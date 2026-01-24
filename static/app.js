@@ -28,7 +28,7 @@ let ipFilters = { source: null, destination: null };
 let natData = null;
 const natTextFilters = { 'Destination NAT': {}, 'Source NAT': {} };
 const natIpFilters = { 'Destination NAT': {}, 'Source NAT': {} };
-const sections = ['Firewall', 'NAT', 'Groups', 'Activity'];
+const sections = ['Dashboard', 'Firewall', 'NAT', 'Groups', 'Interfaces', 'Routes', 'BGP', 'Activity'];
 
 // Groups state
 let groupsData = null;
@@ -224,9 +224,13 @@ fileInput.onchange = async () => {
 // =========================================
 function drawMenu() {
   const icons = {
+    Dashboard: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>',
     Firewall: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>',
     NAT: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/></svg>',
     Groups: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
+    Interfaces: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>',
+    Routes: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>',
+    BGP: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="19" r="3"/><circle cx="19" cy="19" r="3"/><line x1="12" y1="8" x2="5" y2="16"/><line x1="12" y1="8" x2="19" y2="16"/></svg>',
     Activity: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>'
   };
 
@@ -245,6 +249,10 @@ async function loadSection(sec) {
   currentSection = sec;
   drawMenu();
 
+  if (sec === 'Dashboard') {
+    updateBreadcrumb([]);
+    return renderDashboard();
+  }
   if (sec === 'Firewall') {
     updateBreadcrumb([{ label: 'Firewall', action: "loadSection('Firewall')" }]);
     return loadFirewall();
@@ -260,6 +268,18 @@ async function loadSection(sec) {
   if (sec === 'Groups') {
     updateBreadcrumb([{ label: 'Firewall Groups', action: "loadSection('Groups')" }]);
     return loadGroups();
+  }
+  if (sec === 'Interfaces') {
+    updateBreadcrumb([{ label: 'Interfaces', action: "loadSection('Interfaces')" }]);
+    return loadInterfaces();
+  }
+  if (sec === 'Routes') {
+    updateBreadcrumb([{ label: 'Static Routes', action: "loadSection('Routes')" }]);
+    return loadRoutes();
+  }
+  if (sec === 'BGP') {
+    updateBreadcrumb([{ label: 'BGP Configuration', action: "loadSection('BGP')" }]);
+    return loadBGP();
   }
 
   showLoading(`Loading ${sec}...`);
@@ -616,6 +636,1560 @@ async function clearActivityLog() {
     activityLog = [];
     renderActivityLog();
     showToast('info', 'Cleared', 'Activity log cleared');
+  }
+}
+
+// =========================================
+// INTERFACES (Read Only)
+// =========================================
+let interfacesData = null;
+
+async function loadInterfaces() {
+  content.innerHTML = showSkeletonTable(6, 4);
+
+  try {
+    const res = await fetch('/api/interfaces');
+    interfacesData = await res.json();
+    renderInterfaces();
+  } catch (e) {
+    showToast('error', 'Error', 'Failed to load interfaces');
+    content.innerHTML = '<div class="empty-state"><p class="text-muted">Failed to load interfaces</p></div>';
+  }
+}
+
+function renderInterfaces() {
+  const interfaces = interfacesData || {};
+  const interfaceTypes = [
+    { key: 'ethernet', label: 'Ethernet', icon: 'ETH' },
+    { key: 'bonding', label: 'Bonding', icon: 'BOND' },
+    { key: 'bridge', label: 'Bridge', icon: 'BR' },
+    { key: 'vlan', label: 'VLAN', icon: 'VLAN' },
+    { key: 'loopback', label: 'Loopback', icon: 'LO' },
+    { key: 'wireguard', label: 'WireGuard', icon: 'WG' },
+    { key: 'openvpn', label: 'OpenVPN', icon: 'VPN' },
+    { key: 'tunnel', label: 'Tunnel', icon: 'TUN' },
+    { key: 'dummy', label: 'Dummy', icon: 'DUM' },
+    { key: 'vti', label: 'VTI', icon: 'VTI' },
+    { key: 'pppoe', label: 'PPPoE', icon: 'PPP' }
+  ];
+
+  // Check if any interfaces exist
+  const hasInterfaces = interfaceTypes.some(it => Object.keys(interfaces[it.key] || {}).length > 0);
+
+  if (!hasInterfaces) {
+    content.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-state-icon">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <rect x="2" y="2" width="20" height="8" rx="2" ry="2"/>
+            <rect x="2" y="14" width="20" height="8" rx="2" ry="2"/>
+            <line x1="6" y1="6" x2="6.01" y2="6"/>
+            <line x1="6" y1="18" x2="6.01" y2="18"/>
+          </svg>
+        </div>
+        <h3 class="empty-state-title">No Interfaces Found</h3>
+        <p class="empty-state-text">No interfaces are configured on this device.</p>
+      </div>
+    `;
+    return;
+  }
+
+  let html = '';
+
+  for (const it of interfaceTypes) {
+    const typeInterfaces = interfaces[it.key] || {};
+    const ifaceNames = Object.keys(typeInterfaces);
+
+    if (ifaceNames.length === 0) continue;
+
+    html += `
+      <div class="card" style="margin-bottom: 1.5rem;">
+        <div class="card-header">
+          <div class="card-title">
+            <span class="badge badge-outline">${it.icon}</span>
+            ${it.label}
+            <span class="badge">${ifaceNames.length}</span>
+          </div>
+        </div>
+        <div class="table-container">
+          <table>
+            <thead><tr>
+              <th>Interface</th>
+              <th>Addresses</th>
+              <th>VRF</th>
+              <th>Description</th>
+              <th>Details</th>
+            </tr></thead>
+            <tbody>
+    `;
+
+    for (const ifaceName of ifaceNames.sort()) {
+      const ifaceData = typeInterfaces[ifaceName];
+      const addresses = getInterfaceAddresses(ifaceData);
+      const description = ifaceData.description || '-';
+      const details = getInterfaceDetails(it.key, ifaceData);
+      const vrf = ifaceData.vrf || 'default';
+      const vrfBadge = vrf === 'default'
+        ? '<span class="badge badge-outline">default</span>'
+        : `<span class="badge badge-primary">${escapeHtml(vrf)}</span>`;
+
+      html += `
+        <tr>
+          <td><span class="badge badge-primary">${escapeHtml(ifaceName)}</span></td>
+          <td>${addresses.length > 0 ? addresses.map(a => `<code>${escapeHtml(a)}</code>`).join('<br>') : '<span class="text-muted">-</span>'}</td>
+          <td>${vrfBadge}</td>
+          <td>${escapeHtml(description)}</td>
+          <td><span class="text-muted">${escapeHtml(details)}</span></td>
+        </tr>
+      `;
+
+      // Render subinterfaces (vif) if they exist
+      if (ifaceData.vif) {
+        const vifIds = Object.keys(ifaceData.vif).sort((a, b) => parseInt(a) - parseInt(b));
+        for (const vifId of vifIds) {
+          const vifData = ifaceData.vif[vifId];
+          const vifAddresses = getInterfaceAddresses(vifData);
+          const vifDescription = vifData.description || '-';
+          const vifName = `${ifaceName}.${vifId}`;
+          const vifVrf = vifData.vrf || vrf;  // Subinterface hereda VRF del padre si no tiene uno propio
+          const vifVrfBadge = vifVrf === 'default'
+            ? '<span class="badge badge-outline">default</span>'
+            : `<span class="badge badge-primary">${escapeHtml(vifVrf)}</span>`;
+
+          html += `
+            <tr style="background: var(--bg-secondary);">
+              <td><span class="badge badge-outline" style="margin-left: 1rem;">└ ${escapeHtml(vifName)}</span></td>
+              <td>${vifAddresses.length > 0 ? vifAddresses.map(a => `<code>${escapeHtml(a)}</code>`).join('<br>') : '<span class="text-muted">-</span>'}</td>
+              <td>${vifVrfBadge}</td>
+              <td>${escapeHtml(vifDescription)}</td>
+              <td><span class="text-muted">VLAN ${vifId}</span></td>
+            </tr>
+          `;
+        }
+      }
+    }
+
+    html += '</tbody></table></div></div>';
+  }
+
+  content.innerHTML = html;
+}
+
+function getInterfaceAddresses(ifaceData) {
+  if (!ifaceData || !ifaceData.address) return [];
+  if (typeof ifaceData.address === 'string') return [ifaceData.address];
+  if (Array.isArray(ifaceData.address)) return ifaceData.address;
+  if (typeof ifaceData.address === 'object') return Object.keys(ifaceData.address);
+  return [];
+}
+
+function getInterfaceDetails(type, ifaceData) {
+  const details = [];
+  if (ifaceData['hw-id']) details.push(`MAC: ${ifaceData['hw-id']}`);
+  if (ifaceData.vif) details.push(`VLANs: ${Object.keys(ifaceData.vif).join(', ')}`);
+  if (ifaceData.mode) details.push(`Mode: ${ifaceData.mode}`);
+  if (ifaceData.member) {
+    const members = ifaceData.member?.interface;
+    if (members) {
+      const memberList = typeof members === 'object' ? Object.keys(members).join(', ') : members;
+      details.push(`Members: ${memberList}`);
+    }
+  }
+  if (ifaceData.interface) details.push(`Parent: ${ifaceData.interface}`);
+  if (ifaceData.id) details.push(`ID: ${ifaceData.id}`);
+  if (ifaceData.port) details.push(`Port: ${ifaceData.port}`);
+  if (ifaceData.encapsulation) details.push(`Encap: ${ifaceData.encapsulation}`);
+  if (ifaceData['source-address']) details.push(`Src: ${ifaceData['source-address']}`);
+  if (ifaceData.remote) details.push(`Remote: ${ifaceData.remote}`);
+  if (type === 'wireguard' && ifaceData.peer) {
+    details.push(`Peers: ${Object.keys(ifaceData.peer).length}`);
+  }
+  return details.join(' | ') || '-';
+}
+
+// =========================================
+// STATIC ROUTES
+// =========================================
+let routesData = null;
+
+async function loadRoutes() {
+  content.innerHTML = showSkeletonTable(6, 4);
+
+  try {
+    const res = await fetch('/api/static-routes');
+    routesData = await res.json();
+    renderRoutes();
+  } catch (e) {
+    showToast('error', 'Error', 'Failed to load static routes');
+    content.innerHTML = '<div class="empty-state"><p class="text-muted">Failed to load static routes</p></div>';
+  }
+}
+
+function renderRoutes() {
+  const data = routesData || { default: {}, vrfs: {} };
+
+  // Flatten all routes with their VRF info
+  const allRoutes = [];
+
+  // Default VRF routes
+  for (const [network, routeData] of Object.entries(data.default || {})) {
+    const parsed = parseRouteData(routeData);
+    for (const route of parsed) {
+      allRoutes.push({ network, vrf: 'default', ...route });
+    }
+  }
+
+  // VRF-specific routes
+  for (const [vrfName, routes] of Object.entries(data.vrfs || {})) {
+    for (const [network, routeData] of Object.entries(routes)) {
+      const parsed = parseRouteData(routeData);
+      for (const route of parsed) {
+        allRoutes.push({ network, vrf: vrfName, ...route });
+      }
+    }
+  }
+
+  if (allRoutes.length === 0) {
+    content.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-state-icon">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="12" cy="12" r="10"/>
+            <line x1="2" y1="12" x2="22" y2="12"/>
+            <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+          </svg>
+        </div>
+        <h3 class="empty-state-title">No Static Routes</h3>
+        <p class="empty-state-text">No static routes are configured.</p>
+        ${isConnected ? `
+          <button class="btn btn-primary" onclick="openRouteModal('create')" style="margin-top: 1rem;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+            Add Static Route
+          </button>
+        ` : ''}
+      </div>
+    `;
+    return;
+  }
+
+  // Sort routes: by VRF (default first), then by network
+  allRoutes.sort((a, b) => {
+    if (a.vrf === 'default' && b.vrf !== 'default') return -1;
+    if (a.vrf !== 'default' && b.vrf === 'default') return 1;
+    if (a.vrf !== b.vrf) return a.vrf.localeCompare(b.vrf);
+    return a.network.localeCompare(b.network);
+  });
+
+  let html = '';
+
+  // Add "New Route" button if connected
+  if (isConnected) {
+    html += `
+      <div class="table-actions" style="margin-bottom: 1rem;">
+        <button class="btn btn-success btn-sm" onclick="openRouteModal('create')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+          New Static Route
+        </button>
+      </div>
+    `;
+  }
+
+  // Count routes per VRF for display
+  const vrfCounts = {};
+  allRoutes.forEach(r => { vrfCounts[r.vrf] = (vrfCounts[r.vrf] || 0) + 1; });
+  const vrfSummary = Object.entries(vrfCounts).map(([v, c]) => `${v}: ${c}`).join(', ');
+
+  html += `
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">
+          Static Routes
+          <span class="badge">${allRoutes.length} routes</span>
+          <span class="text-muted" style="font-size: 0.8rem; margin-left: 0.5rem;">(${vrfSummary})</span>
+        </div>
+      </div>
+      <div class="table-container">
+        <table>
+          <thead><tr>
+            <th>Destination</th>
+            <th>VRF</th>
+            <th>Type</th>
+            <th>Target</th>
+            <th>Distance</th>
+            ${isConnected ? '<th class="actions-col">Actions</th>' : ''}
+          </tr></thead>
+          <tbody>
+  `;
+
+  for (const route of allRoutes) {
+    const pendingStatus = getRoutePendingStatus(route.network, route.target);
+    const pendingClass = pendingStatus === 'delete' ? 'pending-delete' : (pendingStatus ? 'pending-change' : '');
+    const pendingBadge = pendingStatus ? `<span class="pending-badge">${pendingStatus === 'delete' ? 'DEL' : 'MOD'}</span>` : '';
+    const vrfBadge = route.vrf === 'default'
+      ? '<span class="badge badge-outline">default</span>'
+      : `<span class="badge badge-primary">${escapeHtml(route.vrf)}</span>`;
+    const targetVrf = route.targetVrf ? ` <span class="text-muted">(via ${route.targetVrf})</span>` : '';
+
+    html += `
+      <tr class="${pendingClass}">
+        <td><code>${escapeHtml(route.network)}</code>${pendingBadge}</td>
+        <td>${vrfBadge}</td>
+        <td><span class="badge badge-outline">${route.type}</span></td>
+        <td>${route.target ? `<code>${escapeHtml(route.target)}</code>${targetVrf}` : '<span class="text-muted">-</span>'}</td>
+        <td>${route.distance || '<span class="text-muted">default</span>'}</td>
+        ${isConnected ? `
+          <td class="actions-col">
+            <button class="btn-icon btn-danger" onclick="deleteRoute('${escapeHtml(route.network)}', '${escapeHtml(route.target || '')}', '${escapeHtml(route.vrf)}')" title="Delete">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+              </svg>
+            </button>
+          </td>
+        ` : ''}
+      </tr>
+    `;
+  }
+
+  html += '</tbody></table></div></div>';
+  content.innerHTML = html;
+}
+
+function parseRouteData(routeData) {
+  const routes = [];
+
+  // Next-hop routes
+  if (routeData['next-hop']) {
+    for (const [nhIP, nhData] of Object.entries(routeData['next-hop'])) {
+      routes.push({
+        type: 'next-hop',
+        target: nhIP,
+        distance: nhData?.distance || null,
+        targetVrf: nhData?.vrf || null  // VRF del next-hop (inter-VRF routing)
+      });
+    }
+  }
+
+  // Blackhole routes
+  if (routeData.blackhole !== undefined) {
+    routes.push({
+      type: 'blackhole',
+      target: null,
+      distance: typeof routeData.blackhole === 'object' ? routeData.blackhole.distance : null
+    });
+  }
+
+  // Interface routes
+  if (routeData.interface) {
+    for (const [iface, ifData] of Object.entries(routeData.interface)) {
+      routes.push({
+        type: 'interface',
+        target: iface,
+        distance: ifData?.distance || null,
+        targetVrf: ifData?.vrf || null  // VRF de la interfaz (inter-VRF routing)
+      });
+    }
+  }
+
+  return routes.length > 0 ? routes : [{ type: 'unknown', target: null, distance: null }];
+}
+
+function getRoutePendingStatus(network, target) {
+  if (!stagedMode) return null;
+  const marker = `route:${network}:${target || ''}`;
+  if (pendingRuleMarkers.has(marker)) {
+    const op = pendingOperations.find(o => o.type === 'route' && o.data.network === network);
+    return op?.action === 'delete' ? 'delete' : 'update';
+  }
+  return null;
+}
+
+// Open route creation modal
+async function openRouteModal(mode) {
+  const modal = document.getElementById('routeModal');
+  if (!modal) {
+    // Create modal dynamically
+    createRouteModal();
+  }
+
+  document.getElementById('routeMode').value = mode;
+  document.getElementById('routeNetwork').value = '';
+  document.getElementById('routeType').value = 'next-hop';
+  document.getElementById('routeTarget').value = '';
+  document.getElementById('routeDistance').value = '';
+  document.getElementById('routeTitle').textContent = mode === 'create' ? 'New Static Route' : 'Edit Static Route';
+
+  // Populate VRF selector with available VRFs from API
+  const vrfSelect = document.getElementById('routeVrf');
+  if (vrfSelect) {
+    vrfSelect.innerHTML = '<option value="default">default</option>';
+    try {
+      const res = await fetch('/api/vrfs');
+      const vrfNames = await res.json();
+      for (const vrf of vrfNames.sort()) {
+        vrfSelect.innerHTML += `<option value="${escapeHtml(vrf)}">${escapeHtml(vrf)}</option>`;
+      }
+    } catch (e) {
+      // Fallback: use VRFs from routes data
+      const data = routesData || { default: {}, vrfs: {} };
+      for (const vrf of Object.keys(data.vrfs || {}).sort()) {
+        vrfSelect.innerHTML += `<option value="${escapeHtml(vrf)}">${escapeHtml(vrf)}</option>`;
+      }
+    }
+    vrfSelect.value = 'default';
+  }
+
+  toggleRouteTargetField();
+  openModal('routeModal');
+}
+
+function toggleRouteTargetField() {
+  const routeType = document.getElementById('routeType').value;
+  const targetGroup = document.getElementById('routeTargetGroup');
+  const targetLabel = document.getElementById('routeTargetLabel');
+
+  if (routeType === 'blackhole') {
+    targetGroup.classList.add('hidden');
+  } else {
+    targetGroup.classList.remove('hidden');
+    targetLabel.textContent = routeType === 'next-hop' ? 'Next-Hop IP *' : 'Interface Name *';
+    document.getElementById('routeTarget').placeholder = routeType === 'next-hop' ? '10.0.0.1' : 'eth0';
+  }
+}
+
+async function saveRoute() {
+  const network = document.getElementById('routeNetwork').value.trim();
+  const routeType = document.getElementById('routeType').value;
+  const target = document.getElementById('routeTarget').value.trim();
+  const distance = document.getElementById('routeDistance').value.trim();
+  const vrf = document.getElementById('routeVrf')?.value || 'default';
+
+  if (!network) {
+    showToast('error', 'Validation Error', 'Destination network is required');
+    return;
+  }
+
+  if (routeType !== 'blackhole' && !target) {
+    showToast('error', 'Validation Error', 'Target is required');
+    return;
+  }
+
+  const routeData = {
+    network,
+    type: routeType,
+    target: routeType !== 'blackhole' ? target : undefined,
+    distance: distance ? parseInt(distance) : undefined,
+    vrf: vrf !== 'default' ? vrf : undefined
+  };
+
+  // Build commands for verbose mode and logging
+  const commands = buildRouteCommands(routeData);
+
+  if (stagedMode) {
+    // Stage the operation
+    const marker = `route:${vrf}:${network}:${target || ''}`;
+    pendingOperations.push({
+      type: 'route',
+      action: 'create',
+      data: routeData,
+      display: `Static route ${network} via ${target || routeType}${vrf !== 'default' ? ' (VRF: ' + vrf + ')' : ''}`
+    });
+    pendingRuleMarkers.add(marker);
+    updatePendingIndicator();
+    closeModal('routeModal');
+    loadRoutes();
+    showToast('info', 'Staged', `Route ${network} queued for creation`);
+    logActivity('route', 'staged', `Route ${network}`, 'staged', `Route staged for creation`, commands);
+    return;
+  }
+
+  // Actual save function
+  const doSave = async () => {
+    closeModal('routeModal');
+    showLoading('Creating route...');
+
+    try {
+      const res = await fetch('/api/static-route', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(routeData)
+      });
+      const j = await res.json();
+
+      if (!res.ok) throw new Error(j.error || 'Failed to create route');
+
+      hasUnsavedChanges = true;
+      updateSaveIndicator();
+      await loadRoutes();
+      showToast('success', 'Success', `Route ${network} created`);
+      logActivity('route', 'create', `Route ${network}`, 'success', `Created static route to ${network}`, commands);
+    } catch (e) {
+      logActivity('route', 'create', `Route ${network}`, 'error', e.message);
+      showToast('error', 'Error', e.message);
+      loadRoutes();
+    }
+  };
+
+  // If verbose mode is enabled, show preview first
+  if (verboseMode) {
+    showCommandPreview(commands, doSave);
+  } else {
+    await doSave();
+  }
+}
+
+// Build VyOS commands for static route
+function buildRouteCommands(routeData) {
+  const { network, type, target, distance, vrf } = routeData;
+  const commands = [];
+
+  // Base path depends on VRF
+  const basePath = vrf && vrf !== 'default'
+    ? `vrf name ${vrf} protocols static route ${network}`
+    : `protocols static route ${network}`;
+
+  if (type === 'next-hop') {
+    commands.push({ cmd: `set ${basePath} next-hop ${target}` });
+    if (distance) {
+      commands.push({ cmd: `set ${basePath} next-hop ${target} distance ${distance}` });
+    }
+  } else if (type === 'blackhole') {
+    commands.push({ cmd: `set ${basePath} blackhole` });
+    if (distance) {
+      commands.push({ cmd: `set ${basePath} blackhole distance ${distance}` });
+    }
+  } else if (type === 'interface') {
+    commands.push({ cmd: `set ${basePath} interface ${target}` });
+    if (distance) {
+      commands.push({ cmd: `set ${basePath} interface ${target} distance ${distance}` });
+    }
+  }
+
+  return commands;
+}
+
+async function deleteRoute(network, target, vrf = 'default') {
+  const vrfLabel = vrf !== 'default' ? ` (VRF: ${vrf})` : '';
+  const confirmed = await openConfirmModal(
+    'Delete Static Route?',
+    `Are you sure you want to delete the route to ${network}${vrfLabel}?`
+  );
+
+  if (!confirmed) return;
+
+  const vrfParam = vrf !== 'default' ? vrf : undefined;
+
+  // Build delete command
+  const basePath = vrf !== 'default'
+    ? `vrf name ${vrf} protocols static route ${network}`
+    : `protocols static route ${network}`;
+  const commands = [{ cmd: `delete ${basePath}` }];
+
+  if (stagedMode) {
+    const marker = `route:${vrf}:${network}:${target || ''}`;
+    pendingOperations.push({
+      type: 'route',
+      action: 'delete',
+      data: { network, next_hop: target || undefined, vrf: vrfParam },
+      display: `Delete route ${network}${vrfLabel}`
+    });
+    pendingRuleMarkers.add(marker);
+    updatePendingIndicator();
+    loadRoutes();
+    showToast('info', 'Staged', `Route deletion queued`);
+    logActivity('route', 'staged', `Route ${network}${vrfLabel}`, 'staged', `Route staged for deletion`, commands);
+    return;
+  }
+
+  // Actual delete function
+  const doDelete = async () => {
+    showLoading('Deleting route...');
+
+    try {
+      const res = await fetch('/api/static-route', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ network, next_hop: target || undefined, vrf: vrfParam })
+      });
+      const j = await res.json();
+
+      if (!res.ok) throw new Error(j.error || 'Failed to delete route');
+
+      hasUnsavedChanges = true;
+      updateSaveIndicator();
+      await loadRoutes();
+      showToast('success', 'Success', `Route ${network} deleted`);
+      logActivity('route', 'delete', `Route ${network}${vrfLabel}`, 'success', `Deleted static route to ${network}`, commands);
+    } catch (e) {
+      logActivity('route', 'delete', `Route ${network}${vrfLabel}`, 'error', e.message);
+      showToast('error', 'Error', e.message);
+      loadRoutes();
+    }
+  };
+
+  // If verbose mode is enabled, show preview first
+  if (verboseMode) {
+    showCommandPreview(commands, doDelete);
+  } else {
+    await doDelete();
+  }
+}
+
+function createRouteModal() {
+  const modal = document.createElement('div');
+  modal.id = 'routeModal';
+  modal.className = 'modal hidden';
+  modal.innerHTML = `
+    <div class="modal-backdrop" onclick="closeModal('routeModal')"></div>
+    <div class="modal-content modal-md">
+      <div class="modal-header">
+        <h3 id="routeTitle">New Static Route</h3>
+        <button class="modal-close" onclick="closeModal('routeModal')">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="routeMode" value="create">
+        <div class="form-group">
+          <label>Destination Network (CIDR) *</label>
+          <input type="text" id="routeNetwork" placeholder="10.0.0.0/8" required>
+        </div>
+        <div class="form-group">
+          <label>VRF</label>
+          <select id="routeVrf">
+            <option value="default">default</option>
+          </select>
+          <small class="text-muted">Virtual Routing and Forwarding instance</small>
+        </div>
+        <div class="form-group">
+          <label>Route Type *</label>
+          <select id="routeType" onchange="toggleRouteTargetField()">
+            <option value="next-hop">Next-Hop</option>
+            <option value="blackhole">Blackhole</option>
+            <option value="interface">Interface</option>
+          </select>
+        </div>
+        <div class="form-group" id="routeTargetGroup">
+          <label id="routeTargetLabel">Next-Hop IP *</label>
+          <input type="text" id="routeTarget" placeholder="10.0.0.1">
+        </div>
+        <div class="form-group">
+          <label>Administrative Distance</label>
+          <input type="number" id="routeDistance" min="1" max="255" placeholder="1 (default)">
+          <small class="text-muted">Lower values have higher priority</small>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('routeModal')">Cancel</button>
+        <button class="btn btn-primary" onclick="saveRoute()">Save</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+}
+
+// =========================================
+// GLOBAL SEARCH
+// =========================================
+let globalSearchResults = [];
+
+function openGlobalSearch() {
+  const existingModal = document.getElementById('globalSearchModal');
+  if (existingModal) existingModal.remove();
+
+  const modal = document.createElement('div');
+  modal.id = 'globalSearchModal';
+  modal.className = 'modal';
+  modal.innerHTML = `
+    <div class="modal-backdrop" onclick="closeModal('globalSearchModal')"></div>
+    <div class="modal-content modal-lg">
+      <div class="modal-header">
+        <h3>Global Search</h3>
+        <button class="modal-close" onclick="closeModal('globalSearchModal')">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <input type="text" id="globalSearchInput" placeholder="Search IP, network, port, name..." autofocus
+            oninput="performGlobalSearch(this.value)">
+          <small class="text-muted">Search across firewall rules, NAT, groups, interfaces, routes, and BGP</small>
+        </div>
+        <div id="globalSearchResults" class="global-search-results"></div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+
+  // Focus the input
+  setTimeout(() => document.getElementById('globalSearchInput').focus(), 100);
+}
+
+function performGlobalSearch(query) {
+  const resultsDiv = document.getElementById('globalSearchResults');
+  if (!query || query.length < 2) {
+    resultsDiv.innerHTML = '<p class="text-muted text-center">Enter at least 2 characters to search</p>';
+    return;
+  }
+
+  const q = query.toLowerCase();
+  const results = {
+    firewall: [],
+    nat: [],
+    groups: [],
+    interfaces: [],
+    routes: [],
+    bgp: []
+  };
+
+  // Search firewall rules
+  const fwRulesets = CONFIG?.firewall?.name || {};
+  for (const [rsName, rsData] of Object.entries(fwRulesets)) {
+    for (const [ruleNum, rule] of Object.entries(rsData.rule || {})) {
+      if (matchesQuery(rule, q) || rsName.toLowerCase().includes(q)) {
+        results.firewall.push({
+          section: 'Firewall',
+          target: `${rsName} Rule ${ruleNum}`,
+          match: rule.description || `Action: ${rule.action || 'not set'}`,
+          action: () => { closeModal('globalSearchModal'); loadRuleset(rsName); }
+        });
+      }
+    }
+  }
+
+  // Search NAT rules
+  const natTypes = [
+    { key: 'destination', label: 'DNAT' },
+    { key: 'source', label: 'SNAT' }
+  ];
+  for (const nt of natTypes) {
+    const rules = CONFIG?.nat?.[nt.key]?.rule || {};
+    for (const [ruleNum, rule] of Object.entries(rules)) {
+      if (matchesQuery(rule, q)) {
+        results.nat.push({
+          section: 'NAT',
+          target: `${nt.label} Rule ${ruleNum}`,
+          match: rule.description || `Translation: ${rule.translation?.address || 'not set'}`,
+          action: () => { closeModal('globalSearchModal'); loadSection('NAT'); }
+        });
+      }
+    }
+  }
+
+  // Search groups
+  const groupTypes = ['address-group', 'network-group', 'port-group'];
+  for (const gtype of groupTypes) {
+    const groups = CONFIG?.firewall?.group?.[gtype] || {};
+    for (const [gname, gdata] of Object.entries(groups)) {
+      if (gname.toLowerCase().includes(q) || matchesGroupEntries(gdata, q)) {
+        results.groups.push({
+          section: 'Groups',
+          target: gname,
+          match: gtype.replace('-group', ''),
+          action: () => { closeModal('globalSearchModal'); loadSection('Groups'); }
+        });
+      }
+    }
+  }
+
+  // Search interfaces
+  const interfaces = CONFIG?.interfaces || {};
+  for (const [itype, ifaces] of Object.entries(interfaces)) {
+    if (typeof ifaces !== 'object') continue;
+    for (const [ifname, ifdata] of Object.entries(ifaces)) {
+      if (ifname.toLowerCase().includes(q) || matchesInterface(ifdata, q)) {
+        results.interfaces.push({
+          section: 'Interfaces',
+          target: ifname,
+          match: ifdata.description || ifdata.address || itype,
+          action: () => { closeModal('globalSearchModal'); loadSection('Interfaces'); }
+        });
+      }
+    }
+  }
+
+  // Search routes
+  const routes = CONFIG?.protocols?.static?.route || {};
+  for (const [network, routeData] of Object.entries(routes)) {
+    if (network.includes(q) || matchesRoute(routeData, q)) {
+      results.routes.push({
+        section: 'Routes',
+        target: network,
+        match: getRouteTarget(routeData),
+        action: () => { closeModal('globalSearchModal'); loadSection('Routes'); }
+      });
+    }
+  }
+
+  // Search BGP
+  const bgp = CONFIG?.protocols?.bgp || {};
+  for (const [neighborIP, nbrData] of Object.entries(bgp.neighbor || {})) {
+    if (neighborIP.includes(q) || (nbrData.description || '').toLowerCase().includes(q) ||
+        String(nbrData['remote-as']).includes(q)) {
+      results.bgp.push({
+        section: 'BGP',
+        target: `Neighbor ${neighborIP}`,
+        match: `AS ${nbrData['remote-as']}`,
+        action: () => { closeModal('globalSearchModal'); loadSection('BGP'); }
+      });
+    }
+  }
+  for (const network of Object.keys(bgp['address-family']?.['ipv4-unicast']?.network || {})) {
+    if (network.includes(q)) {
+      results.bgp.push({
+        section: 'BGP',
+        target: `Network ${network}`,
+        match: 'Advertised network',
+        action: () => { closeModal('globalSearchModal'); loadSection('BGP'); }
+      });
+    }
+  }
+
+  // Render results
+  renderGlobalSearchResults(results);
+}
+
+function matchesQuery(obj, query) {
+  if (!obj || typeof obj !== 'object') return false;
+  const str = JSON.stringify(obj).toLowerCase();
+  return str.includes(query);
+}
+
+function matchesGroupEntries(gdata, query) {
+  const entries = gdata.address || gdata.network || gdata.port || [];
+  const arr = Array.isArray(entries) ? entries : Object.keys(entries);
+  return arr.some(e => String(e).toLowerCase().includes(query));
+}
+
+function matchesInterface(ifdata, query) {
+  if (!ifdata) return false;
+  const addresses = ifdata.address;
+  if (addresses) {
+    const addrs = Array.isArray(addresses) ? addresses :
+      (typeof addresses === 'object' ? Object.keys(addresses) : [addresses]);
+    if (addrs.some(a => String(a).includes(query))) return true;
+  }
+  if ((ifdata.description || '').toLowerCase().includes(query)) return true;
+  if ((ifdata['hw-id'] || '').toLowerCase().includes(query)) return true;
+  return false;
+}
+
+function matchesRoute(routeData, query) {
+  if (routeData['next-hop']) {
+    for (const nh of Object.keys(routeData['next-hop'])) {
+      if (nh.includes(query)) return true;
+    }
+  }
+  if (routeData.interface) {
+    for (const iface of Object.keys(routeData.interface)) {
+      if (iface.toLowerCase().includes(query)) return true;
+    }
+  }
+  return false;
+}
+
+function getRouteTarget(routeData) {
+  if (routeData['next-hop']) {
+    return `via ${Object.keys(routeData['next-hop']).join(', ')}`;
+  }
+  if (routeData.blackhole !== undefined) return 'blackhole';
+  if (routeData.interface) {
+    return `via ${Object.keys(routeData.interface).join(', ')}`;
+  }
+  return 'unknown';
+}
+
+function renderGlobalSearchResults(results) {
+  const resultsDiv = document.getElementById('globalSearchResults');
+  const allResults = [
+    ...results.firewall,
+    ...results.nat,
+    ...results.groups,
+    ...results.interfaces,
+    ...results.routes,
+    ...results.bgp
+  ];
+
+  if (allResults.length === 0) {
+    resultsDiv.innerHTML = '<p class="text-muted text-center">No results found</p>';
+    return;
+  }
+
+  // Store for navigation
+  globalSearchResults = allResults;
+
+  let html = `<p class="text-muted" style="margin-bottom: 0.75rem">${allResults.length} result(s) found</p>`;
+
+  // Group by section
+  const sections = ['Firewall', 'NAT', 'Groups', 'Interfaces', 'Routes', 'BGP'];
+  for (const section of sections) {
+    const sectionResults = allResults.filter(r => r.section === section);
+    if (sectionResults.length === 0) continue;
+
+    html += `<div class="search-result-section">
+      <div class="search-result-section-header">${section} (${sectionResults.length})</div>`;
+
+    for (let i = 0; i < sectionResults.length; i++) {
+      const r = sectionResults[i];
+      const globalIdx = allResults.indexOf(r);
+      html += `
+        <div class="search-result-item" onclick="globalSearchResults[${globalIdx}].action()">
+          <span class="search-result-target">${escapeHtml(r.target)}</span>
+          <span class="search-result-match text-muted">${escapeHtml(r.match)}</span>
+        </div>
+      `;
+    }
+
+    html += '</div>';
+  }
+
+  resultsDiv.innerHTML = html;
+}
+
+// =========================================
+// BGP CONFIGURATION
+// =========================================
+let bgpData = null;
+
+async function loadBGP() {
+  content.innerHTML = showSkeletonTable(6, 5);
+
+  try {
+    const res = await fetch('/api/bgp');
+    bgpData = await res.json();
+    renderBGP();
+  } catch (e) {
+    showToast('error', 'Error', 'Failed to load BGP configuration');
+    content.innerHTML = '<div class="empty-state"><p class="text-muted">Failed to load BGP configuration</p></div>';
+  }
+}
+
+function renderBGP() {
+  const bgp = bgpData || {};
+  const systemAs = bgp['system-as'] || null;
+  const neighbors = bgp.neighbor || {};
+  const networks = bgp['address-family']?.['ipv4-unicast']?.network || {};
+  const redistribute = bgp['address-family']?.['ipv4-unicast']?.redistribute || {};
+
+  const hasConfig = systemAs || Object.keys(neighbors).length > 0 || Object.keys(networks).length > 0;
+
+  if (!hasConfig) {
+    content.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-state-icon">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <circle cx="12" cy="5" r="3"/>
+            <circle cx="5" cy="19" r="3"/>
+            <circle cx="19" cy="19" r="3"/>
+            <line x1="12" y1="8" x2="5" y2="16"/>
+            <line x1="12" y1="8" x2="19" y2="16"/>
+          </svg>
+        </div>
+        <h3 class="empty-state-title">BGP Not Configured</h3>
+        <p class="empty-state-text">BGP routing protocol is not configured on this device.</p>
+        ${isConnected ? `
+          <button class="btn btn-primary" onclick="openBGPSystemAsModal()" style="margin-top: 1rem;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+            Configure BGP
+          </button>
+        ` : ''}
+      </div>
+    `;
+    return;
+  }
+
+  let html = '';
+
+  // BGP Overview Card
+  html += `
+    <div class="stats-grid" style="margin-bottom: 1.5rem;">
+      <div class="stat-card">
+        <div class="stat-icon" style="background-color: var(--info-light, #e0f2fe); color: var(--info-color, #0284c7);">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"/>
+            <path d="M12 6v6l4 2"/>
+          </svg>
+        </div>
+        <div class="stat-content">
+          <div class="stat-value">${systemAs || '<span class="text-muted">Not Set</span>'}</div>
+          <div class="stat-label">Local AS</div>
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon" style="background-color: var(--success-light); color: var(--success-color);">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+            <circle cx="9" cy="7" r="4"/>
+            <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+            <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+          </svg>
+        </div>
+        <div class="stat-content">
+          <div class="stat-value">${Object.keys(neighbors).length}</div>
+          <div class="stat-label">Neighbors</div>
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon" style="background-color: var(--warning-light); color: var(--warning-color);">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"/>
+            <line x1="2" y1="12" x2="22" y2="12"/>
+            <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+          </svg>
+        </div>
+        <div class="stat-content">
+          <div class="stat-value">${Object.keys(networks).length}</div>
+          <div class="stat-label">Advertised Networks</div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  // Redistribution info
+  if (Object.keys(redistribute).length > 0) {
+    const redistTypes = Object.keys(redistribute).join(', ');
+    html += `
+      <div class="card" style="margin-bottom: 1rem; padding: 0.75rem 1rem; display: flex; align-items: center; gap: 0.5rem;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="8" x2="12" y2="12"/>
+          <line x1="12" y1="16" x2="12.01" y2="16"/>
+        </svg>
+        <span class="text-muted">Redistributing:</span>
+        <span class="badge badge-outline">${escapeHtml(redistTypes)}</span>
+      </div>
+    `;
+  }
+
+  // Action buttons if connected
+  if (isConnected) {
+    html += `
+      <div class="table-actions" style="margin-bottom: 1rem;">
+        <button class="btn btn-success btn-sm" onclick="openBGPNeighborModal('create')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+          Add Neighbor
+        </button>
+        <button class="btn btn-success btn-sm" onclick="openBGPNetworkModal('create')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+          Add Network
+        </button>
+        ${!systemAs ? `
+          <button class="btn btn-primary btn-sm" onclick="openBGPSystemAsModal()">
+            Set Local AS
+          </button>
+        ` : ''}
+      </div>
+    `;
+  }
+
+  // Neighbors Table
+  if (Object.keys(neighbors).length > 0) {
+    html += `
+      <div class="card" style="margin-bottom: 1.5rem;">
+        <div class="card-header">
+          <div class="card-title">BGP Neighbors</div>
+        </div>
+        <div class="table-container">
+          <table>
+            <thead><tr>
+              <th>Neighbor IP</th>
+              <th>Remote AS</th>
+              <th>Description</th>
+              <th>Update Source</th>
+              <th>eBGP Multihop</th>
+              ${isConnected ? '<th class="actions-col">Actions</th>' : ''}
+            </tr></thead>
+            <tbody>
+    `;
+
+    for (const [neighborIP, nbrData] of Object.entries(neighbors)) {
+      const pendingStatus = getBGPPendingStatus('neighbor', neighborIP);
+      const pendingClass = pendingStatus === 'delete' ? 'pending-delete' : (pendingStatus ? 'pending-change' : '');
+      const pendingBadge = pendingStatus ? `<span class="pending-badge">${pendingStatus === 'delete' ? 'DEL' : 'MOD'}</span>` : '';
+
+      html += `
+        <tr class="${pendingClass}">
+          <td><code>${escapeHtml(neighborIP)}</code>${pendingBadge}</td>
+          <td><span class="badge">${nbrData['remote-as'] || '-'}</span></td>
+          <td>${escapeHtml(nbrData.description || '-')}</td>
+          <td>${nbrData['update-source'] ? `<code>${escapeHtml(nbrData['update-source'])}</code>` : '<span class="text-muted">-</span>'}</td>
+          <td>${nbrData['ebgp-multihop'] || '<span class="text-muted">-</span>'}</td>
+          ${isConnected ? `
+            <td class="actions-col">
+              <button class="btn-icon btn-danger" onclick="deleteBGPNeighbor('${escapeHtml(neighborIP)}')" title="Delete">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                </svg>
+              </button>
+            </td>
+          ` : ''}
+        </tr>
+      `;
+    }
+
+    html += '</tbody></table></div></div>';
+  }
+
+  // Networks Table
+  if (Object.keys(networks).length > 0) {
+    html += `
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">Advertised Networks</div>
+        </div>
+        <div class="table-container">
+          <table>
+            <thead><tr>
+              <th>Network</th>
+              ${isConnected ? '<th class="actions-col">Actions</th>' : ''}
+            </tr></thead>
+            <tbody>
+    `;
+
+    for (const network of Object.keys(networks).sort()) {
+      const pendingStatus = getBGPPendingStatus('network', network);
+      const pendingClass = pendingStatus === 'delete' ? 'pending-delete' : (pendingStatus ? 'pending-change' : '');
+      const pendingBadge = pendingStatus ? `<span class="pending-badge">${pendingStatus === 'delete' ? 'DEL' : 'MOD'}</span>` : '';
+
+      html += `
+        <tr class="${pendingClass}">
+          <td><code>${escapeHtml(network)}</code>${pendingBadge}</td>
+          ${isConnected ? `
+            <td class="actions-col">
+              <button class="btn-icon btn-danger" onclick="deleteBGPNetwork('${escapeHtml(network)}')" title="Delete">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                </svg>
+              </button>
+            </td>
+          ` : ''}
+        </tr>
+      `;
+    }
+
+    html += '</tbody></table></div></div>';
+  }
+
+  content.innerHTML = html;
+}
+
+function getBGPPendingStatus(type, id) {
+  if (!stagedMode) return null;
+  const marker = `bgp:${type}:${id}`;
+  if (pendingRuleMarkers.has(marker)) {
+    const op = pendingOperations.find(o => o.type === 'bgp' && o.data.bgpType === type &&
+      (o.data.neighbor === id || o.data.network === id));
+    return op?.action === 'delete' ? 'delete' : 'update';
+  }
+  return null;
+}
+
+// BGP Modals
+function openBGPSystemAsModal() {
+  const existingModal = document.getElementById('bgpSystemAsModal');
+  if (existingModal) existingModal.remove();
+
+  const modal = document.createElement('div');
+  modal.id = 'bgpSystemAsModal';
+  modal.className = 'modal';
+  modal.innerHTML = `
+    <div class="modal-backdrop" onclick="closeModal('bgpSystemAsModal')"></div>
+    <div class="modal-content modal-sm">
+      <div class="modal-header">
+        <h3>Set Local AS</h3>
+        <button class="modal-close" onclick="closeModal('bgpSystemAsModal')">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>Local AS Number *</label>
+          <input type="number" id="bgpSystemAs" min="1" max="4294967295" placeholder="65000" required>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('bgpSystemAsModal')">Cancel</button>
+        <button class="btn btn-primary" onclick="saveBGPSystemAs()">Save</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+}
+
+async function saveBGPSystemAs() {
+  const systemAs = document.getElementById('bgpSystemAs').value.trim();
+  if (!systemAs) {
+    showToast('error', 'Validation Error', 'AS number is required');
+    return;
+  }
+
+  closeModal('bgpSystemAsModal');
+  showLoading('Configuring BGP...');
+
+  try {
+    const res = await fetch('/api/bgp/system-as', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ system_as: parseInt(systemAs) })
+    });
+    const j = await res.json();
+
+    if (!res.ok) throw new Error(j.error || 'Failed to set system AS');
+
+    hasUnsavedChanges = true;
+    updateSaveIndicator();
+    await loadBGP();
+    showToast('success', 'Success', `BGP local AS set to ${systemAs}`);
+    logActivity('bgp', 'update', 'System AS', 'success', `Set BGP local AS to ${systemAs}`, [
+      { cmd: `set protocols bgp system-as ${systemAs}` }
+    ]);
+  } catch (e) {
+    logActivity('bgp', 'update', 'System AS', 'error', e.message);
+    showToast('error', 'Error', e.message);
+    loadBGP();
+  }
+}
+
+function openBGPNeighborModal(mode) {
+  const existingModal = document.getElementById('bgpNeighborModal');
+  if (existingModal) existingModal.remove();
+
+  const modal = document.createElement('div');
+  modal.id = 'bgpNeighborModal';
+  modal.className = 'modal';
+  modal.innerHTML = `
+    <div class="modal-backdrop" onclick="closeModal('bgpNeighborModal')"></div>
+    <div class="modal-content modal-lg">
+      <div class="modal-header">
+        <h3>Add BGP Neighbor</h3>
+        <button class="modal-close" onclick="closeModal('bgpNeighborModal')">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="form-row">
+          <div class="form-group">
+            <label>Neighbor IP *</label>
+            <input type="text" id="bgpNeighborIP" placeholder="10.0.0.1" required>
+          </div>
+          <div class="form-group">
+            <label>Remote AS *</label>
+            <input type="number" id="bgpRemoteAs" min="1" max="4294967295" placeholder="65001" required>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Description</label>
+          <input type="text" id="bgpNeighborDesc" placeholder="Upstream Provider">
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Update Source</label>
+            <input type="text" id="bgpUpdateSource" placeholder="10.0.0.2 or eth0">
+          </div>
+          <div class="form-group">
+            <label>eBGP Multihop</label>
+            <input type="number" id="bgpMultihop" min="1" max="255" placeholder="2">
+          </div>
+        </div>
+        <fieldset class="form-fieldset">
+          <legend>Address Family IPv4</legend>
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="bgpIpv4Unicast" checked>
+              <span>Enable IPv4 Unicast</span>
+            </label>
+          </div>
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="bgpSoftReconfig">
+              <span>Soft Reconfiguration Inbound</span>
+            </label>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Route-map Import</label>
+              <input type="text" id="bgpRouteMapIn" placeholder="IMPORT-MAP">
+            </div>
+            <div class="form-group">
+              <label>Route-map Export</label>
+              <input type="text" id="bgpRouteMapOut" placeholder="EXPORT-MAP">
+            </div>
+          </div>
+        </fieldset>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('bgpNeighborModal')">Cancel</button>
+        <button class="btn btn-primary" onclick="saveBGPNeighbor()">Save</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+}
+
+async function saveBGPNeighbor() {
+  const neighborIP = document.getElementById('bgpNeighborIP').value.trim();
+  const remoteAs = document.getElementById('bgpRemoteAs').value.trim();
+
+  if (!neighborIP || !remoteAs) {
+    showToast('error', 'Validation Error', 'Neighbor IP and Remote AS are required');
+    return;
+  }
+
+  const neighborData = {
+    neighbor: neighborIP,
+    remote_as: parseInt(remoteAs),
+    description: document.getElementById('bgpNeighborDesc').value.trim() || undefined,
+    update_source: document.getElementById('bgpUpdateSource').value.trim() || undefined,
+    ebgp_multihop: document.getElementById('bgpMultihop').value.trim() ? parseInt(document.getElementById('bgpMultihop').value) : undefined,
+    ipv4_unicast: document.getElementById('bgpIpv4Unicast').checked,
+    soft_reconfiguration: document.getElementById('bgpSoftReconfig').checked,
+    route_map_import: document.getElementById('bgpRouteMapIn').value.trim() || undefined,
+    route_map_export: document.getElementById('bgpRouteMapOut').value.trim() || undefined
+  };
+
+  if (stagedMode) {
+    const marker = `bgp:neighbor:${neighborIP}`;
+    pendingOperations.push({
+      type: 'bgp',
+      action: 'create',
+      data: { bgpType: 'neighbor', ...neighborData },
+      display: `BGP neighbor ${neighborIP} AS ${remoteAs}`
+    });
+    pendingRuleMarkers.add(marker);
+    updatePendingIndicator();
+    closeModal('bgpNeighborModal');
+    loadBGP();
+    showToast('info', 'Staged', `BGP neighbor ${neighborIP} queued for creation`);
+    logActivity('bgp', 'staged', `Neighbor ${neighborIP}`, 'staged', `Neighbor staged for creation`);
+    return;
+  }
+
+  closeModal('bgpNeighborModal');
+  showLoading('Adding BGP neighbor...');
+
+  try {
+    const res = await fetch('/api/bgp/neighbor', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(neighborData)
+    });
+    const j = await res.json();
+
+    if (!res.ok) throw new Error(j.error || 'Failed to add neighbor');
+
+    hasUnsavedChanges = true;
+    updateSaveIndicator();
+    await loadBGP();
+    showToast('success', 'Success', `BGP neighbor ${neighborIP} added`);
+    logActivity('bgp', 'create', `Neighbor ${neighborIP}`, 'success', `Added BGP neighbor ${neighborIP} AS ${remoteAs}`, [
+      { cmd: `set protocols bgp neighbor ${neighborIP} remote-as ${remoteAs}` }
+    ]);
+  } catch (e) {
+    logActivity('bgp', 'create', `Neighbor ${neighborIP}`, 'error', e.message);
+    showToast('error', 'Error', e.message);
+    loadBGP();
+  }
+}
+
+async function deleteBGPNeighbor(neighborIP) {
+  const confirmed = await openConfirmModal(
+    'Delete BGP Neighbor?',
+    `Are you sure you want to delete neighbor ${neighborIP}?`
+  );
+
+  if (!confirmed) return;
+
+  if (stagedMode) {
+    const marker = `bgp:neighbor:${neighborIP}`;
+    pendingOperations.push({
+      type: 'bgp',
+      action: 'delete',
+      data: { bgpType: 'neighbor', neighbor: neighborIP },
+      display: `Delete BGP neighbor ${neighborIP}`
+    });
+    pendingRuleMarkers.add(marker);
+    updatePendingIndicator();
+    loadBGP();
+    showToast('info', 'Staged', `Neighbor deletion queued`);
+    logActivity('bgp', 'staged', `Neighbor ${neighborIP}`, 'staged', `Neighbor staged for deletion`);
+    return;
+  }
+
+  showLoading('Deleting BGP neighbor...');
+
+  try {
+    const res = await fetch('/api/bgp/neighbor', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ neighbor: neighborIP })
+    });
+    const j = await res.json();
+
+    if (!res.ok) throw new Error(j.error || 'Failed to delete neighbor');
+
+    hasUnsavedChanges = true;
+    updateSaveIndicator();
+    await loadBGP();
+    showToast('success', 'Success', `BGP neighbor ${neighborIP} deleted`);
+    logActivity('bgp', 'delete', `Neighbor ${neighborIP}`, 'success', `Deleted BGP neighbor ${neighborIP}`, [
+      { cmd: `delete protocols bgp neighbor ${neighborIP}` }
+    ]);
+  } catch (e) {
+    logActivity('bgp', 'delete', `Neighbor ${neighborIP}`, 'error', e.message);
+    showToast('error', 'Error', e.message);
+    loadBGP();
+  }
+}
+
+function openBGPNetworkModal(mode) {
+  const existingModal = document.getElementById('bgpNetworkModal');
+  if (existingModal) existingModal.remove();
+
+  const modal = document.createElement('div');
+  modal.id = 'bgpNetworkModal';
+  modal.className = 'modal';
+  modal.innerHTML = `
+    <div class="modal-backdrop" onclick="closeModal('bgpNetworkModal')"></div>
+    <div class="modal-content modal-sm">
+      <div class="modal-header">
+        <h3>Add BGP Network</h3>
+        <button class="modal-close" onclick="closeModal('bgpNetworkModal')">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>Network (CIDR) *</label>
+          <input type="text" id="bgpNetworkCIDR" placeholder="192.168.0.0/24" required>
+          <small class="text-muted">Network to advertise via BGP</small>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('bgpNetworkModal')">Cancel</button>
+        <button class="btn btn-primary" onclick="saveBGPNetwork()">Save</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+}
+
+async function saveBGPNetwork() {
+  const network = document.getElementById('bgpNetworkCIDR').value.trim();
+  if (!network) {
+    showToast('error', 'Validation Error', 'Network is required');
+    return;
+  }
+
+  if (stagedMode) {
+    const marker = `bgp:network:${network}`;
+    pendingOperations.push({
+      type: 'bgp',
+      action: 'create',
+      data: { bgpType: 'network', network },
+      display: `BGP network ${network}`
+    });
+    pendingRuleMarkers.add(marker);
+    updatePendingIndicator();
+    closeModal('bgpNetworkModal');
+    loadBGP();
+    showToast('info', 'Staged', `BGP network ${network} queued`);
+    logActivity('bgp', 'staged', `Network ${network}`, 'staged', `Network staged for advertisement`);
+    return;
+  }
+
+  closeModal('bgpNetworkModal');
+  showLoading('Adding BGP network...');
+
+  try {
+    const res = await fetch('/api/bgp/network', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ network })
+    });
+    const j = await res.json();
+
+    if (!res.ok) throw new Error(j.error || 'Failed to add network');
+
+    hasUnsavedChanges = true;
+    updateSaveIndicator();
+    await loadBGP();
+    showToast('success', 'Success', `BGP network ${network} added`);
+    logActivity('bgp', 'create', `Network ${network}`, 'success', `Added BGP network ${network}`, [
+      { cmd: `set protocols bgp address-family ipv4-unicast network ${network}` }
+    ]);
+  } catch (e) {
+    logActivity('bgp', 'create', `Network ${network}`, 'error', e.message);
+    showToast('error', 'Error', e.message);
+    loadBGP();
+  }
+}
+
+async function deleteBGPNetwork(network) {
+  const confirmed = await openConfirmModal(
+    'Delete BGP Network?',
+    `Are you sure you want to stop advertising ${network}?`
+  );
+
+  if (!confirmed) return;
+
+  if (stagedMode) {
+    const marker = `bgp:network:${network}`;
+    pendingOperations.push({
+      type: 'bgp',
+      action: 'delete',
+      data: { bgpType: 'network', network },
+      display: `Delete BGP network ${network}`
+    });
+    pendingRuleMarkers.add(marker);
+    updatePendingIndicator();
+    loadBGP();
+    showToast('info', 'Staged', `Network deletion queued`);
+    logActivity('bgp', 'staged', `Network ${network}`, 'staged', `Network staged for deletion`);
+    return;
+  }
+
+  showLoading('Deleting BGP network...');
+
+  try {
+    const res = await fetch('/api/bgp/network', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ network })
+    });
+    const j = await res.json();
+
+    if (!res.ok) throw new Error(j.error || 'Failed to delete network');
+
+    hasUnsavedChanges = true;
+    updateSaveIndicator();
+    await loadBGP();
+    showToast('success', 'Success', `BGP network ${network} removed`);
+    logActivity('bgp', 'delete', `Network ${network}`, 'success', `Removed BGP network ${network}`, [
+      { cmd: `delete protocols bgp address-family ipv4-unicast network ${network}` }
+    ]);
+  } catch (e) {
+    logActivity('bgp', 'delete', `Network ${network}`, 'error', e.message);
+    showToast('error', 'Error', e.message);
+    loadBGP();
   }
 }
 
@@ -1526,17 +3100,18 @@ function closeAnyModal() {
 function renderDashboard() {
   if (!CONFIG) return;
 
-  currentSection = null;
+  currentSection = 'Dashboard';
   currentRulesetName = null;
   drawMenu();
   updateBreadcrumb([]);
 
-  const fwRulesets = (CONFIG.firewall && CONFIG.firewall.name) ? CONFIG.firewall.name : {};
+  // Collect statistics
+  const fwRulesets = CONFIG.firewall?.name || {};
   let totalFwRules = 0;
   const fwStats = {};
 
   for (const [name, data] of Object.entries(fwRulesets)) {
-    const count = data && data.rule ? Object.keys(data.rule).length : 0;
+    const count = data?.rule ? Object.keys(data.rule).length : 0;
     fwStats[name] = count;
     totalFwRules += count;
   }
@@ -1544,54 +3119,145 @@ function renderDashboard() {
   let snatCount = 0;
   let dnatCount = 0;
   if (CONFIG.nat) {
-    if (CONFIG.nat.source && CONFIG.nat.source.rule) {
-      snatCount = Object.keys(CONFIG.nat.source.rule).length;
-    }
-    if (CONFIG.nat.destination && CONFIG.nat.destination.rule) {
-      dnatCount = Object.keys(CONFIG.nat.destination.rule).length;
-    }
+    snatCount = Object.keys(CONFIG.nat.source?.rule || {}).length;
+    dnatCount = Object.keys(CONFIG.nat.destination?.rule || {}).length;
   }
+
+  // Groups counts
+  const groups = CONFIG.firewall?.group || {};
+  const addressGroups = Object.keys(groups['address-group'] || {}).length;
+  const networkGroups = Object.keys(groups['network-group'] || {}).length;
+  const portGroups = Object.keys(groups['port-group'] || {}).length;
+  const totalGroups = addressGroups + networkGroups + portGroups;
+
+  // Interfaces count
+  let interfaceCount = 0;
+  for (const itype of Object.values(CONFIG.interfaces || {})) {
+    if (typeof itype === 'object') interfaceCount += Object.keys(itype).length;
+  }
+
+  // Routes count
+  const staticRoutes = Object.keys(CONFIG.protocols?.static?.route || {}).length;
+
+  // BGP stats
+  const bgp = CONFIG.protocols?.bgp || {};
+  const bgpNeighbors = Object.keys(bgp.neighbor || {}).length;
+  const bgpNetworks = Object.keys(bgp['address-family']?.['ipv4-unicast']?.network || {}).length;
+  const systemAs = bgp['system-as'] || null;
+
+  // Hostname
+  const hostname = CONFIG.system?.['host-name'] || 'VyOS Router';
 
   const hasFwData = Object.keys(fwStats).length > 0;
   const hasNatData = snatCount > 0 || dnatCount > 0;
 
   const html = `
-    <div class="stats-grid">
-      <div class="stat-card">
-        <div class="stat-icon">
+    <div class="dashboard-header" style="margin-bottom: 1.5rem; display: flex; align-items: center; justify-content: space-between;">
+      <div>
+        <h2 style="margin: 0;">${escapeHtml(hostname)}</h2>
+        <p class="text-muted" style="margin: 0.25rem 0 0 0;">Configuration Overview</p>
+      </div>
+      <button class="btn btn-secondary btn-sm" onclick="openGlobalSearch()" title="Global Search (/)">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        Search
+      </button>
+    </div>
+
+    <div class="dashboard-cards-grid">
+      <div class="dashboard-card clickable" onclick="loadSection('Firewall')">
+        <div class="dashboard-card-icon" style="background-color: var(--accent-light, #dbeafe); color: var(--accent-color);">
           <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
           </svg>
         </div>
-        <div class="stat-content">
-          <div class="stat-value">${Object.keys(fwStats).length}</div>
-          <div class="stat-label">Firewall Rulesets</div>
+        <div class="dashboard-card-content">
+          <div class="dashboard-card-value">${Object.keys(fwStats).length}</div>
+          <div class="dashboard-card-label">Firewall Rulesets</div>
+          <div class="dashboard-card-sub">${totalFwRules} total rules</div>
         </div>
       </div>
-      <div class="stat-card">
-        <div class="stat-icon" style="background-color: var(--success-light); color: var(--success-color);">
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
-          </svg>
-        </div>
-        <div class="stat-content">
-          <div class="stat-value">${totalFwRules}</div>
-          <div class="stat-label">Total Firewall Rules</div>
-        </div>
-      </div>
-      <div class="stat-card">
-        <div class="stat-icon" style="background-color: var(--warning-light); color: var(--warning-color);">
+
+      <div class="dashboard-card clickable" onclick="loadSection('NAT')">
+        <div class="dashboard-card-icon" style="background-color: var(--warning-light); color: var(--warning-color);">
           <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/>
             <polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/>
           </svg>
         </div>
-        <div class="stat-content">
-          <div class="stat-value">${snatCount + dnatCount}</div>
-          <div class="stat-label">NAT Rules</div>
+        <div class="dashboard-card-content">
+          <div class="dashboard-card-value">${snatCount + dnatCount}</div>
+          <div class="dashboard-card-label">NAT Rules</div>
+          <div class="dashboard-card-sub">${dnatCount} DNAT, ${snatCount} SNAT</div>
+        </div>
+      </div>
+
+      <div class="dashboard-card clickable" onclick="loadSection('Groups')">
+        <div class="dashboard-card-icon" style="background-color: var(--success-light); color: var(--success-color);">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+            <circle cx="9" cy="7" r="4"/>
+            <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+            <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+          </svg>
+        </div>
+        <div class="dashboard-card-content">
+          <div class="dashboard-card-value">${totalGroups}</div>
+          <div class="dashboard-card-label">Firewall Groups</div>
+          <div class="dashboard-card-sub">${addressGroups} addr, ${networkGroups} net, ${portGroups} port</div>
+        </div>
+      </div>
+
+      <div class="dashboard-card clickable" onclick="loadSection('Interfaces')">
+        <div class="dashboard-card-icon" style="background-color: #fce7f3; color: #db2777;">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="2" y="2" width="20" height="8" rx="2" ry="2"/>
+            <rect x="2" y="14" width="20" height="8" rx="2" ry="2"/>
+            <line x1="6" y1="6" x2="6.01" y2="6"/>
+            <line x1="6" y1="18" x2="6.01" y2="18"/>
+          </svg>
+        </div>
+        <div class="dashboard-card-content">
+          <div class="dashboard-card-value">${interfaceCount}</div>
+          <div class="dashboard-card-label">Interfaces</div>
+          <div class="dashboard-card-sub">Configured interfaces</div>
+        </div>
+      </div>
+
+      <div class="dashboard-card clickable" onclick="loadSection('Routes')">
+        <div class="dashboard-card-icon" style="background-color: #e0e7ff; color: #4f46e5;">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"/>
+            <line x1="2" y1="12" x2="22" y2="12"/>
+            <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+          </svg>
+        </div>
+        <div class="dashboard-card-content">
+          <div class="dashboard-card-value">${staticRoutes}</div>
+          <div class="dashboard-card-label">Static Routes</div>
+          <div class="dashboard-card-sub">Configured routes</div>
+        </div>
+      </div>
+
+      <div class="dashboard-card clickable" onclick="loadSection('BGP')">
+        <div class="dashboard-card-icon" style="background-color: #ccfbf1; color: #0d9488;">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="5" r="3"/>
+            <circle cx="5" cy="19" r="3"/>
+            <circle cx="19" cy="19" r="3"/>
+            <line x1="12" y1="8" x2="5" y2="16"/>
+            <line x1="12" y1="8" x2="19" y2="16"/>
+          </svg>
+        </div>
+        <div class="dashboard-card-content">
+          <div class="dashboard-card-value">${bgpNeighbors}</div>
+          <div class="dashboard-card-label">BGP Neighbors</div>
+          <div class="dashboard-card-sub">${systemAs ? `AS ${systemAs}` : 'Not configured'}${bgpNetworks > 0 ? `, ${bgpNetworks} networks` : ''}</div>
         </div>
       </div>
     </div>
+
     <div class="dashboard-grid">
       <div class="chart-container">
         <h3>Firewall Rules per Ruleset</h3>
@@ -4092,6 +5758,9 @@ document.addEventListener('keydown', (e) => {
     case 'u':
       document.getElementById('fileInput').click();
       break;
+    case 'd':
+      if (CONFIG) loadSection('Dashboard');
+      break;
     case 'f':
       if (CONFIG) loadSection('Firewall');
       break;
@@ -4101,14 +5770,31 @@ document.addEventListener('keydown', (e) => {
     case 'g':
       if (CONFIG) loadSection('Groups');
       break;
-    case 's':
-      if (currentRulesetName) openSearchModal();
+    case 'i':
+      if (CONFIG) loadSection('Interfaces');
       break;
     case 'r':
       if (currentRulesetName) {
+        // Toggle resolved state when viewing ruleset
         showResolved = !showResolved;
         renderRuleset();
+      } else if (CONFIG) {
+        loadSection('Routes');
       }
+      break;
+    case 'b':
+      if (CONFIG) loadSection('BGP');
+      break;
+    case 'a':
+      if (CONFIG) loadSection('Activity');
+      break;
+    case 's':
+      if (currentRulesetName) openSearchModal();
+      break;
+    case '/':
+      // Global search shortcut
+      e.preventDefault();
+      openGlobalSearch();
       break;
   }
 });

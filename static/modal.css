@@ -1676,3 +1676,212 @@ tr.pending-delete .pending-badge {
   color: var(--accent-color);
   background-color: rgba(0, 255, 65, 0.2);
 }
+
+/* =========================================
+   27. DASHBOARD CARDS GRID
+   ========================================= */
+
+.dashboard-cards-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.dashboard-card {
+  display: flex;
+  gap: 1rem;
+  padding: 1rem 1.25rem;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-lg);
+  transition: all var(--transition-fast);
+}
+
+.dashboard-card.clickable {
+  cursor: pointer;
+}
+
+.dashboard-card.clickable:hover {
+  border-color: var(--accent-color);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+  transform: translateY(-2px);
+}
+
+.dashboard-card-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  border-radius: var(--radius-md);
+  flex-shrink: 0;
+}
+
+.dashboard-card-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.dashboard-card-value {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.2;
+}
+
+.dashboard-card-label {
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--text-primary);
+  margin-top: 0.125rem;
+}
+
+.dashboard-card-sub {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-top: 0.125rem;
+}
+
+/* Dark theme adjustments */
+[data-theme="dark"] .dashboard-card.clickable:hover {
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+/* Retro theme adjustments */
+[data-theme="retro"] .dashboard-card {
+  border-width: 2px;
+  border-radius: 0;
+}
+
+[data-theme="retro"] .dashboard-card.clickable:hover {
+  box-shadow: 0 0 15px rgba(0, 255, 65, 0.3);
+  border-color: var(--accent-color);
+}
+
+[data-theme="retro"] .dashboard-card-value {
+  color: var(--accent-color);
+}
+
+[data-theme="retro"] .dashboard-card-icon {
+  border-radius: 0;
+  background-color: rgba(0, 255, 65, 0.15) !important;
+  color: var(--accent-color) !important;
+}
+
+/* =========================================
+   28. GLOBAL SEARCH
+   ========================================= */
+
+.global-search-results {
+  max-height: 400px;
+  overflow-y: auto;
+  margin-top: 1rem;
+}
+
+.global-search-results::-webkit-scrollbar {
+  width: 6px;
+}
+
+.global-search-results::-webkit-scrollbar-track {
+  background: var(--bg-body);
+}
+
+.global-search-results::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 3px;
+}
+
+.search-result-section {
+  margin-bottom: 1rem;
+}
+
+.search-result-section:last-child {
+  margin-bottom: 0;
+}
+
+.search-result-section-header {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--border-color);
+  margin-bottom: 0.25rem;
+}
+
+.search-result-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.625rem 0.75rem;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background-color var(--transition-fast);
+}
+
+.search-result-item:hover {
+  background-color: var(--bg-hover);
+}
+
+.search-result-target {
+  font-weight: 500;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+}
+
+.search-result-match {
+  font-size: 0.8125rem;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Retro theme */
+[data-theme="retro"] .search-result-item:hover {
+  background-color: rgba(0, 255, 65, 0.1);
+}
+
+[data-theme="retro"] .search-result-target {
+  color: var(--accent-color);
+}
+
+/* =========================================
+   29. RESPONSIVE DASHBOARD
+   ========================================= */
+
+@media (max-width: 768px) {
+  .dashboard-cards-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .dashboard-card {
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    gap: 0.5rem;
+  }
+
+  .dashboard-card-icon {
+    width: 40px;
+    height: 40px;
+  }
+
+  .dashboard-card-value {
+    font-size: 1.25rem;
+  }
+}
+
+@media (max-width: 480px) {
+  .dashboard-cards-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .dashboard-card {
+    flex-direction: row;
+    text-align: left;
+  }
+}

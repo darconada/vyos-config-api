@@ -14,6 +14,12 @@ VyOS Config Viewer API is a Flask-based web application that provides a visual i
 - Resolve firewall groups (address-group, network-group, port-group) inline or via modal
 - **Create, modify, and delete firewall rules** (via API)
 - **Create, modify, and delete NAT rules** (via API)
+- **Create, modify, and delete firewall groups** (via API)
+- **Create and delete static routes** with VRF support (via API)
+- **Create and delete BGP neighbors and networks** (via API)
+- **View interfaces** with subinterfaces (vif) and VRF assignments
+- **Dashboard** with configuration statistics
+- **Global search** across all configuration sections
 - **Save configuration to router** (via API)
 
 ## Development Commands
@@ -249,6 +255,90 @@ let groupModalEntries = [];         // Current entries in modal
 let groupOriginalEntries = [];      // Original entries for diff calculation
 let groupOriginalDescription = null; // Original description for diff
 ```
+
+**Dashboard:**
+- Statistics cards showing counts for all configuration sections
+- Clickable cards that navigate to respective sections
+- Router hostname display
+- Responsive grid layout
+- Keyboard shortcut: `d` to navigate to Dashboard
+
+**Interfaces View (Read-Only):**
+- Displays all interface types: ethernet, bonding, bridge, vlan, loopback, wireguard, openvpn, tunnel, dummy, vti, pppoe
+- Grouped by interface type with collapsible sections
+- Shows subinterfaces (vif/VLAN) nested under parent interfaces
+- VRF column showing which VRF each interface belongs to
+- Displays address, description, and type-specific details (hw-id, mode, members, etc.)
+- Keyboard shortcut: `i` to navigate to Interfaces
+
+### API Endpoints (Interfaces & VRFs)
+- `GET /api/interfaces` - Returns all interfaces configuration
+- `GET /api/vrfs` - Returns list of configured VRF names
+
+**Global Search:**
+- Search input accessible via `/` keyboard shortcut
+- Searches across: Firewall rules, NAT rules, Groups, Interfaces, Routes, BGP
+- Results dropdown grouped by section
+- Click result to navigate to corresponding section
+
+**Static Routes (CRUD):**
+- Full CRUD for static routes with VRF support
+- Supports route types: next-hop, blackhole, interface
+- Optional administrative distance
+- VRF selector in create modal (lists all configured VRFs)
+- Verbose mode shows command preview before execution
+- Integrated with staged mode and activity log
+- Keyboard shortcut: `r` to navigate to Routes
+
+### API Endpoints (Static Routes)
+- `GET /api/static-routes` - Returns routes from default VRF and all named VRFs
+  - Response format: `{ default: {...}, vrfs: { vrf_name: {...} } }`
+- `POST /api/static-route` - Create static route (supports `vrf` parameter)
+- `DELETE /api/static-route` - Delete static route (supports `vrf` parameter)
+
+**BGP Configuration (CRUD):**
+- System AS configuration
+- Neighbors management (remote-as, description, update-source, ebgp-multihop)
+- Address-family settings (IPv4 unicast, soft-reconfiguration, route-maps)
+- Networks management (advertised prefixes)
+- Integrated with staged mode, verbose mode, and activity log
+- Keyboard shortcut: `b` to navigate to BGP
+
+### API Endpoints (BGP)
+- `GET /api/bgp` - Returns full BGP configuration
+- `POST /api/bgp/neighbor` - Create/update BGP neighbor
+- `DELETE /api/bgp/neighbor` - Delete BGP neighbor
+- `POST /api/bgp/network` - Add advertised network
+- `DELETE /api/bgp/network` - Remove advertised network
+- `POST /api/bgp/system-as` - Configure local AS number
+
+### Navigation & Keyboard Shortcuts
+```javascript
+const sections = ['Dashboard', 'Firewall', 'NAT', 'Groups', 'Interfaces', 'Routes', 'BGP', 'Activity'];
+```
+
+| Key | Action |
+|-----|--------|
+| `d` | Dashboard |
+| `f` | Firewall |
+| `n` | NAT |
+| `g` | Groups |
+| `i` | Interfaces |
+| `r` | Routes |
+| `b` | BGP |
+| `a` | Activity |
+| `/` | Global Search |
+
+### Version Compatibility (adapt_14)
+The `adapt_14()` function now copies the following sections from VyOS 1.4 config:
+- `firewall` (with ipv4.name transformation)
+- `nat`
+- `system`
+- `service`
+- `protocols`
+- `policy`
+- `interfaces`
+- `vrf`
 
 ---
 

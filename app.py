@@ -33,10 +33,12 @@ def adapt_14(raw14):
         "nat":  raw14.get("nat", {}),
 
         # Copiamos el resto tal cual (por si la UI los usa)
-        "system":    raw14.get("system",    {}),
-        "service":   raw14.get("service",   {}),
-        "protocols": raw14.get("protocols", {}),
-        "policy":    raw14.get("policy",    {})
+        "system":     raw14.get("system",     {}),
+        "service":    raw14.get("service",    {}),
+        "protocols":  raw14.get("protocols",  {}),
+        "policy":     raw14.get("policy",     {}),
+        "interfaces": raw14.get("interfaces", {}),
+        "vrf":        raw14.get("vrf",        {})
     }
 
     # —— trasladamos los rule-sets IPv4 (firewall.ipv4.name.*.rule) ——
@@ -585,6 +587,320 @@ def connection_status():
         'connected': ACTIVE_API is not None,
         'config_loaded': CONFIG is not None
     })
+
+
+# ──────────────────────────────────────────────────────────────
+#  Dashboard Stats
+# ──────────────────────────────────────────────────────────────
+@app.route('/api/dashboard-stats')
+def dashboard_stats():
+    """Devuelve estadísticas para el dashboard."""
+    if not CONFIG:
+        return jsonify({})
+
+    def count_interfaces(cfg):
+        total = 0
+        for itype in cfg.get('interfaces', {}).values():
+            if isinstance(itype, dict):
+                total += len(itype)
+        return total
+
+    # Count firewall rulesets and rules
+    fw_name = CONFIG.get('firewall', {}).get('name', {})
+    firewall_rulesets = len(fw_name)
+    firewall_rules = sum(len(rs.get('rule', {})) for rs in fw_name.values())
+
+    # Count NAT rules
+    nat_dest = len(CONFIG.get('nat', {}).get('destination', {}).get('rule', {}))
+    nat_source = len(CONFIG.get('nat', {}).get('source', {}).get('rule', {}))
+
+    # Count groups
+    groups = CONFIG.get('firewall', {}).get('group', {})
+    address_groups = len(groups.get('address-group', {}))
+    network_groups = len(groups.get('network-group', {}))
+    port_groups = len(groups.get('port-group', {}))
+
+    # Count static routes
+    static_routes = len(CONFIG.get('protocols', {}).get('static', {}).get('route', {}))
+
+    # Count BGP neighbors
+    bgp = CONFIG.get('protocols', {}).get('bgp', {})
+    bgp_neighbors = len(bgp.get('neighbor', {}))
+    bgp_networks = len(bgp.get('address-family', {}).get('ipv4-unicast', {}).get('network', {}))
+
+    stats = {
+        'firewall': {
+            'rulesets': firewall_rulesets,
+            'rules': firewall_rules
+        },
+        'nat': {
+            'destination': nat_dest,
+            'source': nat_source,
+            'total': nat_dest + nat_source
+        },
+        'groups': {
+            'address': address_groups,
+            'network': network_groups,
+            'port': port_groups,
+            'total': address_groups + network_groups + port_groups
+        },
+        'interfaces': count_interfaces(CONFIG),
+        'routing': {
+            'static_routes': static_routes,
+            'bgp_neighbors': bgp_neighbors,
+            'bgp_networks': bgp_networks
+        },
+        'system': {
+            'hostname': CONFIG.get('system', {}).get('host-name', 'Unknown')
+        }
+    }
+    return jsonify(stats)
+
+
+# ──────────────────────────────────────────────────────────────
+#  Interfaces (Read Only)
+# ──────────────────────────────────────────────────────────────
+@app.route('/api/interfaces')
+def interfaces():
+    """Devuelve configuración de interfaces."""
+    if not CONFIG:
+        return jsonify({})
+    return jsonify(CONFIG.get('interfaces', {}))
+
+
+# ──────────────────────────────────────────────────────────────
+#  VRFs
+# ──────────────────────────────────────────────────────────────
+@app.route('/api/vrfs')
+def list_vrfs():
+    """Devuelve lista de VRFs configurados."""
+    if not CONFIG:
+        return jsonify([])
+    vrfs = CONFIG.get('vrf', {}).get('name', {})
+    return jsonify(list(vrfs.keys()))
+
+
+# ──────────────────────────────────────────────────────────────
+#  Static Routes
+# ──────────────────────────────────────────────────────────────
+@app.route('/api/static-routes')
+def static_routes():
+    """Devuelve rutas estáticas de todos los VRFs."""
+    if not CONFIG:
+        return jsonify({'default': {}, 'vrfs': {}})
+
+    # Rutas del VRF default (protocols.static.route)
+    default_routes = CONFIG.get('protocols', {}).get('static', {}).get('route', {})
+
+    # Rutas de VRFs específicos (vrf.name.<vrf>.protocols.static.route)
+    vrf_routes = {}
+    vrfs = CONFIG.get('vrf', {}).get('name', {})
+    for vrf_name, vrf_data in vrfs.items():
+        routes = vrf_data.get('protocols', {}).get('static', {}).get('route', {})
+        if routes:
+            vrf_routes[vrf_name] = routes
+
+    return jsonify({
+        'default': default_routes,
+        'vrfs': vrf_routes
+    })
+
+
+@app.route('/api/static-route', methods=['POST', 'DELETE'])
+def manage_static_route():
+    """Crear o eliminar ruta estática."""
+    global CONFIG
+
+    if not ACTIVE_API:
+        return jsonify({'error': 'No active connection. Connect to router first.'}), 400
+
+    data = request.get_json() or {}
+    network = data.get('network')
+    vrf = data.get('vrf')  # None or VRF name (not 'default')
+
+    if not network:
+        return jsonify({'error': 'network is required'}), 400
+
+    # Build base path depending on VRF
+    # Default VRF: protocols static route NETWORK
+    # Named VRF:   vrf name VRF_NAME protocols static route NETWORK
+    if vrf and vrf != 'default':
+        base_path = ['vrf', 'name', vrf, 'protocols', 'static', 'route', network]
+    else:
+        base_path = ['protocols', 'static', 'route', network]
+
+    try:
+        if request.method == 'DELETE':
+            # Delete entire route (not just the next-hop)
+            # This removes the whole route entry regardless of target type
+            ACTIVE_API.delete_path(base_path)
+        else:
+            # Create route
+            route_type = data.get('type')  # 'next-hop', 'blackhole', 'interface'
+            target = data.get('target')
+            distance = data.get('distance')
+
+            if not route_type:
+                return jsonify({'error': 'type is required'}), 400
+
+            ops = []
+
+            if route_type == 'next-hop':
+                if not target:
+                    return jsonify({'error': 'target (next-hop IP) is required for next-hop routes'}), 400
+                ops.append({'op': 'set', 'path': base_path + ['next-hop', target]})
+                if distance:
+                    ops.append({'op': 'set', 'path': base_path + ['next-hop', target, 'distance', str(distance)]})
+            elif route_type == 'blackhole':
+                ops.append({'op': 'set', 'path': base_path + ['blackhole']})
+                if distance:
+                    ops.append({'op': 'set', 'path': base_path + ['blackhole', 'distance', str(distance)]})
+            elif route_type == 'interface':
+                if not target:
+                    return jsonify({'error': 'target (interface name) is required for interface routes'}), 400
+                ops.append({'op': 'set', 'path': base_path + ['interface', target]})
+                if distance:
+                    ops.append({'op': 'set', 'path': base_path + ['interface', target, 'distance', str(distance)]})
+            else:
+                return jsonify({'error': 'Invalid route type. Use: next-hop, blackhole, or interface'}), 400
+
+            ACTIVE_API.configure(ops)
+
+        # Reload config
+        raw = ACTIVE_API.get_config()
+        CONFIG = load_config(raw)
+
+        return jsonify({'status': 'ok', 'message': 'Static route updated successfully'})
+
+    except VyOSAPIError as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ──────────────────────────────────────────────────────────────
+#  BGP Configuration
+# ──────────────────────────────────────────────────────────────
+@app.route('/api/bgp')
+def bgp_config():
+    """Devuelve configuración BGP."""
+    if not CONFIG:
+        return jsonify({})
+    return jsonify(CONFIG.get('protocols', {}).get('bgp', {}))
+
+
+@app.route('/api/bgp/neighbor', methods=['POST', 'DELETE'])
+def manage_bgp_neighbor():
+    """Crear o eliminar neighbor BGP."""
+    global CONFIG
+
+    if not ACTIVE_API:
+        return jsonify({'error': 'No active connection. Connect to router first.'}), 400
+
+    data = request.get_json() or {}
+    neighbor_ip = data.get('neighbor')
+
+    if not neighbor_ip:
+        return jsonify({'error': 'neighbor IP is required'}), 400
+
+    try:
+        if request.method == 'DELETE':
+            ACTIVE_API.delete_path(['protocols', 'bgp', 'neighbor', neighbor_ip])
+        else:
+            remote_as = data.get('remote_as')
+            if not remote_as:
+                return jsonify({'error': 'remote_as is required'}), 400
+
+            base_path = ['protocols', 'bgp', 'neighbor', neighbor_ip]
+            ops = [{'op': 'set', 'path': base_path + ['remote-as', str(remote_as)]}]
+
+            if data.get('description'):
+                ops.append({'op': 'set', 'path': base_path + ['description', data['description']]})
+            if data.get('update_source'):
+                ops.append({'op': 'set', 'path': base_path + ['update-source', data['update_source']]})
+            if data.get('ebgp_multihop'):
+                ops.append({'op': 'set', 'path': base_path + ['ebgp-multihop', str(data['ebgp_multihop'])]})
+            if data.get('password'):
+                ops.append({'op': 'set', 'path': base_path + ['password', data['password']]})
+
+            # Address family settings
+            if data.get('ipv4_unicast'):
+                af_path = base_path + ['address-family', 'ipv4-unicast']
+                ops.append({'op': 'set', 'path': af_path})
+                if data.get('soft_reconfiguration'):
+                    ops.append({'op': 'set', 'path': af_path + ['soft-reconfiguration', 'inbound']})
+                if data.get('route_map_import'):
+                    ops.append({'op': 'set', 'path': af_path + ['route-map', 'import', data['route_map_import']]})
+                if data.get('route_map_export'):
+                    ops.append({'op': 'set', 'path': af_path + ['route-map', 'export', data['route_map_export']]})
+
+            ACTIVE_API.configure(ops)
+
+        # Reload config
+        raw = ACTIVE_API.get_config()
+        CONFIG = load_config(raw)
+
+        return jsonify({'status': 'ok', 'message': 'BGP neighbor updated successfully'})
+
+    except VyOSAPIError as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/bgp/network', methods=['POST', 'DELETE'])
+def manage_bgp_network():
+    """Añadir o eliminar network BGP."""
+    global CONFIG
+
+    if not ACTIVE_API:
+        return jsonify({'error': 'No active connection. Connect to router first.'}), 400
+
+    data = request.get_json() or {}
+    network = data.get('network')
+
+    if not network:
+        return jsonify({'error': 'network is required'}), 400
+
+    try:
+        path = ['protocols', 'bgp', 'address-family', 'ipv4-unicast', 'network', network]
+
+        if request.method == 'DELETE':
+            ACTIVE_API.delete_path(path)
+        else:
+            ACTIVE_API.configure([{'op': 'set', 'path': path}])
+
+        # Reload config
+        raw = ACTIVE_API.get_config()
+        CONFIG = load_config(raw)
+
+        return jsonify({'status': 'ok', 'message': 'BGP network updated successfully'})
+
+    except VyOSAPIError as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/bgp/system-as', methods=['POST'])
+def set_bgp_system_as():
+    """Configurar ASN local para BGP."""
+    global CONFIG
+
+    if not ACTIVE_API:
+        return jsonify({'error': 'No active connection. Connect to router first.'}), 400
+
+    data = request.get_json() or {}
+    system_as = data.get('system_as')
+
+    if not system_as:
+        return jsonify({'error': 'system_as is required'}), 400
+
+    try:
+        ACTIVE_API.configure([{'op': 'set', 'path': ['protocols', 'bgp', 'system-as', str(system_as)]}])
+
+        # Reload config
+        raw = ACTIVE_API.get_config()
+        CONFIG = load_config(raw)
+
+        return jsonify({'status': 'ok', 'message': 'BGP system AS configured successfully'})
+
+    except VyOSAPIError as e:
+        return jsonify({'error': str(e)}), 500
 
 
 if __name__ == '__main__':
