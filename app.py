@@ -113,6 +113,55 @@ def get_section(section):
 
 
 # ──────────────────────────────────────────────────────────────
+#  API de lectura (Firewall Groups)
+# ──────────────────────────────────────────────────────────────
+@app.route('/api/firewall/groups')
+def firewall_groups():
+    """Lista todos los grupos de firewall."""
+    if not CONFIG:
+        return jsonify({})
+    return jsonify(CONFIG.get('firewall', {}).get('group', {}))
+
+
+@app.route('/api/firewall/group-usage/<gtype>/<gname>')
+def firewall_group_usage(gtype, gname):
+    """
+    Devuelve las reglas que usan un grupo específico.
+    Útil para verificar antes de eliminar un grupo.
+    """
+    if not CONFIG:
+        return jsonify({'firewall': [], 'nat': []})
+
+    references = {'firewall': [], 'nat': []}
+
+    # Buscar en reglas de firewall
+    for rs_name, rs_data in CONFIG.get('firewall', {}).get('name', {}).items():
+        for rule_id, rule in rs_data.get('rule', {}).items():
+            for side in ['source', 'destination']:
+                group = rule.get(side, {}).get('group', {})
+                if group.get(f'{gtype}-group') == gname:
+                    references['firewall'].append({
+                        'ruleset': rs_name,
+                        'rule_id': rule_id,
+                        'side': side
+                    })
+
+    # Buscar en reglas NAT (también pueden usar grupos)
+    for nat_type in ['source', 'destination']:
+        for rule_id, rule in CONFIG.get('nat', {}).get(nat_type, {}).get('rule', {}).items():
+            for side in ['source', 'destination']:
+                group = rule.get(side, {}).get('group', {})
+                if group.get(f'{gtype}-group') == gname:
+                    references['nat'].append({
+                        'nat_type': nat_type,
+                        'rule_id': rule_id,
+                        'side': side
+                    })
+
+    return jsonify(references)
+
+
+# ──────────────────────────────────────────────────────────────
 #  Conexión via API REST de VyOS
 # ──────────────────────────────────────────────────────────────
 @app.route('/fetch-config', methods=['POST'])
@@ -240,6 +289,56 @@ def manage_nat_rule():
         CONFIG = load_config(raw)
 
         return jsonify({'status': 'ok', 'message': 'NAT rule updated successfully'})
+
+    except VyOSAPIError as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ──────────────────────────────────────────────────────────────
+#  API de escritura (Firewall Groups)
+# ──────────────────────────────────────────────────────────────
+@app.route('/api/firewall/group', methods=['POST', 'PUT', 'DELETE'])
+def manage_firewall_group():
+    """Crear, modificar o eliminar grupo de firewall."""
+    global CONFIG
+
+    if not ACTIVE_API:
+        return jsonify({'error': 'No active connection. Connect to router first.'}), 400
+
+    data = request.get_json() or {}
+    group_type = data.get('group_type')  # 'address', 'network', 'port'
+    group_name = data.get('group_name')
+
+    if not group_type or not group_name:
+        return jsonify({'error': 'group_type and group_name are required'}), 400
+
+    if group_type not in ['address', 'network', 'port']:
+        return jsonify({'error': 'group_type must be "address", "network", or "port"'}), 400
+
+    try:
+        if request.method == 'DELETE':
+            # Eliminar grupo
+            ACTIVE_API.delete_firewall_group(group_type, group_name)
+        else:
+            # Check if this is a differential update
+            diff = data.get('diff')
+            if diff:
+                # Differential update - only change what's different
+                base_path = ['firewall', 'group', f'{group_type}-group', group_name]
+                ops = build_diff_operations(base_path, diff)
+                if ops:
+                    ACTIVE_API.configure(ops)
+            else:
+                # Full create/update
+                entries = data.get('entries', [])
+                description = data.get('description')
+                ACTIVE_API.create_firewall_group(group_type, group_name, entries, description)
+
+        # Recargar configuración
+        raw = ACTIVE_API.get_config()
+        CONFIG = load_config(raw)
+
+        return jsonify({'status': 'ok', 'message': 'Group updated successfully'})
 
     except VyOSAPIError as e:
         return jsonify({'error': str(e)}), 500
@@ -403,6 +502,28 @@ def build_vyos_operations(operation):
                 ops.append({'op': 'set', 'path': base_path + ['inbound-interface', 'name', rule['inbound-interface']['name']]})
             if rule.get('outbound-interface', {}).get('name'):
                 ops.append({'op': 'set', 'path': base_path + ['outbound-interface', 'name', rule['outbound-interface']['name']]})
+
+    elif op_type == 'group':
+        group_type = data.get('group_type')  # 'address', 'network', 'port'
+        group_name = data.get('group_name')
+        entry_key = {'address': 'address', 'network': 'network', 'port': 'port'}[group_type]
+        base_path = ['firewall', 'group', f'{group_type}-group', group_name]
+
+        if action == 'delete':
+            ops.append({'op': 'delete', 'path': base_path})
+        elif diff and action == 'update':
+            # Differential update - only change what's different
+            ops.extend(build_diff_operations(base_path, diff))
+        else:
+            # Full create/update
+            entries = data.get('entries', [])
+            description = data.get('description')
+
+            for entry in entries:
+                ops.append({'op': 'set', 'path': base_path + [entry_key, str(entry)]})
+
+            if description:
+                ops.append({'op': 'set', 'path': base_path + ['description', description]})
 
     return ops
 

@@ -227,6 +227,29 @@ let activityLogIdCounter = 0;   // Auto-increment ID for entries
 // Entry structure: { id, timestamp, type, action, target, status, message, commands }
 ```
 
+**Firewall Groups Management:**
+- New "Groups" section in navigation menu (alongside Firewall, NAT, Activity)
+- Supports three group types: address-group, network-group, port-group
+- Full CRUD operations: create, view, edit, delete groups
+- Entry validation with format-specific patterns (IP, CIDR, ports)
+- Usage checking before delete (prevents deleting groups used by rules)
+- Integrated with staged mode, verbose mode, and activity log
+- Keyboard shortcut: `g` to navigate to Groups section
+
+### API Endpoints (Firewall Groups)
+- `GET /api/firewall/groups` - List all firewall groups
+- `GET /api/firewall/group-usage/<gtype>/<gname>` - Find rules using a group
+- `POST /api/firewall/group` - Create or update a group (supports diff)
+- `DELETE /api/firewall/group` - Delete a group
+
+### Frontend State (Groups)
+```javascript
+let groupsData = null;              // Cached groups from API
+let groupModalEntries = [];         // Current entries in modal
+let groupOriginalEntries = [];      // Original entries for diff calculation
+let groupOriginalDescription = null; // Original description for diff
+```
+
 ---
 
 <claude-mem-context>

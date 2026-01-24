@@ -230,6 +230,10 @@
             <span>Go to NAT</span>
           </div>
           <div class="shortcut-item">
+            <kbd>g</kbd>
+            <span>Go to Groups</span>
+          </div>
+          <div class="shortcut-item">
             <kbd>s</kbd>
             <span>Search traffic (in Firewall view)</span>
           </div>
@@ -504,6 +508,82 @@
       <div class="modal-footer">
         <button class="btn btn-secondary" onclick="closeModal('natRuleModal')">Cancelar</button>
         <button class="btn btn-primary" onclick="saveNatRule()">Guardar</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Group Edit Modal -->
+  <div id="groupEditModal" class="modal modal-draggable hidden">
+    <div class="modal-backdrop"></div>
+    <div id="groupEditModalContent" class="modal-content modal-lg">
+      <div id="groupEditModalHeader" class="modal-header">
+        <h3 id="groupEditTitle">New Group</h3>
+        <button class="modal-close" onclick="closeModal('groupEditModal')">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <form id="groupEditForm">
+          <input type="hidden" id="groupEditMode" value="create">
+          <input type="hidden" id="groupEditOriginalName" value="">
+          <div class="form-row">
+            <div class="form-group">
+              <label>Group Type *</label>
+              <select id="groupEditType" required onchange="updateGroupEntryHint()">
+                <option value="address">Address Group</option>
+                <option value="network">Network Group</option>
+                <option value="port">Port Group</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Group Name *</label>
+              <input type="text" id="groupEditName" required pattern="[A-Za-z0-9_-]+" placeholder="MY_GROUP_NAME">
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Description</label>
+            <input type="text" id="groupEditDescription" maxlength="255" placeholder="Optional description">
+          </div>
+          <fieldset class="form-fieldset">
+            <legend>Entries</legend>
+            <div class="group-entries-container">
+              <div class="group-entries-header">
+                <input type="text" id="groupNewEntry" placeholder="Add entry..." onkeydown="if(event.key==='Enter'){event.preventDefault();addGroupEntry();}">
+                <button type="button" class="btn btn-success btn-sm" onclick="addGroupEntry()">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="12" y1="5" x2="12" y2="19"></line>
+                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                  </svg>
+                  Add
+                </button>
+              </div>
+              <ul id="groupEntriesList" class="group-entries-list">
+                <li class="group-entries-empty">No entries yet. Add entries above.</li>
+              </ul>
+              <div id="groupEntryValidationHint" class="group-entry-validation-hint">
+                Format: IP address or IP range (e.g., 10.0.0.1 or 10.0.0.1-10.0.0.10)
+              </div>
+            </div>
+          </fieldset>
+        </form>
+        <div id="groupUsageInfo" class="group-usage-warning hidden">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+            <line x1="12" y1="9" x2="12" y2="13"></line>
+            <line x1="12" y1="17" x2="12.01" y2="17"></line>
+          </svg>
+          <div>
+            <strong>This group is used in rules:</strong>
+            <ul id="groupUsageList" class="group-usage-list"></ul>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('groupEditModal')">Cancel</button>
+        <button class="btn btn-primary" onclick="saveGroup()">Save</button>
       </div>
     </div>
   </div>

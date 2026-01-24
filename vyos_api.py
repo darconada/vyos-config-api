@@ -406,3 +406,60 @@ class VyOSAPI:
         """
         path = ['nat', nat_type, 'rule', str(rule_id)]
         return self.delete_path(path)
+
+    # ========== HELPERS PARA FIREWALL GROUPS ==========
+
+    def create_firewall_group(self, group_type, group_name, entries, description=None):
+        """
+        Crea o modifica un grupo de firewall.
+
+        Args:
+            group_type: 'address', 'network', o 'port'
+            group_name: Nombre del grupo
+            entries: Lista de entradas (IPs, redes CIDR, o puertos según tipo)
+            description: Descripción opcional del grupo
+
+        Formatos de entries según tipo:
+            - address: IPs individuales o rangos ('10.0.0.1', '10.0.0.1-10.0.0.10')
+            - network: Redes CIDR ('192.168.0.0/24', '10.0.0.0/8')
+            - port: Puertos, rangos, o nombres ('443', '8000-8100', 'http', 'https')
+
+        Ejemplo:
+            api.create_firewall_group('address', 'TRUSTED_IPS', [
+                '192.168.1.1',
+                '192.168.1.100-192.168.1.110'
+            ], 'IPs de confianza')
+
+            api.create_firewall_group('network', 'INTERNAL_NETS', [
+                '192.168.0.0/24',
+                '10.0.0.0/8'
+            ])
+
+            api.create_firewall_group('port', 'WEB_PORTS', [
+                '80',
+                '443',
+                '8080-8090'
+            ])
+        """
+        entry_key = {'address': 'address', 'network': 'network', 'port': 'port'}[group_type]
+        base_path = ['firewall', 'group', f'{group_type}-group', group_name]
+        ops = []
+
+        for entry in entries:
+            ops.append({'op': 'set', 'path': base_path + [entry_key, str(entry)]})
+
+        if description:
+            ops.append({'op': 'set', 'path': base_path + ['description', description]})
+
+        return self.configure(ops)
+
+    def delete_firewall_group(self, group_type, group_name):
+        """
+        Elimina un grupo de firewall.
+
+        Args:
+            group_type: 'address', 'network', o 'port'
+            group_name: Nombre del grupo a eliminar
+        """
+        path = ['firewall', 'group', f'{group_type}-group', group_name]
+        return self.delete_path(path)

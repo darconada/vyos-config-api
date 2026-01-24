@@ -28,7 +28,13 @@ let ipFilters = { source: null, destination: null };
 let natData = null;
 const natTextFilters = { 'Destination NAT': {}, 'Source NAT': {} };
 const natIpFilters = { 'Destination NAT': {}, 'Source NAT': {} };
-const sections = ['Firewall', 'NAT', 'Activity'];
+const sections = ['Firewall', 'NAT', 'Groups', 'Activity'];
+
+// Groups state
+let groupsData = null;
+let groupModalEntries = [];      // Current entries in the modal (array of strings)
+let groupOriginalEntries = [];   // Original entries when editing (for diff)
+let groupOriginalDescription = null; // Original description for diff
 
 // Activity Log - stores all operations performed during the session
 let activityLog = [];
@@ -220,6 +226,7 @@ function drawMenu() {
   const icons = {
     Firewall: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>',
     NAT: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/></svg>',
+    Groups: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
     Activity: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>'
   };
 
@@ -249,6 +256,10 @@ async function loadSection(sec) {
   if (sec === 'Activity') {
     updateBreadcrumb([{ label: 'Activity Log', action: "loadSection('Activity')" }]);
     return renderActivityLog();
+  }
+  if (sec === 'Groups') {
+    updateBreadcrumb([{ label: 'Firewall Groups', action: "loadSection('Groups')" }]);
+    return loadGroups();
   }
 
   showLoading(`Loading ${sec}...`);
@@ -1485,7 +1496,7 @@ async function doFetchConfig() {
 // CLOSE MODAL
 // =========================================
 // Static modals that should NOT be removed from DOM
-const STATIC_MODALS = ['shortcutsModal', 'confirmModal', 'firewallRuleModal', 'natRuleModal', 'commandPreviewModal'];
+const STATIC_MODALS = ['shortcutsModal', 'confirmModal', 'firewallRuleModal', 'natRuleModal', 'commandPreviewModal', 'groupEditModal'];
 
 function closeModal(id) {
   const modal = document.getElementById(id);
@@ -3193,7 +3204,858 @@ document.addEventListener('DOMContentLoaded', () => {
   initDraggableModal('commandPreviewModal', 'commandPreviewModalHeader', 'commandPreviewModalContent');
   initDraggableModal('firewallRuleModal', 'firewallRuleModalHeader', 'firewallRuleModalContent');
   initDraggableModal('natRuleModal', 'natRuleModalHeader', 'natRuleModalContent');
+  initDraggableModal('groupEditModal', 'groupEditModalHeader', 'groupEditModalContent');
 });
+
+// =========================================
+// FIREWALL GROUPS
+// =========================================
+
+// Load groups data from API
+async function loadGroups() {
+  content.innerHTML = showSkeletonTable(6, 3);
+
+  try {
+    const res = await fetch('/api/firewall/groups');
+    groupsData = await res.json();
+    renderGroups();
+  } catch (e) {
+    showToast('error', 'Error', 'Failed to load firewall groups');
+    content.innerHTML = '<div class="empty-state"><p class="text-muted">Failed to load firewall groups</p></div>';
+  }
+}
+
+// Render groups view
+function renderGroups() {
+  const groups = groupsData || {};
+  const groupTypes = [
+    { key: 'address-group', label: 'Address Groups', entryKey: 'address', icon: 'IP' },
+    { key: 'network-group', label: 'Network Groups', entryKey: 'network', icon: 'NET' },
+    { key: 'port-group', label: 'Port Groups', entryKey: 'port', icon: 'PORT' }
+  ];
+
+  // Check if any groups exist
+  const hasGroups = groupTypes.some(gt => Object.keys(groups[gt.key] || {}).length > 0);
+
+  if (!hasGroups) {
+    content.innerHTML = `
+      <div class="groups-empty">
+        <div class="groups-empty-icon">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+            <circle cx="9" cy="7" r="4"/>
+            <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+            <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+          </svg>
+        </div>
+        <div class="groups-empty-title">No Firewall Groups</div>
+        <p class="groups-empty-description">Create groups to organize IP addresses, networks, and ports for use in firewall rules.</p>
+        ${isConnected ? `
+          <button class="btn btn-primary" onclick="openGroupModal('create')" style="margin-top: 1rem;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+            Create First Group
+          </button>
+        ` : ''}
+      </div>
+    `;
+    return;
+  }
+
+  // Render group sections
+  let html = '';
+
+  // Add "New Group" button if connected
+  if (isConnected) {
+    html += `
+      <div class="table-actions" style="margin-bottom: 1.5rem;">
+        <button class="btn btn-success btn-sm" onclick="openGroupModal('create', 'address')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+          New Address Group
+        </button>
+        <button class="btn btn-success btn-sm" onclick="openGroupModal('create', 'network')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+          New Network Group
+        </button>
+        <button class="btn btn-success btn-sm" onclick="openGroupModal('create', 'port')">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+          New Port Group
+        </button>
+      </div>
+    `;
+  }
+
+  for (const gt of groupTypes) {
+    const typeGroups = groups[gt.key] || {};
+    const groupNames = Object.keys(typeGroups);
+
+    if (groupNames.length === 0) continue;
+
+    html += `
+      <div class="groups-section">
+        <div class="groups-section-header">
+          <h3>${gt.label}</h3>
+          <span class="groups-section-count">${groupNames.length} group${groupNames.length !== 1 ? 's' : ''}</span>
+        </div>
+        <div class="groups-grid">
+    `;
+
+    for (const groupName of groupNames.sort()) {
+      const groupData = typeGroups[groupName];
+      const entries = getGroupEntries(groupData, gt.entryKey);
+      const description = groupData.description || '';
+      const pendingStatus = getGroupPendingStatus(gt.key.replace('-group', ''), groupName);
+      const pendingClass = pendingStatus === 'delete' ? 'pending-delete' :
+        (pendingStatus ? 'pending-change' : '');
+      const pendingBadge = pendingStatus ? `<span class="pending-badge">${pendingStatus === 'delete' ? 'DEL' : 'MOD'}</span>` : '';
+
+      html += `
+        <div class="group-card ${pendingClass}">
+          <div class="group-card-info">
+            <div class="group-card-name">${escapeHtml(groupName)}${pendingBadge}</div>
+            <div class="group-card-meta">
+              <span class="group-card-entries-count">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/>
+                  <line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>
+                </svg>
+                ${entries.length} entr${entries.length !== 1 ? 'ies' : 'y'}
+              </span>
+              ${description ? `<span class="group-card-description">${escapeHtml(description)}</span>` : ''}
+            </div>
+          </div>
+          <div class="group-card-actions">
+            <button class="btn-icon" onclick="showGroupDetails('${gt.key.replace('-group', '')}', '${escapeHtml(groupName)}')" title="View entries">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                <circle cx="12" cy="12" r="3"/>
+              </svg>
+            </button>
+            ${isConnected ? `
+              <button class="btn-icon" onclick="openGroupModal('edit', '${gt.key.replace('-group', '')}', '${escapeHtml(groupName)}')" title="Edit group">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                  <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                </svg>
+              </button>
+              <button class="btn-icon btn-danger" onclick="deleteGroup('${gt.key.replace('-group', '')}', '${escapeHtml(groupName)}')" title="Delete group">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="3 6 5 6 21 6"/>
+                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                </svg>
+              </button>
+            ` : ''}
+          </div>
+        </div>
+      `;
+    }
+
+    html += '</div></div>';
+  }
+
+  content.innerHTML = html;
+}
+
+// Get entries from a group object
+function getGroupEntries(groupData, entryKey) {
+  if (!groupData || !groupData[entryKey]) return [];
+  const entry = groupData[entryKey];
+  if (Array.isArray(entry)) return entry;
+  if (typeof entry === 'string') return [entry];
+  if (typeof entry === 'object') return Object.keys(entry);
+  return [];
+}
+
+// Show group details modal (view only)
+function showGroupDetails(groupType, groupName) {
+  const groups = groupsData?.[`${groupType}-group`];
+  if (!groups || !groups[groupName]) {
+    showToast('error', 'Error', 'Group not found');
+    return;
+  }
+
+  const groupData = groups[groupName];
+  const entryKey = { address: 'address', network: 'network', port: 'port' }[groupType];
+  const entries = getGroupEntries(groupData, entryKey);
+
+  // Use existing group modal but in view mode
+  const modal = document.getElementById('groupEditModal');
+  const title = document.getElementById('groupEditTitle');
+  const entriesList = document.getElementById('groupEntriesList');
+  const footer = modal.querySelector('.modal-footer');
+
+  title.textContent = `${groupName} (${groupType}-group)`;
+
+  if (entries.length === 0) {
+    entriesList.innerHTML = '<li class="group-entries-empty">No entries in this group</li>';
+  } else {
+    entriesList.innerHTML = entries.map(e => `
+      <li><span class="entry-value">${escapeHtml(e)}</span></li>
+    `).join('');
+  }
+
+  // Hide form elements for view mode
+  document.getElementById('groupEditForm').style.display = 'none';
+  document.getElementById('groupUsageInfo').classList.add('hidden');
+  footer.innerHTML = '<button class="btn btn-secondary" onclick="closeModal(\'groupEditModal\')">Close</button>';
+
+  openModal('groupEditModal');
+}
+
+// Open group modal for create/edit
+async function openGroupModal(mode, groupType = 'address', groupName = '') {
+  const modal = document.getElementById('groupEditModal');
+  const form = document.getElementById('groupEditForm');
+  const title = document.getElementById('groupEditTitle');
+  const footer = modal.querySelector('.modal-footer');
+
+  // Reset form visibility
+  form.style.display = 'block';
+
+  // Set mode
+  document.getElementById('groupEditMode').value = mode;
+  document.getElementById('groupEditOriginalName').value = groupName;
+
+  // Reset state
+  groupModalEntries = [];
+  groupOriginalEntries = [];
+  groupOriginalDescription = null;
+
+  // Set form values
+  const typeSelect = document.getElementById('groupEditType');
+  const nameInput = document.getElementById('groupEditName');
+  const descInput = document.getElementById('groupEditDescription');
+
+  typeSelect.value = groupType;
+  typeSelect.disabled = (mode === 'edit');
+  nameInput.value = groupName;
+  nameInput.readOnly = (mode === 'edit');
+
+  if (mode === 'create') {
+    title.textContent = 'New Group';
+    descInput.value = '';
+    updateGroupEntryHint();
+    renderGroupEntriesList();
+  } else {
+    title.textContent = `Edit Group: ${groupName}`;
+
+    // Load existing group data
+    const groups = groupsData?.[`${groupType}-group`];
+    if (groups && groups[groupName]) {
+      const groupData = groups[groupName];
+      const entryKey = { address: 'address', network: 'network', port: 'port' }[groupType];
+      const entries = getGroupEntries(groupData, entryKey);
+
+      groupModalEntries = [...entries];
+      groupOriginalEntries = [...entries];
+      descInput.value = groupData.description || '';
+      groupOriginalDescription = groupData.description || '';
+
+      // Check for usage
+      await loadGroupUsage(groupType, groupName);
+    }
+
+    updateGroupEntryHint();
+    renderGroupEntriesList();
+  }
+
+  // Restore footer buttons
+  footer.innerHTML = `
+    <button class="btn btn-secondary" onclick="closeModal('groupEditModal')">Cancel</button>
+    <button class="btn btn-primary" onclick="saveGroup()">Save</button>
+  `;
+
+  openModal('groupEditModal');
+}
+
+// Update the entry hint based on group type
+function updateGroupEntryHint() {
+  const groupType = document.getElementById('groupEditType').value;
+  const hints = {
+    address: 'Format: IP address or IP range (e.g., 10.0.0.1 or 10.0.0.1-10.0.0.10)',
+    network: 'Format: Network in CIDR notation (e.g., 192.168.0.0/24)',
+    port: 'Format: Port number, range, or name (e.g., 443, 8000-8100, http)'
+  };
+  document.getElementById('groupEntryValidationHint').textContent = hints[groupType] || '';
+  document.getElementById('groupNewEntry').placeholder = {
+    address: '10.0.0.1 or 10.0.0.1-10.0.0.10',
+    network: '192.168.0.0/24',
+    port: '443 or 8000-8100'
+  }[groupType] || 'Add entry...';
+}
+
+// Load and display group usage
+async function loadGroupUsage(groupType, groupName) {
+  try {
+    const res = await fetch(`/api/firewall/group-usage/${groupType}/${groupName}`);
+    const usage = await res.json();
+    const usageInfo = document.getElementById('groupUsageInfo');
+    const usageList = document.getElementById('groupUsageList');
+
+    const refs = [...(usage.firewall || []), ...(usage.nat || [])];
+    if (refs.length > 0) {
+      usageList.innerHTML = refs.map(ref => {
+        if (ref.ruleset) {
+          return `<li>Firewall: ${ref.ruleset} rule ${ref.rule_id} (${ref.side})</li>`;
+        } else {
+          return `<li>NAT: ${ref.nat_type} rule ${ref.rule_id} (${ref.side})</li>`;
+        }
+      }).join('');
+      usageInfo.classList.remove('hidden');
+    } else {
+      usageInfo.classList.add('hidden');
+    }
+  } catch (e) {
+    console.error('Failed to load group usage:', e);
+  }
+}
+
+// Render the entries list in the modal
+function renderGroupEntriesList() {
+  const list = document.getElementById('groupEntriesList');
+  const mode = document.getElementById('groupEditMode').value;
+
+  if (groupModalEntries.length === 0) {
+    list.innerHTML = '<li class="group-entries-empty">No entries yet. Add entries above.</li>';
+    return;
+  }
+
+  list.innerHTML = groupModalEntries.map((entry, index) => {
+    // Determine if this is a new entry (not in original)
+    const isNew = mode === 'edit' && !groupOriginalEntries.includes(entry);
+    const entryClass = isNew ? 'entry-added' : '';
+
+    return `
+      <li class="${entryClass}">
+        <span class="entry-value">${escapeHtml(entry)}</span>
+        <button class="entry-remove" onclick="removeGroupEntry(${index})" title="Remove entry">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </li>
+    `;
+  }).join('');
+}
+
+// Add entry to the modal list
+function addGroupEntry() {
+  const input = document.getElementById('groupNewEntry');
+  const value = input.value.trim();
+
+  if (!value) return;
+
+  // Validate entry format
+  const groupType = document.getElementById('groupEditType').value;
+  if (!validateGroupEntry(groupType, value)) {
+    showToast('warning', 'Invalid Format', `"${value}" is not a valid ${groupType} entry`);
+    return;
+  }
+
+  // Check for duplicates
+  if (groupModalEntries.includes(value)) {
+    showToast('warning', 'Duplicate', 'This entry already exists in the group');
+    return;
+  }
+
+  groupModalEntries.push(value);
+  input.value = '';
+  renderGroupEntriesList();
+}
+
+// Remove entry from the modal list
+function removeGroupEntry(index) {
+  groupModalEntries.splice(index, 1);
+  renderGroupEntriesList();
+}
+
+// Validate group entry format
+function validateGroupEntry(groupType, value) {
+  const patterns = {
+    // IP: single IP or range (e.g., 10.0.0.1 or 10.0.0.1-10.0.0.10)
+    address: /^(\d{1,3}\.){3}\d{1,3}(-(\d{1,3}\.){3}\d{1,3})?$/,
+    // CIDR: network/prefix (e.g., 192.168.0.0/24)
+    network: /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/,
+    // Port: number, range, or service name (e.g., 443, 8000-8100, http)
+    port: /^(\d+(-\d+)?|[a-z][a-z0-9-]*)$/i
+  };
+
+  return patterns[groupType]?.test(value) ?? true;
+}
+
+// Save group (create or update)
+async function saveGroup() {
+  const mode = document.getElementById('groupEditMode').value;
+  const groupType = document.getElementById('groupEditType').value;
+  const groupName = document.getElementById('groupEditName').value.trim();
+  const description = document.getElementById('groupEditDescription').value.trim();
+
+  // Validation
+  if (!groupName) {
+    showToast('warning', 'Validation', 'Group name is required');
+    return;
+  }
+
+  if (!/^[A-Za-z0-9_-]+$/.test(groupName)) {
+    showToast('warning', 'Validation', 'Group name can only contain letters, numbers, underscores, and hyphens');
+    return;
+  }
+
+  if (groupModalEntries.length === 0) {
+    showToast('warning', 'Validation', 'Group must have at least one entry');
+    return;
+  }
+
+  // Build the group data
+  const groupData = {
+    group_type: groupType,
+    group_name: groupName,
+    entries: groupModalEntries,
+    description: description || undefined
+  };
+
+  // Calculate diff if editing
+  let diff = null;
+  if (mode === 'edit') {
+    diff = getGroupDiff(groupType, groupOriginalEntries, groupModalEntries, groupOriginalDescription, description);
+    if (diff.sets.length === 0 && diff.deletes.length === 0) {
+      showToast('info', 'No Changes', 'No changes to save');
+      closeModal('groupEditModal');
+      return;
+    }
+    groupData.diff = diff;
+  }
+
+  // Build commands for logging/verbose
+  const commands = buildGroupCommands(groupType, groupName, groupModalEntries, description, diff, mode === 'edit');
+
+  closeModal('groupEditModal');
+
+  // Check if staged mode
+  if (stagedMode) {
+    const operation = {
+      type: 'group',
+      action: mode === 'create' ? 'create' : 'update',
+      data: groupData,
+      display: mode === 'create' ? `Create ${groupType}-group ${groupName}` : `Update ${groupType}-group ${groupName}`
+    };
+    addGroupPendingOperation(operation);
+    return;
+  }
+
+  // Verbose mode - show preview
+  if (verboseMode) {
+    showCommandPreview(commands, async () => {
+      await executeGroupSave(groupData, mode, commands);
+    });
+    return;
+  }
+
+  // Direct save
+  await executeGroupSave(groupData, mode, commands);
+}
+
+// Execute group save to API
+async function executeGroupSave(groupData, mode, commands) {
+  try {
+    showLoading('Applying...');
+
+    const res = await fetch('/api/firewall/group', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(groupData)
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Failed to save group');
+
+    // Update local data
+    const groupRes = await fetch('/api/firewall/groups');
+    if (groupRes.ok) {
+      groupsData = await groupRes.json();
+      if (CONFIG) CONFIG.firewall = CONFIG.firewall || {};
+      if (CONFIG) CONFIG.firewall.group = groupsData;
+    }
+
+    showToast('success', 'Success', `Group ${mode === 'create' ? 'created' : 'updated'} successfully`);
+    hasUnsavedChanges = true;
+    updateSaveIndicator();
+
+    // Log activity
+    logActivity('group', mode === 'create' ? 'create' : 'update',
+      `${groupData.group_type}-group: ${groupData.group_name}`,
+      'success', `${mode === 'create' ? 'Created' : 'Updated'} firewall group`, commands);
+
+    renderGroups();
+  } catch (e) {
+    showToast('error', 'Error', e.message);
+    logActivity('group', mode === 'create' ? 'create' : 'update',
+      `${groupData.group_type}-group: ${groupData.group_name}`,
+      'error', `Failed: ${e.message}`, commands);
+    renderGroups();
+  }
+}
+
+// Delete a group
+async function deleteGroup(groupType, groupName) {
+  // Check usage first
+  try {
+    const res = await fetch(`/api/firewall/group-usage/${groupType}/${groupName}`);
+    const usage = await res.json();
+    const refs = [...(usage.firewall || []), ...(usage.nat || [])];
+
+    if (refs.length > 0) {
+      const refList = refs.slice(0, 5).map(ref => {
+        if (ref.ruleset) return `${ref.ruleset} rule ${ref.rule_id}`;
+        return `${ref.nat_type} NAT rule ${ref.rule_id}`;
+      }).join(', ');
+      showToast('error', 'Cannot Delete', `Group is used by: ${refList}${refs.length > 5 ? '...' : ''}`);
+      return;
+    }
+  } catch (e) {
+    console.error('Failed to check group usage:', e);
+  }
+
+  const confirmed = await openConfirmModal(
+    'Delete Group?',
+    `Are you sure you want to delete the group "${groupName}"? This action cannot be undone.`
+  );
+
+  if (!confirmed) return;
+
+  const commands = [{ op: 'delete', cmd: `delete firewall group ${groupType}-group ${groupName}` }];
+
+  // Check if staged mode
+  if (stagedMode) {
+    const operation = {
+      type: 'group',
+      action: 'delete',
+      data: { group_type: groupType, group_name: groupName },
+      display: `Delete ${groupType}-group ${groupName}`
+    };
+    addGroupPendingOperation(operation);
+    return;
+  }
+
+  // Verbose mode
+  if (verboseMode) {
+    showCommandPreview(commands, async () => {
+      await executeGroupDelete(groupType, groupName, commands);
+    });
+    return;
+  }
+
+  await executeGroupDelete(groupType, groupName, commands);
+}
+
+// Execute group delete
+async function executeGroupDelete(groupType, groupName, commands) {
+  try {
+    showLoading('Deleting...');
+
+    const res = await fetch('/api/firewall/group', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ group_type: groupType, group_name: groupName })
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Failed to delete group');
+
+    // Update local data
+    const groupRes = await fetch('/api/firewall/groups');
+    if (groupRes.ok) {
+      groupsData = await groupRes.json();
+      if (CONFIG) CONFIG.firewall.group = groupsData;
+    }
+
+    showToast('success', 'Deleted', `Group "${groupName}" deleted`);
+    hasUnsavedChanges = true;
+    updateSaveIndicator();
+
+    logActivity('group', 'delete', `${groupType}-group: ${groupName}`,
+      'success', 'Deleted firewall group', commands);
+
+    renderGroups();
+  } catch (e) {
+    showToast('error', 'Error', e.message);
+    logActivity('group', 'delete', `${groupType}-group: ${groupName}`,
+      'error', `Failed: ${e.message}`, commands);
+    renderGroups();
+  }
+}
+
+// Calculate diff between original and new group entries
+function getGroupDiff(groupType, originalEntries, newEntries, originalDesc, newDesc) {
+  const entryKey = { address: 'address', network: 'network', port: 'port' }[groupType];
+  const diff = { sets: [], deletes: [] };
+
+  // Find added entries
+  for (const entry of newEntries) {
+    if (!originalEntries.includes(entry)) {
+      diff.sets.push({ path: [entryKey, entry], value: null });
+    }
+  }
+
+  // Find removed entries
+  for (const entry of originalEntries) {
+    if (!newEntries.includes(entry)) {
+      diff.deletes.push([entryKey, entry]);
+    }
+  }
+
+  // Check description change
+  if (newDesc !== originalDesc) {
+    if (newDesc) {
+      diff.sets.push({ path: ['description'], value: newDesc });
+    } else if (originalDesc) {
+      diff.deletes.push(['description']);
+    }
+  }
+
+  return diff;
+}
+
+// Build VyOS commands for a group operation
+function buildGroupCommands(groupType, groupName, entries, description, diff, isEdit) {
+  const commands = [];
+  const basePath = `firewall group ${groupType}-group ${groupName}`;
+  const entryKey = { address: 'address', network: 'network', port: 'port' }[groupType];
+
+  if (diff && isEdit) {
+    // Differential update
+    for (const setOp of diff.sets || []) {
+      const pathStr = setOp.path.join(' ');
+      if (setOp.value !== null && setOp.value !== undefined) {
+        commands.push({ op: 'set', cmd: `set ${basePath} ${pathStr} '${setOp.value}'` });
+      } else {
+        commands.push({ op: 'set', cmd: `set ${basePath} ${pathStr}` });
+      }
+    }
+    for (const delPath of diff.deletes || []) {
+      const pathStr = delPath.join(' ');
+      commands.push({ op: 'delete', cmd: `delete ${basePath} ${pathStr}` });
+    }
+  } else {
+    // Full create
+    for (const entry of entries) {
+      commands.push({ op: 'set', cmd: `set ${basePath} ${entryKey} '${entry}'` });
+    }
+    if (description) {
+      commands.push({ op: 'set', cmd: `set ${basePath} description '${description}'` });
+    }
+  }
+
+  return commands;
+}
+
+// Get pending status for a group
+function getGroupPendingStatus(groupType, groupName) {
+  const marker = `group:${groupType}:${groupName}`;
+  if (!pendingRuleMarkers.has(marker)) return null;
+  const op = pendingOperations.find(o => buildGroupMarker(o) === marker);
+  return op ? op.action : null;
+}
+
+// Build marker for a group operation
+function buildGroupMarker(operation) {
+  if (operation.type !== 'group') return '';
+  return `group:${operation.data.group_type}:${operation.data.group_name}`;
+}
+
+// Add group operation to pending queue (staged mode)
+function addGroupPendingOperation(operation) {
+  const marker = buildGroupMarker(operation);
+
+  // Check if there's already a pending operation for this group
+  const existingIndex = pendingOperations.findIndex(op =>
+    op.type === 'group' && buildGroupMarker(op) === marker
+  );
+
+  if (existingIndex >= 0) {
+    pendingOperations.splice(existingIndex, 1);
+  } else {
+    // Store original server state
+    const originalState = getGroupOriginalServerState(operation);
+    if (originalState !== undefined) {
+      originalServerStates.set(marker, originalState);
+    }
+  }
+
+  // For updates, check if reverted to original
+  if (operation.action === 'update') {
+    const origState = originalServerStates.get(marker);
+    if (origState !== undefined && origState !== null) {
+      // Compare entries
+      const origEntries = getGroupEntries(origState, { address: 'address', network: 'network', port: 'port' }[operation.data.group_type]);
+      const newEntries = operation.data.entries;
+      const origDesc = origState.description || '';
+      const newDesc = operation.data.description || '';
+
+      if (arraysEqual(origEntries, newEntries) && origDesc === newDesc) {
+        // Reverted to original
+        pendingRuleMarkers.delete(marker);
+        restoreGroupOriginalInConfig(operation, origState);
+        originalServerStates.delete(marker);
+        updatePendingIndicator();
+        showToast('info', 'Reverted', 'Group restored to original state');
+        logActivity('group', 'revert', `${operation.data.group_type}-group: ${operation.data.group_name}`,
+          'reverted', 'Pending change reverted - group matches original state');
+        renderGroups();
+        return;
+      }
+    }
+  }
+
+  // Add the operation
+  pendingOperations.push(operation);
+  pendingRuleMarkers.add(marker);
+
+  // Update local config
+  applyGroupOperationToLocalConfig(operation);
+
+  updatePendingIndicator();
+  showToast('info', 'Staged', operation.display);
+
+  // Log
+  const commands = buildGroupCommands(
+    operation.data.group_type,
+    operation.data.group_name,
+    operation.data.entries || [],
+    operation.data.description,
+    operation.data.diff,
+    operation.action === 'update'
+  );
+  logActivity('group', 'staged', `${operation.data.group_type}-group: ${operation.data.group_name}`,
+    'staged', `Staged: ${operation.display}`, commands);
+
+  renderGroups();
+}
+
+// Get original server state for a group
+function getGroupOriginalServerState(operation) {
+  if (!groupsData) return undefined;
+  const { group_type, group_name } = operation.data;
+  const groups = groupsData[`${group_type}-group`];
+  if (groups && groups[group_name]) {
+    return deepClone(groups[group_name]);
+  }
+  return null; // Group doesn't exist on server
+}
+
+// Restore group original state in local config
+function restoreGroupOriginalInConfig(operation, originalState) {
+  if (!groupsData) return;
+  const { group_type, group_name } = operation.data;
+  const groupKey = `${group_type}-group`;
+
+  if (!groupsData[groupKey]) groupsData[groupKey] = {};
+
+  if (originalState === null) {
+    delete groupsData[groupKey][group_name];
+  } else {
+    groupsData[groupKey][group_name] = originalState;
+  }
+
+  if (CONFIG) CONFIG.firewall.group = groupsData;
+}
+
+// Apply group operation to local config
+function applyGroupOperationToLocalConfig(operation) {
+  if (!groupsData) groupsData = {};
+
+  const { group_type, group_name, entries, description } = operation.data;
+  const groupKey = `${group_type}-group`;
+  const entryKey = { address: 'address', network: 'network', port: 'port' }[group_type];
+
+  if (!groupsData[groupKey]) groupsData[groupKey] = {};
+
+  if (operation.action === 'delete') {
+    // Mark for deletion but keep for display
+  } else {
+    // Create or update
+    const groupData = groupsData[groupKey][group_name] || {};
+    groupData[entryKey] = entries;
+    if (description) {
+      groupData.description = description;
+    } else {
+      delete groupData.description;
+    }
+    groupsData[groupKey][group_name] = groupData;
+  }
+
+  if (CONFIG) CONFIG.firewall = CONFIG.firewall || {};
+  if (CONFIG) CONFIG.firewall.group = groupsData;
+}
+
+// Helper: compare arrays for equality
+function arraysEqual(a, b) {
+  if (a.length !== b.length) return false;
+  const sortedA = [...a].sort();
+  const sortedB = [...b].sort();
+  return sortedA.every((v, i) => v === sortedB[i]);
+}
+
+// Update buildRuleMarker to handle groups
+const _originalBuildRuleMarker = buildRuleMarker;
+buildRuleMarker = function(operation) {
+  if (operation.type === 'group') {
+    return buildGroupMarker(operation);
+  }
+  return _originalBuildRuleMarker(operation);
+};
+
+// Update buildCommandsForOperation to handle groups
+const _originalBuildCommandsForOperation = buildCommandsForOperation;
+buildCommandsForOperation = function(op) {
+  if (op.type === 'group') {
+    if (op.action === 'delete') {
+      return [{ op: 'delete', cmd: `delete firewall group ${op.data.group_type}-group ${op.data.group_name}` }];
+    } else {
+      return buildGroupCommands(
+        op.data.group_type,
+        op.data.group_name,
+        op.data.entries || [],
+        op.data.description,
+        op.data.diff,
+        op.action === 'update'
+      );
+    }
+  }
+  return _originalBuildCommandsForOperation(op);
+};
+
+// Update refreshCurrentViewSoft to handle groups
+const _originalRefreshCurrentViewSoft = refreshCurrentViewSoft;
+refreshCurrentViewSoft = function() {
+  if (currentSection === 'Groups') {
+    renderGroups();
+    return;
+  }
+  _originalRefreshCurrentViewSoft();
+};
+
+// Update reloadCurrentView to handle groups
+const _originalReloadCurrentView = reloadCurrentView;
+reloadCurrentView = async function() {
+  if (currentSection === 'Groups') {
+    const groupRes = await fetch('/api/firewall/groups');
+    if (groupRes.ok) {
+      groupsData = await groupRes.json();
+      if (CONFIG) CONFIG.firewall.group = groupsData;
+    }
+    renderGroups();
+    return;
+  }
+  await _originalReloadCurrentView();
+};
 
 // =========================================
 // KEYBOARD SHORTCUTS
@@ -3235,6 +4097,9 @@ document.addEventListener('keydown', (e) => {
       break;
     case 'n':
       if (CONFIG) loadSection('NAT');
+      break;
+    case 'g':
+      if (CONFIG) loadSection('Groups');
       break;
     case 's':
       if (currentRulesetName) openSearchModal();

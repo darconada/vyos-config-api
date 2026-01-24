@@ -1307,3 +1307,372 @@ tr.pending-delete .pending-badge {
   background: var(--accent-color);
   color: #000;
 }
+
+/* =========================================
+   25. FIREWALL GROUPS SECTION
+   ========================================= */
+
+/* Group section container */
+.groups-section {
+  margin-bottom: 2rem;
+}
+
+.groups-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.groups-section-header h3 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.groups-section-count {
+  font-size: 0.875rem;
+  color: var(--text-muted);
+}
+
+/* Group cards container */
+.groups-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+/* Individual group card */
+.group-card {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.75rem 1rem;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+}
+
+.group-card:hover {
+  border-color: var(--accent-color);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+}
+
+.group-card-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.group-card-name {
+  font-weight: 600;
+  font-family: var(--font-mono);
+  font-size: 0.9375rem;
+  color: var(--text-primary);
+}
+
+.group-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8125rem;
+  color: var(--text-muted);
+}
+
+.group-card-entries-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.group-card-description {
+  color: var(--text-secondary);
+  font-style: italic;
+}
+
+.group-card-actions {
+  display: flex;
+  gap: 0.375rem;
+}
+
+/* Pending states for group cards */
+.group-card.pending-change {
+  border-left: 3px solid #f59e0b;
+  background: linear-gradient(90deg, rgba(245, 158, 11, 0.08) 0%, transparent 100%);
+}
+
+.group-card.pending-delete {
+  border-left: 3px solid var(--danger-color, #dc2626);
+  opacity: 0.6;
+}
+
+.group-card.pending-delete .group-card-name {
+  text-decoration: line-through;
+  text-decoration-color: var(--danger-color, #dc2626);
+}
+
+/* =========================================
+   26. GROUP EDIT MODAL - ENTRIES LIST
+   ========================================= */
+
+.group-entries-container {
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background-color: var(--bg-body);
+  overflow: hidden;
+}
+
+.group-entries-header {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  border-bottom: 1px solid var(--border-color);
+  background-color: var(--bg-card);
+}
+
+.group-entries-header input {
+  flex: 1;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.875rem;
+  font-family: var(--font-mono);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background-color: var(--bg-body);
+  color: var(--text-primary);
+}
+
+.group-entries-header input:focus {
+  outline: none;
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+}
+
+.group-entries-list {
+  max-height: 250px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.group-entries-list::-webkit-scrollbar {
+  width: 6px;
+}
+
+.group-entries-list::-webkit-scrollbar-track {
+  background: var(--bg-body);
+}
+
+.group-entries-list::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 3px;
+}
+
+.group-entries-list li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.5rem 0.75rem;
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+  border-bottom: 1px solid var(--border-color);
+  transition: background-color var(--transition-fast);
+}
+
+.group-entries-list li:last-child {
+  border-bottom: none;
+}
+
+.group-entries-list li:hover {
+  background-color: var(--bg-hover);
+}
+
+.group-entries-list li .entry-value {
+  color: var(--text-primary);
+}
+
+.group-entries-list li .entry-remove {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.group-entries-list li .entry-remove:hover {
+  background-color: var(--danger-light, #fee2e2);
+  color: var(--danger-color, #dc2626);
+}
+
+/* Entry states in modal */
+.group-entries-list li.entry-added {
+  background-color: var(--success-light, rgba(16, 185, 129, 0.1));
+}
+
+.group-entries-list li.entry-added::before {
+  content: '+';
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin-right: 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: var(--success-color, #10b981);
+  background-color: var(--success-light, rgba(16, 185, 129, 0.2));
+  border-radius: 50%;
+}
+
+.group-entries-list li.entry-removed {
+  background-color: var(--danger-light, rgba(220, 38, 38, 0.1));
+  text-decoration: line-through;
+  opacity: 0.7;
+}
+
+.group-entries-list li.entry-removed::before {
+  content: '−';
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin-right: 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: var(--danger-color, #dc2626);
+  background-color: var(--danger-light, rgba(220, 38, 38, 0.2));
+  border-radius: 50%;
+}
+
+/* Empty state */
+.group-entries-empty {
+  padding: 2rem;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 0.875rem;
+}
+
+/* Validation hint */
+.group-entry-validation-hint {
+  padding: 0.5rem 0.75rem;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  background-color: var(--bg-body);
+  border-top: 1px solid var(--border-color);
+}
+
+/* Group usage warning */
+.group-usage-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  background-color: var(--warning-light, rgba(245, 158, 11, 0.1));
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  border-radius: var(--radius-md);
+  font-size: 0.8125rem;
+  color: var(--warning-color, #f59e0b);
+}
+
+.group-usage-warning svg {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+}
+
+.group-usage-list {
+  margin: 0;
+  padding: 0 0 0 1rem;
+  font-size: 0.8125rem;
+}
+
+/* No groups state */
+.groups-empty {
+  padding: 2rem;
+  text-align: center;
+  background: var(--bg-body);
+  border: 1px dashed var(--border-color);
+  border-radius: var(--radius-md);
+}
+
+.groups-empty-icon {
+  width: 48px;
+  height: 48px;
+  margin: 0 auto 1rem;
+  color: var(--text-muted);
+  opacity: 0.5;
+}
+
+.groups-empty-title {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 0.25rem;
+}
+
+.groups-empty-description {
+  font-size: 0.875rem;
+  color: var(--text-muted);
+}
+
+/* Dark theme adjustments */
+[data-theme="dark"] .group-card {
+  background: var(--bg-card);
+}
+
+[data-theme="dark"] .group-card:hover {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+[data-theme="dark"] .group-entries-list li.entry-added {
+  background-color: rgba(16, 185, 129, 0.15);
+}
+
+[data-theme="dark"] .group-entries-list li.entry-removed {
+  background-color: rgba(220, 38, 38, 0.15);
+}
+
+/* Retro theme adjustments */
+[data-theme="retro"] .group-card {
+  border-width: 2px;
+  border-radius: 0;
+}
+
+[data-theme="retro"] .group-card:hover {
+  box-shadow: 0 0 10px rgba(0, 255, 65, 0.2);
+}
+
+[data-theme="retro"] .group-card-name {
+  color: var(--accent-color);
+}
+
+[data-theme="retro"] .group-card.pending-change {
+  border-left-color: var(--accent-color);
+  background: linear-gradient(90deg, rgba(0, 255, 65, 0.1) 0%, transparent 100%);
+}
+
+[data-theme="retro"] .group-entries-container {
+  border-width: 2px;
+  border-radius: 0;
+}
+
+[data-theme="retro"] .group-entries-list li.entry-added {
+  background-color: rgba(0, 255, 65, 0.1);
+}
+
+[data-theme="retro"] .group-entries-list li.entry-added::before {
+  color: var(--accent-color);
+  background-color: rgba(0, 255, 65, 0.2);
+}
