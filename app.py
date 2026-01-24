@@ -169,11 +169,20 @@ def manage_firewall_rule():
             # Eliminar regla
             ACTIVE_API.delete_firewall_rule(ruleset, rule_id)
         else:
-            # Crear/modificar regla
-            rule_data = data.get('rule', {})
-            if not rule_data:
-                return jsonify({'error': 'rule data is required'}), 400
-            ACTIVE_API.create_firewall_rule(ruleset, rule_id, rule_data)
+            # Check if this is a differential update
+            diff = data.get('diff')
+            if diff:
+                # Differential update - only change what's different
+                base_path = ['firewall', 'ipv4', 'name', ruleset, 'rule', str(rule_id)]
+                ops = build_diff_operations(base_path, diff)
+                if ops:
+                    ACTIVE_API.configure(ops)
+            else:
+                # Full create/update (legacy behavior)
+                rule_data = data.get('rule', {})
+                if not rule_data:
+                    return jsonify({'error': 'rule data is required'}), 400
+                ACTIVE_API.create_firewall_rule(ruleset, rule_id, rule_data)
 
         # Recargar configuración
         raw = ACTIVE_API.get_config()
@@ -211,11 +220,20 @@ def manage_nat_rule():
             # Eliminar regla
             ACTIVE_API.delete_nat_rule(nat_type, rule_id)
         else:
-            # Crear/modificar regla
-            rule_data = data.get('rule', {})
-            if not rule_data:
-                return jsonify({'error': 'rule data is required'}), 400
-            ACTIVE_API.create_nat_rule(nat_type, rule_id, rule_data)
+            # Check if this is a differential update
+            diff = data.get('diff')
+            if diff:
+                # Differential update - only change what's different
+                base_path = ['nat', nat_type, 'rule', str(rule_id)]
+                ops = build_diff_operations(base_path, diff)
+                if ops:
+                    ACTIVE_API.configure(ops)
+            else:
+                # Full create/update (legacy behavior)
+                rule_data = data.get('rule', {})
+                if not rule_data:
+                    return jsonify({'error': 'rule data is required'}), 400
+                ACTIVE_API.create_nat_rule(nat_type, rule_id, rule_data)
 
         # Recargar configuración
         raw = ACTIVE_API.get_config()
@@ -225,6 +243,199 @@ def manage_nat_rule():
 
     except VyOSAPIError as e:
         return jsonify({'error': str(e)}), 500
+
+
+# ──────────────────────────────────────────────────────────────
+#  Batch Configure (Staged Changes)
+# ──────────────────────────────────────────────────────────────
+@app.route('/api/batch-configure', methods=['POST'])
+def batch_configure():
+    """
+    Aplica múltiples operaciones en una sola llamada.
+
+    Espera un JSON con:
+    {
+        "operations": [
+            { "type": "firewall", "action": "create", "data": {...} },
+            { "type": "firewall", "action": "delete", "data": {...} },
+            { "type": "nat", "action": "create", "data": {...} },
+            ...
+        ]
+    }
+    """
+    global CONFIG
+
+    if not ACTIVE_API:
+        return jsonify({'error': 'No active connection. Connect to router first.'}), 400
+
+    data = request.get_json() or {}
+    operations = data.get('operations', [])
+
+    if not operations:
+        return jsonify({'error': 'No operations provided'}), 400
+
+    try:
+        # Construir lista de operaciones VyOS
+        vyos_ops = []
+        for op in operations:
+            vyos_ops.extend(build_vyos_operations(op))
+
+        if not vyos_ops:
+            return jsonify({'error': 'No valid operations to execute'}), 400
+
+        # Ejecutar todas en una sola llamada
+        ACTIVE_API.configure(vyos_ops)
+
+        # Refrescar config
+        raw = ACTIVE_API.get_config()
+        CONFIG = load_config(raw)
+
+        return jsonify({
+            'success': True,
+            'applied': len(operations),
+            'vyos_operations': len(vyos_ops)
+        })
+
+    except VyOSAPIError as e:
+        return jsonify({'error': str(e)}), 500
+    except Exception as e:
+        return jsonify({'error': f'Unexpected error: {str(e)}'}), 500
+
+
+def build_vyos_operations(operation):
+    """
+    Convierte una operación del frontend a operaciones VyOS (lista de dicts con 'op' y 'path').
+    Soporta actualizaciones diferenciales cuando se incluye 'diff' en los datos.
+    """
+    ops = []
+    op_type = operation.get('type')
+    action = operation.get('action')
+    data = operation.get('data', {})
+
+    # Check if this is a differential update
+    diff = data.get('diff')
+
+    if op_type == 'firewall':
+        ruleset = data.get('ruleset')
+        rule_id = str(data.get('rule_id'))
+        base_path = ['firewall', 'ipv4', 'name', ruleset, 'rule', rule_id]
+
+        if action == 'delete':
+            ops.append({'op': 'delete', 'path': base_path})
+        elif diff and action == 'update':
+            # Differential update - only change what's different
+            ops.extend(build_diff_operations(base_path, diff))
+        else:
+            # Full create/update (legacy behavior)
+            rule = data.get('rule', {})
+            if rule.get('action'):
+                ops.append({'op': 'set', 'path': base_path + ['action', rule['action']]})
+            if rule.get('jump-target'):
+                ops.append({'op': 'set', 'path': base_path + ['jump-target', rule['jump-target']]})
+            if rule.get('protocol'):
+                ops.append({'op': 'set', 'path': base_path + ['protocol', rule['protocol']]})
+            if rule.get('description'):
+                ops.append({'op': 'set', 'path': base_path + ['description', rule['description']]})
+
+            # Source
+            src = rule.get('source', {})
+            if src.get('address'):
+                ops.append({'op': 'set', 'path': base_path + ['source', 'address', src['address']]})
+            if src.get('port'):
+                ops.append({'op': 'set', 'path': base_path + ['source', 'port', str(src['port'])]})
+            if src.get('group'):
+                for gtype, gname in src['group'].items():
+                    ops.append({'op': 'set', 'path': base_path + ['source', 'group', gtype, gname]})
+
+            # Destination
+            dst = rule.get('destination', {})
+            if dst.get('address'):
+                ops.append({'op': 'set', 'path': base_path + ['destination', 'address', dst['address']]})
+            if dst.get('port'):
+                ops.append({'op': 'set', 'path': base_path + ['destination', 'port', str(dst['port'])]})
+            if dst.get('group'):
+                for gtype, gname in dst['group'].items():
+                    ops.append({'op': 'set', 'path': base_path + ['destination', 'group', gtype, gname]})
+
+    elif op_type == 'nat':
+        nat_type = data.get('nat_type')
+        rule_id = str(data.get('rule_id'))
+        base_path = ['nat', nat_type, 'rule', rule_id]
+
+        if action == 'delete':
+            ops.append({'op': 'delete', 'path': base_path})
+        elif diff and action == 'update':
+            # Differential update - only change what's different
+            ops.extend(build_diff_operations(base_path, diff))
+        else:
+            # Full create/update (legacy behavior)
+            rule = data.get('rule', {})
+            if rule.get('description'):
+                ops.append({'op': 'set', 'path': base_path + ['description', rule['description']]})
+            if rule.get('exclude'):
+                ops.append({'op': 'set', 'path': base_path + ['exclude']})
+            if rule.get('protocol'):
+                ops.append({'op': 'set', 'path': base_path + ['protocol', rule['protocol']]})
+
+            # Source
+            src = rule.get('source', {})
+            if src.get('address'):
+                ops.append({'op': 'set', 'path': base_path + ['source', 'address', src['address']]})
+            if src.get('port'):
+                ops.append({'op': 'set', 'path': base_path + ['source', 'port', str(src['port'])]})
+
+            # Destination
+            dst = rule.get('destination', {})
+            if dst.get('address'):
+                ops.append({'op': 'set', 'path': base_path + ['destination', 'address', dst['address']]})
+            if dst.get('port'):
+                ops.append({'op': 'set', 'path': base_path + ['destination', 'port', str(dst['port'])]})
+
+            # Translation
+            trans = rule.get('translation', {})
+            if trans.get('address'):
+                ops.append({'op': 'set', 'path': base_path + ['translation', 'address', trans['address']]})
+            if trans.get('port'):
+                ops.append({'op': 'set', 'path': base_path + ['translation', 'port', str(trans['port'])]})
+
+            # Interfaces
+            if rule.get('inbound-interface', {}).get('name'):
+                ops.append({'op': 'set', 'path': base_path + ['inbound-interface', 'name', rule['inbound-interface']['name']]})
+            if rule.get('outbound-interface', {}).get('name'):
+                ops.append({'op': 'set', 'path': base_path + ['outbound-interface', 'name', rule['outbound-interface']['name']]})
+
+    return ops
+
+
+def build_diff_operations(base_path, diff):
+    """
+    Construye operaciones VyOS a partir de un diff.
+    diff = { sets: [{path: [...], value: ...}], deletes: [[...]] }
+    """
+    ops = []
+
+    # Process set operations
+    for set_op in diff.get('sets', []):
+        path = set_op.get('path', [])
+        value = set_op.get('value')
+
+        full_path = base_path + path
+        if value is not None:
+            # Handle boolean values (like 'exclude')
+            if isinstance(value, bool):
+                if value:
+                    ops.append({'op': 'set', 'path': full_path})
+            else:
+                ops.append({'op': 'set', 'path': full_path + [str(value)]})
+        else:
+            ops.append({'op': 'set', 'path': full_path})
+
+    # Process delete operations
+    for del_path in diff.get('deletes', []):
+        full_path = base_path + del_path
+        ops.append({'op': 'delete', 'path': full_path})
+
+    return ops
 
 
 # ──────────────────────────────────────────────────────────────

@@ -90,6 +90,25 @@
         <span class="toggle-label">Verbose</span>
       </label>
 
+      <!-- Staged Mode Toggle -->
+      <label class="toggle-switch hidden" id="stagedToggle" title="Queue changes instead of immediate apply">
+        <input type="checkbox" id="stagedModeCheck">
+        <span class="toggle-slider"></span>
+        <span class="toggle-label">Staged</span>
+      </label>
+
+      <!-- Pending Changes Indicator -->
+      <div id="pendingChangesIndicator" class="pending-indicator hidden">
+        <span id="pendingCount" class="pending-count">0</span>
+        <span class="pending-text">pending</span>
+        <button class="btn btn-apply" onclick="applyAllChanges()" title="Apply all staged changes">
+          Apply All
+        </button>
+        <button class="btn btn-discard" onclick="discardAllChanges()" title="Discard all staged changes">
+          Discard
+        </button>
+      </div>
+
       <div class="header-divider hidden" id="verboseDivider"></div>
 
       <!-- Action Buttons -->

@@ -176,28 +176,56 @@ curl -k --location --request POST 'https://ROUTER:8443/retrieve' \
 
 ### Files Modified
 - `vyos_api.py` - API client with jump-target and NAT exclude support
-- `templates/index.html` - Modals with draggable support, verbose toggle, NAT exclude checkbox
-- `static/app.js` - CRUD functions, verbose mode, draggable modals
-- `static/modal.css` - Styles for forms, checkboxes, draggable modals
+- `templates/index.html` - Modals with draggable support, verbose toggle, NAT exclude checkbox, staged mode toggle
+- `static/app.js` - CRUD functions, verbose mode, draggable modals, staged mode, differential updates
+- `static/modal.css` - Styles for forms, checkboxes, draggable modals, pending change indicators
 
----
+**Staged Mode (Batch Changes):**
+- Toggle switch in header to enable staged mode
+- Changes queue locally instead of immediate commit
+- Visual markers for pending changes (MOD/DEL badges, colored rows)
+- In-memory preview of changes before applying
+- "Apply All" button commits all changes in one batch via `/api/batch-configure`
+- "Discard" button reverts all pending changes
+- Warning when closing page with unsaved pending changes
 
-## Pending Feature Request: Batch/Staged Changes
+**Differential Updates:**
+- When editing existing rules, only changed fields are sent to VyOS
+- Deep comparison between original and modified rule state
+- Generates minimal set/delete operations
+- Verbose mode shows only the differential commands when editing
+- Works in both immediate and staged modes
 
-**Problem:** Each rule edit immediately commits to VyOS, causing delay per change.
+### API Endpoints (Batch Operations)
+- `POST /api/batch-configure` - Apply multiple operations in one call
+  - Accepts array of operations with type, action, and data
+  - Supports differential updates via `diff` parameter
+  - Returns count of applied operations
 
-**Requested Solution:** Add "Group Changes" mode:
-1. Toggle switch similar to verbose mode
-2. When enabled, changes queue locally instead of immediate commit
-3. User can make multiple edits (create 3 rules, modify 2, delete 1)
-4. Show pending changes count/indicator
-5. "Apply All" button to commit all changes in one batch
-6. Option to discard pending changes
+**Activity Log:**
+- New "Activity" section in navigation menu (alongside Firewall and NAT)
+- Tracks all operations performed during the session
+- Each log entry contains: timestamp, type, action, target, status, message, VyOS commands
+- Expandable command details (click to show/hide)
+- Clear log button with confirmation
+- Session-only persistence (in-memory, clears on page reload)
 
-**Benefits:**
-- Reduces commit overhead
-- Allows reviewing all changes before applying
-- Better for bulk operations
+**Logged Operations:**
+- Router connection (success/failure)
+- Firewall rule create/update/delete
+- NAT rule create/update/delete
+- Staged operations (when changes are queued)
+- Revert detection (when rule returns to original state)
+- Batch apply (when applying all staged changes)
+- Config save to router
+- Discard pending changes
+
+### Frontend State (Activity Log)
+```javascript
+let activityLog = [];           // Array of log entries
+let activityLogIdCounter = 0;   // Auto-increment ID for entries
+// Entry structure: { id, timestamp, type, action, target, status, message, commands }
+```
 
 ---
 

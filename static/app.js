@@ -28,13 +28,32 @@ let ipFilters = { source: null, destination: null };
 let natData = null;
 const natTextFilters = { 'Destination NAT': {}, 'Source NAT': {} };
 const natIpFilters = { 'Destination NAT': {}, 'Source NAT': {} };
-const sections = ['Firewall', 'NAT'];
+const sections = ['Firewall', 'NAT', 'Activity'];
+
+// Activity Log - stores all operations performed during the session
+let activityLog = [];
+// Each entry: { id, timestamp, type, action, target, status, message, commands }
 
 // Estado de conexión activa (para operaciones de escritura)
 let isConnected = false;
 let hasUnsavedChanges = false;
 let verboseMode = false;
 let pendingCommandExecution = null; // Stores pending command data for verbose mode
+
+// Staged mode state
+let stagedMode = false;
+let pendingOperations = []; // Array of { type, action, data, display }
+// Track which rules have pending changes for visual marking
+// Keys: "firewall:RULESET:RULEID" or "nat:TYPE:RULEID"
+let pendingRuleMarkers = new Set();
+// Store ORIGINAL SERVER STATE for each rule with pending changes
+// This tracks the rule state BEFORE any staged changes
+// Key: marker string, Value: original rule object (or null if new rule)
+let originalServerStates = new Map();
+
+// Store original rule data when editing (for differential updates)
+let originalFirewallRule = null;
+let originalNatRule = null;
 
 // =========================================
 // THEME MANAGEMENT
@@ -200,7 +219,8 @@ fileInput.onchange = async () => {
 function drawMenu() {
   const icons = {
     Firewall: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>',
-    NAT: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/></svg>'
+    NAT: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/></svg>',
+    Activity: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>'
   };
 
   menu.innerHTML = sections.map(s => `
@@ -225,6 +245,10 @@ async function loadSection(sec) {
   if (sec === 'NAT') {
     updateBreadcrumb([{ label: 'NAT', action: "loadSection('NAT')" }]);
     return loadNat();
+  }
+  if (sec === 'Activity') {
+    updateBreadcrumb([{ label: 'Activity Log', action: "loadSection('Activity')" }]);
+    return renderActivityLog();
   }
 
   showLoading(`Loading ${sec}...`);
@@ -365,8 +389,14 @@ function renderNatTable(title, natType, rules, cols) {
         if (!cell.toLowerCase().includes(txtF[key].toLowerCase())) return;
       }
       visibleCount++;
-      html += `<tr>
-        <td><span class="badge">${id}</span></td>
+
+      // Check if this NAT rule has pending changes
+      const pendingStatus = getPendingStatus('nat', natType, id);
+      const pendingClass = pendingStatus === 'delete' ? 'pending-delete' : (pendingStatus ? 'pending-change' : '');
+      const pendingBadge = pendingStatus ? `<span class="pending-badge">${pendingStatus === 'delete' ? 'DEL' : 'MOD'}</span>` : '';
+
+      html += `<tr class="${pendingClass}">
+        <td><span class="badge">${id}</span>${pendingBadge}</td>
         ${cols.map(c => `<td>${escapeHtml(get(r, c.key))}</td>`).join('')}
         ${isConnected ? `<td class="actions-col">
           <button class="btn-icon" onclick="openNatRuleModal('edit', '${natType}', '${id}')" title="Edit">
@@ -410,6 +440,172 @@ function clearNatFilters(title) {
   natIpFilters[title] = {};
   content.innerHTML = '';
   renderNat(natData);
+}
+
+// =========================================
+// ACTIVITY LOG
+// =========================================
+let activityLogIdCounter = 0;
+
+// Add entry to activity log
+function logActivity(type, action, target, status, message, commands = []) {
+  const entry = {
+    id: ++activityLogIdCounter,
+    timestamp: new Date(),
+    type,      // 'firewall', 'nat', 'config', 'connection'
+    action,    // 'create', 'update', 'delete', 'save', 'connect', 'staged', 'revert'
+    target,    // e.g., 'Rule 20 in LAN-IN', 'Destination NAT rule 100'
+    status,    // 'success', 'error', 'staged', 'reverted'
+    message,   // Human-readable message
+    commands   // Array of VyOS commands (for expandable view)
+  };
+  activityLog.unshift(entry); // Add to beginning (newest first)
+
+  // Keep max 500 entries
+  if (activityLog.length > 500) {
+    activityLog.pop();
+  }
+
+  // If currently viewing Activity section, refresh
+  if (currentSection === 'Activity') {
+    renderActivityLog();
+  }
+}
+
+// Format timestamp for display
+function formatLogTimestamp(date) {
+  return date.toLocaleTimeString('en-US', {
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
+}
+
+// Get status badge class
+function getStatusBadgeClass(status) {
+  switch (status) {
+    case 'success': return 'badge-success';
+    case 'error': return 'badge-danger';
+    case 'staged': return 'badge-warning';
+    case 'reverted': return 'badge-info';
+    default: return 'badge-secondary';
+  }
+}
+
+// Get action icon
+function getActionIcon(action) {
+  switch (action) {
+    case 'create':
+      return '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>';
+    case 'update':
+      return '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>';
+    case 'delete':
+      return '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>';
+    case 'save':
+      return '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/></svg>';
+    case 'connect':
+      return '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/><path d="M12 5l7 7-7 7"/></svg>';
+    case 'staged':
+      return '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>';
+    case 'revert':
+      return '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>';
+    default:
+      return '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/></svg>';
+  }
+}
+
+// Render activity log view
+function renderActivityLog() {
+  if (activityLog.length === 0) {
+    content.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-state-icon">
+          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+            <line x1="16" y1="13" x2="8" y2="13"/>
+            <line x1="16" y1="17" x2="8" y2="17"/>
+          </svg>
+        </div>
+        <h3 class="empty-state-title">No Activity Yet</h3>
+        <p class="empty-state-text">Operations performed during this session will appear here.</p>
+      </div>
+    `;
+    return;
+  }
+
+  const logHtml = activityLog.map(entry => {
+    const hasCommands = entry.commands && entry.commands.length > 0;
+    const commandsHtml = hasCommands ? `
+      <div class="log-commands-toggle" onclick="toggleLogCommands(${entry.id})">
+        <svg class="toggle-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="9 18 15 12 9 6"/>
+        </svg>
+        <span>${entry.commands.length} command${entry.commands.length > 1 ? 's' : ''}</span>
+      </div>
+      <div class="log-commands hidden" id="logCommands-${entry.id}">
+        <pre class="log-commands-pre">${entry.commands.map(c => escapeHtml(c.cmd || c)).join('\n')}</pre>
+      </div>
+    ` : '';
+
+    return `
+      <div class="log-entry log-entry-${entry.status}">
+        <div class="log-entry-header">
+          <span class="log-time">${formatLogTimestamp(entry.timestamp)}</span>
+          <span class="log-action-icon" title="${entry.action}">${getActionIcon(entry.action)}</span>
+          <span class="log-type badge badge-outline">${entry.type}</span>
+          <span class="log-target">${escapeHtml(entry.target)}</span>
+          <span class="log-status badge ${getStatusBadgeClass(entry.status)}">${entry.status}</span>
+        </div>
+        <div class="log-entry-body">
+          <span class="log-message">${escapeHtml(entry.message)}</span>
+          ${commandsHtml}
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  content.innerHTML = `
+    <div class="activity-log-container">
+      <div class="activity-log-header">
+        <h2>Activity Log</h2>
+        <div class="activity-log-actions">
+          <span class="log-count">${activityLog.length} entries</span>
+          <button class="btn btn-secondary btn-sm" onclick="clearActivityLog()" title="Clear log">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="3 6 5 6 21 6"/>
+              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+            </svg>
+            Clear
+          </button>
+        </div>
+      </div>
+      <div class="activity-log-entries">
+        ${logHtml}
+      </div>
+    </div>
+  `;
+}
+
+// Toggle commands visibility in log entry
+function toggleLogCommands(id) {
+  const commandsDiv = document.getElementById(`logCommands-${id}`);
+  const toggleDiv = commandsDiv?.previousElementSibling;
+  if (commandsDiv) {
+    commandsDiv.classList.toggle('hidden');
+    toggleDiv?.classList.toggle('expanded');
+  }
+}
+
+// Clear activity log
+async function clearActivityLog() {
+  const confirmed = await openConfirmModal('Clear Activity Log?', 'This will remove all log entries from this session.');
+  if (confirmed) {
+    activityLog = [];
+    renderActivityLog();
+    showToast('info', 'Cleared', 'Activity log cleared');
+  }
 }
 
 // =========================================
@@ -642,8 +838,13 @@ function renderRuleset() {
       visibleCount++;
       const actionClass = row.action?.toLowerCase() || '';
 
-      html += `<tr id="row-${id}">
-        <td><span class="badge">${row.rule_id}</span></td>
+      // Check if this rule has pending changes
+      const pendingStatus = getPendingStatus('firewall', currentRulesetName, id);
+      const pendingClass = pendingStatus === 'delete' ? 'pending-delete' : (pendingStatus ? 'pending-change' : '');
+      const pendingBadge = pendingStatus ? `<span class="pending-badge">${pendingStatus === 'delete' ? 'DEL' : 'MOD'}</span>` : '';
+
+      html += `<tr id="row-${id}" class="${pendingClass}">
+        <td><span class="badge">${row.rule_id}</span>${pendingBadge}</td>
         <td>${cellHTML(r.source, 'address', 'network')}</td>
         <td class="font-mono text-sm">${cellHTML(r.source, 'port')}</td>
         <td>${cellHTML(r.destination, 'address', 'network')}</td>
@@ -1248,14 +1449,17 @@ async function doFetchConfig() {
     CONFIG = j.data;
     closeModal('fetchModal');
     updateConnectionStatus(true, host);
-    // Show Save button and Verbose toggle when connected
+    // Show Save button, Verbose toggle, and Staged toggle when connected
     document.getElementById('saveConfigBtn')?.classList.remove('hidden');
     document.getElementById('verboseToggle')?.classList.remove('hidden');
+    document.getElementById('stagedToggle')?.classList.remove('hidden');
     document.getElementById('verboseDivider')?.classList.remove('hidden');
     drawMenu();
     renderDashboard();
     showToast('success', 'Connected', `Successfully fetched config from ${host}`);
+    logActivity('connection', 'connect', host, 'success', `Connected to VyOS router at ${host}:${port}`);
   } catch (e) {
+    logActivity('connection', 'connect', host, 'error', `Connection failed: ${e.message}`);
     statusDiv.innerHTML = `
       <div class="modal-alert error">
         <div class="modal-alert-icon">
@@ -1466,6 +1670,137 @@ function updateSaveIndicator() {
   if (dot) dot.classList.toggle('hidden', !hasUnsavedChanges);
 }
 
+// =========================================
+// DIFFERENTIAL UPDATE HELPERS
+// =========================================
+
+/**
+ * Deep clone an object (for storing original state)
+ */
+function deepClone(obj) {
+  if (obj === null || obj === undefined) return obj;
+  return JSON.parse(JSON.stringify(obj));
+}
+
+/**
+ * Compare two values for equality (handles nested objects)
+ */
+function deepEqual(a, b) {
+  if (a === b) return true;
+  if (a === null || b === null) return a === b;
+  if (a === undefined || b === undefined) return a === b;
+  if (typeof a !== typeof b) return false;
+  if (typeof a !== 'object') return a === b;
+
+  const keysA = Object.keys(a);
+  const keysB = Object.keys(b);
+
+  if (keysA.length !== keysB.length) return false;
+
+  for (const key of keysA) {
+    if (!keysB.includes(key)) return false;
+    if (!deepEqual(a[key], b[key])) return false;
+  }
+
+  return true;
+}
+
+/**
+ * Get differential changes between original and modified rule
+ * Returns: { sets: [{path, value}], deletes: [path] }
+ */
+function getRuleDiff(original, modified, basePath = []) {
+  const result = { sets: [], deletes: [] };
+
+  if (!original && !modified) return result;
+
+  // If original is null/undefined, everything in modified is new
+  if (!original) {
+    flattenToSets(modified, basePath, result.sets);
+    return result;
+  }
+
+  // If modified is null/undefined, everything in original should be deleted
+  if (!modified) {
+    result.deletes.push([...basePath]);
+    return result;
+  }
+
+  // Compare each field
+  const allKeys = new Set([...Object.keys(original), ...Object.keys(modified)]);
+
+  for (const key of allKeys) {
+    const origVal = original[key];
+    const modVal = modified[key];
+    const currentPath = [...basePath, key];
+
+    // Field removed
+    if (modVal === undefined && origVal !== undefined) {
+      result.deletes.push(currentPath);
+      continue;
+    }
+
+    // Field added or changed
+    if (origVal === undefined && modVal !== undefined) {
+      if (typeof modVal === 'object' && modVal !== null) {
+        flattenToSets(modVal, currentPath, result.sets);
+      } else {
+        result.sets.push({ path: currentPath, value: modVal });
+      }
+      continue;
+    }
+
+    // Both exist - check for changes
+    if (!deepEqual(origVal, modVal)) {
+      if (typeof modVal === 'object' && modVal !== null && typeof origVal === 'object' && origVal !== null) {
+        // Recurse into nested objects
+        const nested = getRuleDiff(origVal, modVal, currentPath);
+        result.sets.push(...nested.sets);
+        result.deletes.push(...nested.deletes);
+      } else {
+        // Primitive value changed
+        if (typeof modVal === 'object' && modVal !== null) {
+          flattenToSets(modVal, currentPath, result.sets);
+        } else {
+          result.sets.push({ path: currentPath, value: modVal });
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Flatten an object into set operations
+ */
+function flattenToSets(obj, basePath, sets) {
+  if (obj === null || obj === undefined) return;
+
+  if (typeof obj !== 'object') {
+    sets.push({ path: basePath, value: obj });
+    return;
+  }
+
+  for (const [key, val] of Object.entries(obj)) {
+    const currentPath = [...basePath, key];
+    if (typeof val === 'object' && val !== null) {
+      flattenToSets(val, currentPath, sets);
+    } else if (val !== undefined) {
+      sets.push({ path: currentPath, value: val });
+    }
+  }
+}
+
+/**
+ * Check if this is an edit operation (has original data)
+ */
+function isEditMode(type) {
+  if (type === 'firewall') return originalFirewallRule !== null;
+  if (type === 'nat') return originalNatRule !== null;
+  return false;
+}
+
 function openModal(id) {
   const modal = document.getElementById(id);
   if (modal) modal.classList.remove('hidden');
@@ -1576,10 +1911,22 @@ function openFirewallRuleModal(mode = 'create', rulesetName = null, ruleId = nul
   // Reset jump target visibility
   document.getElementById('fwJumpTargetGroup').classList.add('hidden');
 
+  // Reset original rule state
+  originalFirewallRule = null;
+
   if (mode === 'edit' && rulesetName && ruleId) {
     document.getElementById('firewallRuleTitle').textContent = `Edit Rule ${ruleId}`;
     const rule = CONFIG?.firewall?.name?.[rulesetName]?.rule?.[ruleId];
     if (rule) {
+      // Store original rule for differential updates
+      // Use original server state if available (for rules with pending changes)
+      const marker = `firewall:${rulesetName}:${ruleId}`;
+      if (originalServerStates.has(marker)) {
+        originalFirewallRule = deepClone(originalServerStates.get(marker));
+      } else {
+        originalFirewallRule = deepClone(rule);
+      }
+
       document.getElementById('fwRuleId').value = ruleId;
       document.getElementById('fwRuleAction').value = rule.action || 'accept';
       document.getElementById('fwRuleProtocol').value = rule.protocol || '';
@@ -1674,34 +2021,113 @@ async function saveFirewallRule() {
   if (!Object.keys(ruleData.destination).length) delete ruleData.destination;
   Object.keys(ruleData).forEach(k => ruleData[k] === undefined && delete ruleData[k]);
 
+  // Check if this is an edit (differential update) or create (full write)
+  const isEdit = originalFirewallRule !== null;
+  let diff = null;
+
+  if (isEdit) {
+    // Compute differential changes
+    diff = getRuleDiff(originalFirewallRule, ruleData);
+
+    // If no changes from original
+    if (diff.sets.length === 0 && diff.deletes.length === 0) {
+      // In staged mode, check if there's a pending operation to revert
+      const marker = `firewall:${ruleset}:${ruleId}`;
+      if (stagedMode && pendingRuleMarkers.has(marker)) {
+        // There's a pending operation - call addPendingOperation to handle revert
+        const operationData = {
+          type: 'firewall',
+          action: 'update',
+          data: { ruleset, rule_id: ruleId, rule: ruleData }
+        };
+        addPendingOperation(operationData);
+        closeModal('firewallRuleModal');
+        originalFirewallRule = null;
+        return;
+      }
+      // No pending operation - just show "No Changes"
+      showToast('info', 'No Changes', 'No changes detected');
+      closeModal('firewallRuleModal');
+      originalFirewallRule = null;
+      return;
+    }
+  }
+
+  // If staged mode is enabled, queue the operation
+  if (stagedMode) {
+    const operationData = {
+      type: 'firewall',
+      action: isEdit ? 'update' : 'create',
+      data: {
+        ruleset,
+        rule_id: ruleId,
+        rule: ruleData,
+        ...(isEdit && diff ? { diff } : {})
+      },
+      display: `${isEdit ? 'Update' : 'Create'} firewall rule ${ruleId} in ${ruleset}`
+    };
+    addPendingOperation(operationData);
+    closeModal('firewallRuleModal');
+    originalFirewallRule = null;
+    return;
+  }
+
   // Actual execution function
   const doSave = async () => {
     closeModal('firewallRuleModal');
+    // Compute commands for logging
+    let commands;
+    if (isEdit && diff) {
+      const basePath = `firewall ipv4 name ${ruleset} rule ${ruleId}`;
+      commands = buildDiffCommands(basePath, diff);
+    } else {
+      commands = buildFirewallCommands(ruleset, ruleId, ruleData);
+    }
+    const action = isEdit ? 'update' : 'create';
+    const target = `Rule ${ruleId} in ${ruleset}`;
+
     try {
       showLoading('Applying rule...');
+      const requestBody = {
+        ruleset,
+        rule_id: ruleId,
+        rule: ruleData,
+        ...(isEdit && diff ? { diff } : {})
+      };
       const res = await fetch('/api/firewall/rule', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ruleset, rule_id: ruleId, rule: ruleData })
+        body: JSON.stringify(requestBody)
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to save rule');
 
       showToast('success', 'Rule Saved', `Rule ${ruleId} saved successfully`);
+      logActivity('firewall', action, target, 'success', `Firewall rule ${ruleId} ${action}d successfully`, commands);
       hasUnsavedChanges = true;
       updateSaveIndicator();
       await reloadConfig();
       viewRuleset(ruleset);
     } catch (e) {
       showToast('error', 'Error', e.message);
+      logActivity('firewall', action, target, 'error', `Failed to ${action} firewall rule: ${e.message}`, commands);
       content.innerHTML = '';
       viewRuleset(ruleset);
+    } finally {
+      originalFirewallRule = null;
     }
   };
 
   // If verbose mode is enabled, show preview first
   if (verboseMode) {
-    const commands = buildFirewallCommands(ruleset, ruleId, ruleData);
+    // Use diff commands when editing (differential update)
+    let commands;
+    if (isEdit && diff) {
+      const basePath = `firewall ipv4 name ${ruleset} rule ${ruleId}`;
+      commands = buildDiffCommands(basePath, diff);
+    } else {
+      commands = buildFirewallCommands(ruleset, ruleId, ruleData);
+    }
     showCommandPreview(commands, doSave);
   } else {
     await doSave();
@@ -1717,7 +2143,21 @@ async function deleteFirewallRule(rulesetName, ruleId) {
   const confirmed = await openConfirmModal('Delete Rule?', `Are you sure you want to delete rule ${ruleId} from ${rulesetName}?`);
   if (!confirmed) return;
 
+  // If staged mode is enabled, queue the operation
+  if (stagedMode) {
+    addPendingOperation({
+      type: 'firewall',
+      action: 'delete',
+      data: { ruleset: rulesetName, rule_id: ruleId },
+      display: `Delete firewall rule ${ruleId} from ${rulesetName}`
+    });
+    return;
+  }
+
   // Actual execution function
+  const commands = buildDeleteCommand('firewall', rulesetName, ruleId);
+  const target = `Rule ${ruleId} in ${rulesetName}`;
+
   const doDelete = async () => {
     try {
       showLoading('Deleting rule...');
@@ -1729,19 +2169,20 @@ async function deleteFirewallRule(rulesetName, ruleId) {
       if (!res.ok) throw new Error((await res.json()).error);
 
       showToast('success', 'Rule Deleted', `Rule ${ruleId} deleted successfully`);
+      logActivity('firewall', 'delete', target, 'success', `Firewall rule ${ruleId} deleted successfully`, commands);
       hasUnsavedChanges = true;
       updateSaveIndicator();
       await reloadConfig();
       viewRuleset(rulesetName);
     } catch (e) {
       showToast('error', 'Error', e.message);
+      logActivity('firewall', 'delete', target, 'error', `Failed to delete firewall rule: ${e.message}`, commands);
       viewRuleset(rulesetName);
     }
   };
 
   // If verbose mode is enabled, show preview first
   if (verboseMode) {
-    const commands = buildDeleteCommand('firewall', rulesetName, ruleId);
     showCommandPreview(commands, doDelete);
   } else {
     await doDelete();
@@ -1776,10 +2217,22 @@ function openNatRuleModal(mode = 'create', natType = 'destination', ruleId = nul
   document.getElementById('natRuleMode').value = mode;
   document.getElementById('natRuleType').value = natType;
 
+  // Reset original rule state
+  originalNatRule = null;
+
   if (mode === 'edit' && ruleId) {
     document.getElementById('natRuleTitle').textContent = `Edit NAT Rule ${ruleId}`;
     const rule = CONFIG?.nat?.[natType]?.rule?.[ruleId];
     if (rule) {
+      // Store original rule for differential updates
+      // Use original server state if available (for rules with pending changes)
+      const marker = `nat:${natType}:${ruleId}`;
+      if (originalServerStates.has(marker)) {
+        originalNatRule = deepClone(originalServerStates.get(marker));
+      } else {
+        originalNatRule = deepClone(rule);
+      }
+
       document.getElementById('natRuleId').value = ruleId;
       document.getElementById('natRuleDescription').value = rule.description || '';
       document.getElementById('natRuleProtocol').value = rule.protocol || '';
@@ -1858,19 +2311,88 @@ async function saveNatRule() {
 
   Object.keys(ruleData).forEach(k => ruleData[k] === undefined && delete ruleData[k]);
 
+  // Check if this is an edit (differential update) or create (full write)
+  const isEdit = originalNatRule !== null;
+  let diff = null;
+
+  if (isEdit) {
+    // Compute differential changes
+    diff = getRuleDiff(originalNatRule, ruleData);
+
+    // If no changes from original
+    if (diff.sets.length === 0 && diff.deletes.length === 0) {
+      // In staged mode, check if there's a pending operation to revert
+      const marker = `nat:${natType}:${ruleId}`;
+      if (stagedMode && pendingRuleMarkers.has(marker)) {
+        // There's a pending operation - call addPendingOperation to handle revert
+        const operationData = {
+          type: 'nat',
+          action: 'update',
+          data: { nat_type: natType, rule_id: ruleId, rule: ruleData }
+        };
+        addPendingOperation(operationData);
+        closeModal('natRuleModal');
+        originalNatRule = null;
+        return;
+      }
+      // No pending operation - just show "No Changes"
+      showToast('info', 'No Changes', 'No changes detected');
+      closeModal('natRuleModal');
+      originalNatRule = null;
+      return;
+    }
+  }
+
+  // If staged mode is enabled, queue the operation
+  if (stagedMode) {
+    const operationData = {
+      type: 'nat',
+      action: isEdit ? 'update' : 'create',
+      data: {
+        nat_type: natType,
+        rule_id: ruleId,
+        rule: ruleData,
+        ...(isEdit && diff ? { diff } : {})
+      },
+      display: `${isEdit ? 'Update' : 'Create'} ${natType} NAT rule ${ruleId}`
+    };
+    addPendingOperation(operationData);
+    closeModal('natRuleModal');
+    originalNatRule = null;
+    return;
+  }
+
   // Actual execution function
   const doSave = async () => {
     closeModal('natRuleModal');
+    // Compute commands for logging
+    let commands;
+    if (isEdit && diff) {
+      const basePath = `nat ${natType} rule ${ruleId}`;
+      commands = buildDiffCommands(basePath, diff);
+    } else {
+      commands = buildNatCommands(natType, ruleId, ruleData);
+    }
+    const action = isEdit ? 'update' : 'create';
+    const target = `${natType} NAT rule ${ruleId}`;
+
     try {
       showLoading('Applying NAT rule...');
+      const requestBody = {
+        nat_type: natType,
+        rule_id: ruleId,
+        rule: ruleData,
+        ...(isEdit && diff ? { diff } : {})
+      };
       const res = await fetch('/api/nat/rule', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ nat_type: natType, rule_id: ruleId, rule: ruleData })
+        body: JSON.stringify(requestBody)
       });
       if (!res.ok) throw new Error((await res.json()).error);
 
       showToast('success', 'NAT Rule Saved', `NAT rule ${ruleId} saved successfully`);
+      logActivity('nat', action, target, 'success', `NAT rule ${ruleId} ${action}d successfully`, commands);
       hasUnsavedChanges = true;
       updateSaveIndicator();
       // Reload NAT data
@@ -1882,13 +2404,23 @@ async function saveNatRule() {
       loadNat();
     } catch (e) {
       showToast('error', 'Error', e.message);
+      logActivity('nat', action, target, 'error', `Failed to ${action} NAT rule: ${e.message}`, commands);
       loadNat();
+    } finally {
+      originalNatRule = null;
     }
   };
 
   // If verbose mode is enabled, show preview first
   if (verboseMode) {
-    const commands = buildNatCommands(natType, ruleId, ruleData);
+    // Use diff commands when editing (differential update)
+    let commands;
+    if (isEdit && diff) {
+      const basePath = `nat ${natType} rule ${ruleId}`;
+      commands = buildDiffCommands(basePath, diff);
+    } else {
+      commands = buildNatCommands(natType, ruleId, ruleData);
+    }
     showCommandPreview(commands, doSave);
   } else {
     await doSave();
@@ -1904,7 +2436,21 @@ async function deleteNatRule(natType, ruleId) {
   const confirmed = await openConfirmModal('Delete NAT Rule?', `Are you sure you want to delete NAT rule ${ruleId} (${natType})?`);
   if (!confirmed) return;
 
+  // If staged mode is enabled, queue the operation
+  if (stagedMode) {
+    addPendingOperation({
+      type: 'nat',
+      action: 'delete',
+      data: { nat_type: natType, rule_id: ruleId },
+      display: `Delete ${natType} NAT rule ${ruleId}`
+    });
+    return;
+  }
+
   // Actual execution function
+  const commands = buildDeleteCommand('nat', natType, ruleId);
+  const target = `${natType} NAT rule ${ruleId}`;
+
   const doDelete = async () => {
     try {
       showLoading('Deleting NAT rule...');
@@ -1916,6 +2462,7 @@ async function deleteNatRule(natType, ruleId) {
       if (!res.ok) throw new Error((await res.json()).error);
 
       showToast('success', 'NAT Rule Deleted', `NAT rule ${ruleId} deleted successfully`);
+      logActivity('nat', 'delete', target, 'success', `NAT rule ${ruleId} deleted successfully`, commands);
       hasUnsavedChanges = true;
       updateSaveIndicator();
       // Reload NAT data
@@ -1927,6 +2474,7 @@ async function deleteNatRule(natType, ruleId) {
       loadNat();
     } catch (e) {
       showToast('error', 'Error', e.message);
+      logActivity('nat', 'delete', target, 'error', `Failed to delete NAT rule: ${e.message}`, commands);
       loadNat();
     }
   };
@@ -1955,8 +2503,10 @@ async function saveConfigToRouter() {
     showToast('success', 'Configuration Saved', 'Configuration saved to the router successfully');
     hasUnsavedChanges = false;
     updateSaveIndicator();
+    logActivity('config', 'save', 'Router config', 'success', 'Configuration saved to router (config.boot)');
   } catch (e) {
     showToast('error', 'Error', e.message);
+    logActivity('config', 'save', 'Router config', 'error', `Failed to save config: ${e.message}`);
   } finally {
     // Restore content
     if (currentSection === 'Firewall' && currentRulesetName) {
@@ -1983,6 +2533,400 @@ document.getElementById('verboseModeCheck')?.addEventListener('change', (e) => {
   verboseMode = e.target.checked;
   showToast('info', 'Verbose Mode', verboseMode ? 'Command preview enabled' : 'Command preview disabled');
 });
+
+// =========================================
+// STAGED MODE
+// =========================================
+
+// Toggle staged mode
+document.getElementById('stagedModeCheck')?.addEventListener('change', async (e) => {
+  const wasEnabled = stagedMode;
+  stagedMode = e.target.checked;
+  const toggle = document.getElementById('stagedToggle');
+
+  if (stagedMode) {
+    toggle?.classList.add('staged-active');
+    showToast('info', 'Staged Mode', 'Changes will be queued - click Apply All to commit');
+  } else {
+    toggle?.classList.remove('staged-active');
+
+    // If disabling and there are pending changes, ask what to do
+    if (wasEnabled && pendingOperations.length > 0) {
+      const confirmed = await openConfirmModal(
+        'Pending Changes',
+        `You have ${pendingOperations.length} pending change(s). Apply them now?`
+      );
+      if (confirmed) {
+        await applyAllChanges();
+      } else {
+        await discardAllChangesQuiet();
+      }
+    }
+    showToast('info', 'Staged Mode', 'Changes apply immediately');
+  }
+});
+
+// Add operation to pending queue (consolidates operations for the same rule)
+function addPendingOperation(operation) {
+  const marker = buildRuleMarker(operation);
+
+  // Check if there's already a pending operation for this rule
+  const existingIndex = pendingOperations.findIndex(op => buildRuleMarker(op) === marker);
+
+  if (existingIndex >= 0) {
+    // Remove existing operation - we'll replace it with the new one
+    pendingOperations.splice(existingIndex, 1);
+  } else {
+    // First time modifying this rule - store original server state
+    const originalState = getOriginalServerState(operation);
+    if (originalState !== undefined) {
+      originalServerStates.set(marker, originalState);
+    }
+  }
+
+  // For updates, check if new state matches original server state
+  if (operation.action === 'update' || operation.action === 'create') {
+    const origState = originalServerStates.get(marker);
+    if (origState !== undefined && origState !== null) {
+      // Compare new rule with original server state
+      const diff = getRuleDiff(origState, operation.data.rule);
+      if (diff.sets.length === 0 && diff.deletes.length === 0) {
+        // No changes from original - remove the pending operation entirely
+        pendingRuleMarkers.delete(marker);
+        // Restore original state in CONFIG
+        restoreOriginalInConfig(operation, origState);
+        originalServerStates.delete(marker);
+        updatePendingIndicator();
+        showToast('info', 'Reverted', 'Rule restored to original state');
+        // Log the revert
+        const target = operation.type === 'firewall'
+          ? `Rule ${operation.data.rule_id} in ${operation.data.ruleset}`
+          : `${operation.data.nat_type} NAT rule ${operation.data.rule_id}`;
+        logActivity(operation.type, 'revert', target, 'reverted', 'Pending change reverted - rule matches original state');
+        refreshCurrentViewSoft();
+        return;
+      }
+      // Update the diff in the operation to reflect changes from original
+      operation.data.diff = diff;
+    }
+  }
+
+  // Add the operation
+  pendingOperations.push(operation);
+  pendingRuleMarkers.add(marker);
+
+  // Update local CONFIG to show changes immediately
+  applyOperationToLocalConfig(operation);
+
+  updatePendingIndicator();
+  showToast('info', 'Staged', operation.display);
+
+  // Log the staged operation
+  const target = operation.type === 'firewall'
+    ? `Rule ${operation.data.rule_id} in ${operation.data.ruleset}`
+    : `${operation.data.nat_type} NAT rule ${operation.data.rule_id}`;
+  const commands = buildCommandsForOperation(operation);
+  logActivity(operation.type, 'staged', target, 'staged', `Staged: ${operation.display}`, commands);
+
+  // Re-render current view to show the changes
+  refreshCurrentViewSoft();
+}
+
+// Get original server state for a rule before any pending changes
+function getOriginalServerState(operation) {
+  if (!CONFIG) return undefined;
+
+  if (operation.type === 'firewall') {
+    const { ruleset, rule_id } = operation.data;
+    const rules = CONFIG.firewall?.name?.[ruleset]?.rule;
+    if (rules && rules[rule_id]) {
+      return deepClone(rules[rule_id]);
+    }
+    return null; // Rule doesn't exist on server (new rule)
+  } else if (operation.type === 'nat') {
+    const { nat_type, rule_id } = operation.data;
+    const rules = (nat_type === 'destination' ? natData?.destination : natData?.source)?.rule;
+    if (rules && rules[rule_id]) {
+      return deepClone(rules[rule_id]);
+    }
+    return null; // Rule doesn't exist on server (new rule)
+  }
+  return undefined;
+}
+
+// Restore original state in CONFIG when reverting a change
+function restoreOriginalInConfig(operation, originalState) {
+  if (!CONFIG) return;
+
+  if (operation.type === 'firewall') {
+    const { ruleset, rule_id } = operation.data;
+    if (CONFIG.firewall?.name?.[ruleset]?.rule) {
+      if (originalState === null) {
+        delete CONFIG.firewall.name[ruleset].rule[rule_id];
+      } else {
+        CONFIG.firewall.name[ruleset].rule[rule_id] = originalState;
+      }
+      if (currentRulesetName === ruleset) {
+        currentRulesetData = CONFIG.firewall.name[ruleset].rule || {};
+      }
+    }
+  } else if (operation.type === 'nat') {
+    const { nat_type, rule_id } = operation.data;
+    const natSection = nat_type === 'destination' ? 'destination' : 'source';
+    if (natData?.[natSection]?.rule) {
+      if (originalState === null) {
+        delete natData[natSection].rule[rule_id];
+      } else {
+        natData[natSection].rule[rule_id] = originalState;
+      }
+      if (CONFIG) CONFIG.nat = natData;
+    }
+  }
+}
+
+// Build marker key for a rule
+function buildRuleMarker(operation) {
+  if (operation.type === 'firewall') {
+    return `firewall:${operation.data.ruleset}:${operation.data.rule_id}`;
+  } else if (operation.type === 'nat') {
+    return `nat:${operation.data.nat_type}:${operation.data.rule_id}`;
+  }
+  return '';
+}
+
+// Get pending status for a rule
+function getPendingStatus(type, ...args) {
+  let marker;
+  if (type === 'firewall') {
+    const [ruleset, ruleId] = args;
+    marker = `firewall:${ruleset}:${ruleId}`;
+  } else if (type === 'nat') {
+    const [natType, ruleId] = args;
+    marker = `nat:${natType}:${ruleId}`;
+  }
+
+  if (!pendingRuleMarkers.has(marker)) return null;
+
+  // Find the operation to determine if it's a create/update or delete
+  const op = pendingOperations.find(o => buildRuleMarker(o) === marker);
+  return op ? op.action : null;
+}
+
+// Apply operation to local CONFIG (in-memory preview)
+function applyOperationToLocalConfig(operation) {
+  if (!CONFIG) return;
+
+  if (operation.type === 'firewall') {
+    const { ruleset, rule_id, rule } = operation.data;
+
+    // Ensure path exists
+    if (!CONFIG.firewall) CONFIG.firewall = {};
+    if (!CONFIG.firewall.name) CONFIG.firewall.name = {};
+    if (!CONFIG.firewall.name[ruleset]) CONFIG.firewall.name[ruleset] = { rule: {} };
+    if (!CONFIG.firewall.name[ruleset].rule) CONFIG.firewall.name[ruleset].rule = {};
+
+    if (operation.action === 'delete') {
+      // Mark for deletion but keep for display with strikethrough
+      // The actual deletion happens on apply
+    } else {
+      // Create or update
+      CONFIG.firewall.name[ruleset].rule[rule_id] = rule;
+    }
+
+    // Update currentRulesetData if we're viewing this ruleset
+    if (currentRulesetName === ruleset) {
+      currentRulesetData = CONFIG.firewall.name[ruleset].rule || {};
+    }
+
+  } else if (operation.type === 'nat') {
+    const { nat_type, rule_id, rule } = operation.data;
+
+    // Ensure path exists
+    if (!CONFIG.nat) CONFIG.nat = {};
+    if (!CONFIG.nat[nat_type]) CONFIG.nat[nat_type] = { rule: {} };
+    if (!CONFIG.nat[nat_type].rule) CONFIG.nat[nat_type].rule = {};
+
+    if (operation.action === 'delete') {
+      // Mark for deletion but keep for display
+    } else {
+      // Create or update
+      CONFIG.nat[nat_type].rule[rule_id] = rule;
+    }
+
+    // Update natData
+    if (natData) {
+      if (!natData[nat_type]) natData[nat_type] = { rule: {} };
+      if (!natData[nat_type].rule) natData[nat_type].rule = {};
+      if (operation.action !== 'delete') {
+        natData[nat_type].rule[rule_id] = rule;
+      }
+    }
+  }
+}
+
+// Soft refresh - just re-render without fetching from server
+function refreshCurrentViewSoft() {
+  if (currentSection === 'Firewall' && currentRulesetName) {
+    renderRuleset();
+  } else if (currentSection === 'NAT') {
+    renderNat(natData);
+  }
+}
+
+// Update the pending indicator UI
+function updatePendingIndicator() {
+  const indicator = document.getElementById('pendingChangesIndicator');
+  const countEl = document.getElementById('pendingCount');
+
+  if (pendingOperations.length > 0) {
+    indicator?.classList.remove('hidden');
+    if (countEl) countEl.textContent = pendingOperations.length;
+  } else {
+    indicator?.classList.add('hidden');
+  }
+}
+
+// Apply all pending changes
+async function applyAllChanges() {
+  if (pendingOperations.length === 0) {
+    showToast('info', 'No Changes', 'No pending changes to apply');
+    return;
+  }
+
+  // If verbose mode is enabled, show preview of all commands first
+  if (verboseMode) {
+    const allCommands = pendingOperations.flatMap(op => buildCommandsForOperation(op));
+    showCommandPreview(allCommands, executeAllPending);
+    return;
+  }
+
+  await executeAllPending();
+}
+
+// Execute all pending operations
+async function executeAllPending() {
+  if (pendingOperations.length === 0) return;
+
+  const count = pendingOperations.length;
+  // Build all commands for logging
+  const allCommands = pendingOperations.flatMap(op => buildCommandsForOperation(op));
+
+  try {
+    showLoading(`Applying ${count} change(s)...`);
+
+    const res = await fetch('/api/batch-configure', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ operations: pendingOperations })
+    });
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Failed to apply changes');
+
+    // Clear pending operations, markers, and original states
+    pendingOperations = [];
+    pendingRuleMarkers.clear();
+    originalServerStates.clear();
+    updatePendingIndicator();
+
+    showToast('success', 'Applied', `${count} change(s) applied successfully`);
+    logActivity('config', 'update', `Batch: ${count} operations`, 'success', `Applied ${count} staged change(s) to router`, allCommands);
+    hasUnsavedChanges = true;
+    updateSaveIndicator();
+
+    // Reload current view from server (get fresh data)
+    await reloadCurrentView();
+
+  } catch (e) {
+    showToast('error', 'Error', e.message);
+    logActivity('config', 'update', `Batch: ${count} operations`, 'error', `Failed to apply batch changes: ${e.message}`, allCommands);
+    // Keep pending operations on error for retry
+    await reloadCurrentView();
+  }
+}
+
+// Discard all pending changes (with confirmation)
+async function discardAllChanges() {
+  if (pendingOperations.length === 0) {
+    showToast('info', 'No Changes', 'No pending changes to discard');
+    return;
+  }
+
+  const confirmed = await openConfirmModal(
+    'Discard Changes?',
+    `Are you sure you want to discard ${pendingOperations.length} pending change(s)?`
+  );
+
+  if (confirmed) {
+    await discardAllChangesQuiet();
+  }
+}
+
+// Discard without confirmation (used internally)
+async function discardAllChangesQuiet() {
+  const count = pendingOperations.length;
+  const discardedOps = [...pendingOperations]; // Keep copy for logging
+  pendingOperations = [];
+  pendingRuleMarkers.clear();
+  originalServerStates.clear();
+  updatePendingIndicator();
+
+  if (count > 0) {
+    showToast('info', 'Discarded', `${count} pending change(s) discarded`);
+    // Log the discarded operations
+    const descriptions = discardedOps.map(op => op.display).join(', ');
+    logActivity('config', 'discard', `${count} operation(s)`, 'reverted', `Discarded pending changes: ${descriptions}`);
+    // Reload from server to revert in-memory changes
+    await reloadCurrentView();
+  }
+}
+
+// Build VyOS commands for a single operation (for verbose mode preview)
+function buildCommandsForOperation(op) {
+  if (op.type === 'firewall') {
+    if (op.action === 'delete') {
+      return buildDeleteCommand('firewall', op.data.ruleset, op.data.rule_id);
+    } else if (op.data.diff && op.action === 'update') {
+      // Use diff commands for updates
+      const basePath = `firewall ipv4 name ${op.data.ruleset} rule ${op.data.rule_id}`;
+      return buildDiffCommands(basePath, op.data.diff);
+    } else {
+      return buildFirewallCommands(op.data.ruleset, op.data.rule_id, op.data.rule);
+    }
+  } else if (op.type === 'nat') {
+    if (op.action === 'delete') {
+      return buildDeleteCommand('nat', op.data.nat_type, op.data.rule_id);
+    } else if (op.data.diff && op.action === 'update') {
+      // Use diff commands for updates
+      const basePath = `nat ${op.data.nat_type} rule ${op.data.rule_id}`;
+      return buildDiffCommands(basePath, op.data.diff);
+    } else {
+      return buildNatCommands(op.data.nat_type, op.data.rule_id, op.data.rule);
+    }
+  }
+  return [];
+}
+
+// Helper to reload current view after batch apply
+async function reloadCurrentView() {
+  if (currentSection === 'Firewall' && currentRulesetName) {
+    await reloadConfig();
+    viewRuleset(currentRulesetName);
+  } else if (currentSection === 'NAT') {
+    const natRes = await fetch('/api/NAT');
+    if (natRes.ok) {
+      natData = await natRes.json();
+      if (CONFIG) CONFIG.nat = natData;
+    }
+    renderNat(natData);
+  } else if (currentSection === 'Firewall') {
+    await reloadConfig();
+    loadFirewall();
+  } else {
+    await reloadConfig();
+    renderDashboard();
+  }
+}
 
 // Build VyOS set commands from firewall rule data
 function buildFirewallCommands(ruleset, ruleId, ruleData) {
@@ -2103,6 +3047,37 @@ function buildDeleteCommand(type, ...args) {
     return [{ op: 'delete', cmd: `delete nat ${natType} rule ${ruleId}` }];
   }
   return [];
+}
+
+// Build commands from a diff object (for differential updates)
+function buildDiffCommands(basePath, diff) {
+  const commands = [];
+
+  // Process set operations
+  for (const setOp of diff.sets || []) {
+    const pathStr = setOp.path.join(' ');
+    const value = setOp.value;
+
+    if (value !== null && value !== undefined) {
+      if (typeof value === 'boolean') {
+        if (value) {
+          commands.push({ op: 'set', cmd: `set ${basePath} ${pathStr}` });
+        }
+      } else {
+        commands.push({ op: 'set', cmd: `set ${basePath} ${pathStr} '${value}'` });
+      }
+    } else {
+      commands.push({ op: 'set', cmd: `set ${basePath} ${pathStr}` });
+    }
+  }
+
+  // Process delete operations
+  for (const delPath of diff.deletes || []) {
+    const pathStr = delPath.join(' ');
+    commands.push({ op: 'delete', cmd: `delete ${basePath} ${pathStr}` });
+  }
+
+  return commands;
 }
 
 // Show command preview modal
@@ -2270,6 +3245,20 @@ document.addEventListener('keydown', (e) => {
         renderRuleset();
       }
       break;
+  }
+});
+
+// =========================================
+// BEFOREUNLOAD WARNING
+// =========================================
+
+// Warn before closing if there are pending staged changes
+window.addEventListener('beforeunload', (e) => {
+  if (pendingOperations.length > 0) {
+    e.preventDefault();
+    // Most browsers ignore custom messages, but we set it anyway
+    e.returnValue = `You have ${pendingOperations.length} pending change(s) that will be lost.`;
+    return e.returnValue;
   }
 });
 

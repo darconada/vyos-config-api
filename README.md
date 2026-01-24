@@ -10,7 +10,10 @@ Web application for viewing and managing VyOS router configurations via REST API
 
 - **View Configuration**: Browse firewall rulesets, NAT rules, and firewall groups
 - **CRUD Operations**: Create, modify, and delete firewall and NAT rules
+- **Staged Mode**: Queue multiple changes and apply them in a single batch
 - **Verbose Mode**: Preview VyOS commands before execution
+- **Differential Updates**: Only send changed fields when editing rules
+- **Activity Log**: Track all operations performed during the session
 - **NAT Exclude**: Support for VPN/IPsec traffic bypass rules
 - **All VyOS 1.4 Actions**: accept, drop, reject, return, continue, jump, queue
 - **Group Support**: address-group, network-group, port-group
@@ -76,8 +79,10 @@ set service https allow-client address 192.168.1.0/24
    - API Key: The key configured in VyOS
 3. Browse firewall rules and NAT configuration
 4. Use **Edit** and **Delete** buttons to manage rules
-5. Enable **Verbose** mode to preview commands before execution
-6. Click **Save** to persist changes to the router
+5. Enable **Staged** mode to queue multiple changes before applying
+6. Enable **Verbose** mode to preview commands before execution
+7. Check the **Activity** section to review all operations
+8. Click **Save** to persist changes to the router
 
 ## Screenshots
 
@@ -110,6 +115,7 @@ set service https allow-client address 192.168.1.0/24
 | POST | `/api/nat/rule` | Create/modify NAT rule |
 | DELETE | `/api/nat/rule` | Delete NAT rule |
 | POST | `/api/save-config` | Save config to router |
+| POST | `/api/batch-configure` | Apply multiple operations in batch |
 
 ## File Structure
 
