@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="VyOS Configuration Viewer - Visual interface for VyOS router configurations">
+  <title>VyOS Config Viewer (API)</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/modal.css">
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=VT323&display=swap"
+    rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+
+<body>
+  <!-- Toast Container -->
+  <div id="toastContainer" class="toast-container"></div>
+
+  <!-- Header -->
+  <header class="app-header">
+    <div class="header-left">
+      <div class="logo">
+        <div class="logo-icon">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
+            <path d="M2 17l10 5 10-5"></path>
+            <path d="M2 12l10 5 10-5"></path>
+          </svg>
+        </div>
+        <span class="logo-text">VyOS Viewer</span>
+        <span class="badge badge-primary" style="margin-left: 0.5rem;">API</span>
+      </div>
+
+      <!-- Breadcrumb -->
+      <nav class="breadcrumb" id="breadcrumb" aria-label="Breadcrumb">
+        <span class="breadcrumb-item">Home</span>
+      </nav>
+    </div>
+
+    <div class="header-center">
+      <!-- Connection Status -->
+      <div class="connection-status" id="connectionStatus">
+        <span class="status-dot"></span>
+        <span class="status-text">No config loaded</span>
+      </div>
+    </div>
+
+    <div class="header-controls">
+      <!-- Theme Toggle -->
+      <div class="theme-toggle" role="group" aria-label="Theme selection">
+        <button class="theme-btn" data-theme="light" title="Light theme">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="5"></circle>
+            <line x1="12" y1="1" x2="12" y2="3"></line>
+            <line x1="12" y1="21" x2="12" y2="23"></line>
+            <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+            <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+            <line x1="1" y1="12" x2="3" y2="12"></line>
+            <line x1="21" y1="12" x2="23" y2="12"></line>
+            <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+            <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+          </svg>
+        </button>
+        <button class="theme-btn" data-theme="dark" title="Dark theme">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+          </svg>
+        </button>
+        <button class="theme-btn" data-theme="retro" title="Retro theme">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+            <line x1="8" y1="21" x2="16" y2="21"></line>
+            <line x1="12" y1="17" x2="12" y2="21"></line>
+          </svg>
+        </button>
+      </div>
+
+      <div class="header-divider"></div>
+
+      <!-- Verbose Mode Toggle -->
+      <label class="toggle-switch hidden" id="verboseToggle" title="Show commands before execution">
+        <input type="checkbox" id="verboseModeCheck">
+        <span class="toggle-slider"></span>
+        <span class="toggle-label">Verbose</span>
+      </label>
+
+      <div class="header-divider hidden" id="verboseDivider"></div>
+
+      <!-- Action Buttons -->
+      <button id="fetchBtn" class="btn btn-primary">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round">
+          <path d="M5 12h14"></path>
+          <path d="M12 5l7 7-7 7"></path>
+        </svg>
+        <span>Connect</span>
+      </button>
+      <button id="uploadBtn" class="btn btn-secondary">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+          <polyline points="17 8 12 3 7 8"></polyline>
+          <line x1="12" y1="3" x2="12" y2="15"></line>
+        </svg>
+        <span>Upload</span>
+      </button>
+      <button id="saveConfigBtn" class="btn btn-success hidden" title="Save config to router">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path>
+          <polyline points="17 21 17 13 7 13 7 21"></polyline>
+          <polyline points="7 3 7 8 15 8"></polyline>
+        </svg>
+        <span>Save</span>
+        <span id="unsavedDot" class="unsaved-indicator hidden"></span>
+      </button>
+      <input type="file" id="fileInput" accept="application/json" style="display:none">
+    </div>
+  </header>
+
+  <!-- Main Content -->
+  <main class="main-container">
+    <!-- Navigation Menu -->
+    <nav id="menu" class="nav-menu" aria-label="Main navigation"></nav>
+
+    <!-- Content Area -->
+    <div id="content" class="content-area">
+      <!-- Welcome State -->
+      <div class="empty-state">
+        <div class="empty-state-icon">
+          <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
+            <path d="M2 17l10 5 10-5"></path>
+            <path d="M2 12l10 5 10-5"></path>
+          </svg>
+        </div>
+        <h2 class="empty-state-title">Welcome to VyOS Config Viewer</h2>
+        <p class="empty-state-text">Connect to a VyOS router via API REST or upload a JSON configuration file to get started.</p>
+        <div class="empty-state-actions">
+          <button class="btn btn-primary btn-lg" onclick="document.getElementById('fetchBtn').click()">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M5 12h14"></path>
+              <path d="M12 5l7 7-7 7"></path>
+            </svg>
+            Connect via API
+          </button>
+          <button class="btn btn-secondary btn-lg" onclick="document.getElementById('fileInput').click()">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="17 8 12 3 7 8"></polyline>
+              <line x1="12" y1="3" x2="12" y2="15"></line>
+            </svg>
+            Upload JSON File
+          </button>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- Footer -->
+  <footer class="app-footer">
+    <div class="footer-content">
+      <span class="footer-text">VyOS Config Viewer (API REST)</span>
+      <span class="footer-separator">|</span>
+      <span class="footer-hint">Press <kbd>?</kbd> for keyboard shortcuts</span>
+    </div>
+  </footer>
+
+  <!-- Keyboard Shortcuts Modal (hidden by default) -->
+  <div id="shortcutsModal" class="modal hidden" role="dialog" aria-labelledby="shortcutsTitle" aria-modal="true">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content modal-sm">
+      <div class="modal-header">
+        <h3 id="shortcutsTitle">Keyboard Shortcuts</h3>
+        <button class="modal-close" onclick="closeModal('shortcutsModal')" aria-label="Close">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="shortcuts-list">
+          <div class="shortcut-item">
+            <kbd>?</kbd>
+            <span>Show this help</span>
+          </div>
+          <div class="shortcut-item">
+            <kbd>Esc</kbd>
+            <span>Close modal / Clear search</span>
+          </div>
+          <div class="shortcut-item">
+            <kbd>c</kbd>
+            <span>Connect to router</span>
+          </div>
+          <div class="shortcut-item">
+            <kbd>u</kbd>
+            <span>Upload config file</span>
+          </div>
+          <div class="shortcut-item">
+            <kbd>f</kbd>
+            <span>Go to Firewall</span>
+          </div>
+          <div class="shortcut-item">
+            <kbd>n</kbd>
+            <span>Go to NAT</span>
+          </div>
+          <div class="shortcut-item">
+            <kbd>s</kbd>
+            <span>Search traffic (in Firewall view)</span>
+          </div>
+          <div class="shortcut-item">
+            <kbd>r</kbd>
+            <span>Toggle resolved values</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Command Preview Modal (Verbose Mode) -->
+  <div id="commandPreviewModal" class="modal modal-draggable hidden">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content modal-lg" id="commandPreviewModalContent">
+      <div class="modal-header" id="commandPreviewModalHeader">
+        <h3>Commands to Execute</h3>
+        <button class="modal-close" onclick="closeModal('commandPreviewModal')">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <p class="text-muted" style="margin-bottom: 1rem;">The following VyOS commands will be executed:</p>
+        <pre id="commandPreviewContent" class="command-preview"></pre>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="cancelCommandPreview()">Cancel</button>
+        <button class="btn btn-primary" onclick="executePreviewedCommands()">Execute</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Confirm Modal -->
+  <div id="confirmModal" class="modal hidden">
+    <div class="modal-backdrop"></div>
+    <div class="modal-content modal-sm">
+      <div class="modal-header">
+        <h3 id="confirmTitle">Confirmar</h3>
+      </div>
+      <div class="modal-body">
+        <p id="confirmMessage"></p>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" id="confirmCancel">Cancelar</button>
+        <button class="btn btn-danger" id="confirmOk">Confirmar</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Firewall Rule Modal -->
+  <div id="firewallRuleModal" class="modal modal-draggable hidden">
+    <div class="modal-backdrop"></div>
+    <div id="firewallRuleModalContent" class="modal-content modal-lg">
+      <div id="firewallRuleModalHeader" class="modal-header">
+        <h3 id="firewallRuleTitle">Nueva Regla de Firewall</h3>
+        <button class="modal-close" onclick="closeModal('firewallRuleModal')">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <form id="firewallRuleForm">
+          <input type="hidden" id="fwRuleMode" value="create">
+          <div class="form-row">
+            <div class="form-group">
+              <label>Ruleset *</label>
+              <select id="fwRuleRuleset" required></select>
+            </div>
+            <div class="form-group">
+              <label>Rule ID *</label>
+              <input type="number" id="fwRuleId" min="1" max="9999" required>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Action *</label>
+              <select id="fwRuleAction" required onchange="toggleJumpTarget()">
+                <option value="accept">accept</option>
+                <option value="drop">drop</option>
+                <option value="reject">reject</option>
+                <option value="return">return</option>
+                <option value="continue">continue</option>
+                <option value="jump">jump</option>
+                <option value="queue">queue</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Protocol</label>
+              <select id="fwRuleProtocol">
+                <option value="">any</option>
+                <option value="tcp">tcp</option>
+                <option value="udp">udp</option>
+                <option value="tcp_udp">tcp_udp</option>
+                <option value="icmp">icmp</option>
+                <option value="gre">gre</option>
+                <option value="esp">esp</option>
+                <option value="ah">ah</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group hidden" id="fwJumpTargetGroup">
+            <label>Jump Target *</label>
+            <select id="fwRuleJumpTarget"></select>
+            <small class="text-muted">Ruleset to jump to when action is "jump"</small>
+          </div>
+          <div class="form-group">
+            <label>Description</label>
+            <input type="text" id="fwRuleDescription" maxlength="255">
+          </div>
+          <fieldset class="form-fieldset">
+            <legend>Source</legend>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Address/Network</label>
+                <input type="text" id="fwRuleSrcAddress" placeholder="192.168.1.0/24">
+              </div>
+              <div class="form-group">
+                <label>Port</label>
+                <input type="text" id="fwRuleSrcPort" placeholder="80,443">
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Address Group</label>
+                <select id="fwRuleSrcAddrGroup"><option value="">--</option></select>
+              </div>
+              <div class="form-group">
+                <label>Network Group</label>
+                <select id="fwRuleSrcNetGroup"><option value="">--</option></select>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>Port Group</label>
+              <select id="fwRuleSrcPortGroup"><option value="">--</option></select>
+            </div>
+          </fieldset>
+          <fieldset class="form-fieldset">
+            <legend>Destination</legend>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Address/Network</label>
+                <input type="text" id="fwRuleDstAddress" placeholder="10.0.0.1">
+              </div>
+              <div class="form-group">
+                <label>Port</label>
+                <input type="text" id="fwRuleDstPort" placeholder="443">
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Address Group</label>
+                <select id="fwRuleDstAddrGroup"><option value="">--</option></select>
+              </div>
+              <div class="form-group">
+                <label>Network Group</label>
+                <select id="fwRuleDstNetGroup"><option value="">--</option></select>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>Port Group</label>
+              <select id="fwRuleDstPortGroup"><option value="">--</option></select>
+            </div>
+          </fieldset>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('firewallRuleModal')">Cancelar</button>
+        <button class="btn btn-primary" onclick="saveFirewallRule()">Guardar</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- NAT Rule Modal -->
+  <div id="natRuleModal" class="modal modal-draggable hidden">
+    <div class="modal-backdrop"></div>
+    <div id="natRuleModalContent" class="modal-content modal-lg">
+      <div id="natRuleModalHeader" class="modal-header">
+        <h3 id="natRuleTitle">Nueva Regla NAT</h3>
+        <button class="modal-close" onclick="closeModal('natRuleModal')">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <form id="natRuleForm">
+          <input type="hidden" id="natRuleMode" value="create">
+          <div class="form-row">
+            <div class="form-group">
+              <label>Tipo *</label>
+              <select id="natRuleType" required>
+                <option value="destination">Destination (DNAT)</option>
+                <option value="source">Source (SNAT)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Rule ID *</label>
+              <input type="number" id="natRuleId" min="1" max="9999" required>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Description</label>
+            <input type="text" id="natRuleDescription" maxlength="255">
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label>Protocol</label>
+              <select id="natRuleProtocol">
+                <option value="">all</option>
+                <option value="tcp">tcp</option>
+                <option value="udp">udp</option>
+                <option value="tcp_udp">tcp_udp</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Interface</label>
+              <input type="text" id="natRuleInterface" placeholder="eth0">
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="natRuleExclude" onchange="toggleNatExclude()">
+              <span>Exclude from NAT</span>
+            </label>
+            <small class="text-muted">When enabled, matching traffic bypasses NAT (useful for VPN/IPsec)</small>
+          </div>
+          <fieldset class="form-fieldset">
+            <legend>Original (Match)</legend>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Source Address</label>
+                <input type="text" id="natRuleSrcAddress">
+              </div>
+              <div class="form-group">
+                <label>Source Port</label>
+                <input type="text" id="natRuleSrcPort">
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Destination Address</label>
+                <input type="text" id="natRuleDstAddress">
+              </div>
+              <div class="form-group">
+                <label>Destination Port</label>
+                <input type="text" id="natRuleDstPort" placeholder="80">
+              </div>
+            </div>
+          </fieldset>
+          <fieldset id="natTranslationFieldset" class="form-fieldset">
+            <legend>Translation</legend>
+            <div class="form-row">
+              <div class="form-group">
+                <label id="natTransAddressLabel">Address *</label>
+                <input type="text" id="natRuleTransAddress" placeholder="192.168.1.100">
+              </div>
+              <div class="form-group">
+                <label>Port</label>
+                <input type="text" id="natRuleTransPort" placeholder="8080">
+              </div>
+            </div>
+          </fieldset>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('natRuleModal')">Cancelar</button>
+        <button class="btn btn-primary" onclick="saveNatRule()">Guardar</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+
+</html>
