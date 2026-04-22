@@ -3,12 +3,30 @@
 VyOS Config Viewer - API REST Version
 Flask backend con conexión a VyOS via API REST oficial (1.4+)
 """
+import os
 import re
-from flask import Flask, render_template, request, jsonify
+import sys
+import secrets as _secrets
+from flask import Flask, render_template, request, jsonify, redirect, session, url_for
 import json
 from vyos_api import VyOSAPI, VyOSAPIError
+from auth import authenticate_with_ldap, login_required, load_vyos_defaults
 
 app = Flask(__name__)
+
+_session_secret = os.environ.get("VYOS_VIEWER_SESSION_SECRET")
+if not _session_secret:
+    _session_secret = _secrets.token_hex(32)
+    print(
+        "[warn] VYOS_VIEWER_SESSION_SECRET not set; using an ephemeral random key. "
+        "Existing sessions will be invalidated on each restart.",
+        file=sys.stderr,
+    )
+app.secret_key = _session_secret
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+)
 
 # Variable global para almacenar la configuración
 CONFIG = None
@@ -121,14 +139,81 @@ def load_config(raw):
 
 
 # ──────────────────────────────────────────────────────────────
+#  Autenticación (LDAP corporativo)
+# ──────────────────────────────────────────────────────────────
+@app.route('/login', methods=['GET'])
+def login_form():
+    if session.get('user'):
+        return redirect(url_for('index'))
+    return render_template('login.html', error=None, username='')
+
+
+@app.route('/login', methods=['POST'])
+def login_submit():
+    username = (request.form.get('username') or '').strip()
+    password = request.form.get('password') or ''
+
+    if not username or not password:
+        return render_template(
+            'login.html',
+            error='Introduce usuario y contrasena.',
+            username=username,
+        ), 400
+
+    try:
+        ok = authenticate_with_ldap(username, password)
+    except Exception as e:
+        print(f"[error] LDAP auth failure: {e}", file=sys.stderr)
+        return render_template(
+            'login.html',
+            error='Error contactando con el servicio de autenticacion.',
+            username=username,
+        ), 500
+
+    if ok:
+        session['user'] = {'username': username}
+        return redirect(url_for('index'))
+
+    return render_template(
+        'login.html',
+        error='Credenciales invalidas o usuario sin permiso.',
+        username=username,
+    ), 401
+
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    session.clear()
+    return redirect(url_for('login_form'))
+
+
+# ──────────────────────────────────────────────────────────────
 #  Rutas básicas
 # ──────────────────────────────────────────────────────────────
 @app.route('/')
+@login_required
 def index():
-    return render_template('index.html')
+    user = session.get('user') or {}
+    return render_template('index.html', username=user.get('username', ''))
+
+
+@app.route('/api/defaults')
+@login_required
+def api_defaults():
+    """Valores precargados para el modal Connect (port, api_key)."""
+    try:
+        vyos = load_vyos_defaults()
+    except Exception as e:
+        print(f"[warn] could not load vyos defaults: {e}", file=sys.stderr)
+        vyos = {}
+    return jsonify({'vyos': {
+        'port': vyos.get('port', 8443),
+        'api_key': vyos.get('api_key', ''),
+    }})
 
 
 @app.route('/upload', methods=['POST'])
+@login_required
 def upload():
     global CONFIG
     f = request.files.get('file')
@@ -145,6 +230,7 @@ def upload():
 #  API de lectura
 # ──────────────────────────────────────────────────────────────
 @app.route('/api/firewall/rulesets')
+@login_required
 def firewall_rulesets():
     if not CONFIG:
         return jsonify([])
@@ -152,6 +238,7 @@ def firewall_rulesets():
 
 
 @app.route('/api/firewall/ruleset/<rs>')
+@login_required
 def firewall_ruleset(rs):
     if not CONFIG:
         return jsonify({})
@@ -159,6 +246,7 @@ def firewall_ruleset(rs):
 
 
 @app.route('/api/firewall/group/<gtype>/<gname>')
+@login_required
 def firewall_group(gtype, gname):
     if not CONFIG:
         return jsonify({})
@@ -166,6 +254,7 @@ def firewall_group(gtype, gname):
 
 
 @app.route('/api/<section>')
+@login_required
 def get_section(section):
     if not CONFIG:
         return jsonify({})
@@ -176,6 +265,7 @@ def get_section(section):
 #  API de lectura (Firewall Groups)
 # ──────────────────────────────────────────────────────────────
 @app.route('/api/firewall/groups')
+@login_required
 def firewall_groups():
     """Lista todos los grupos de firewall."""
     if not CONFIG:
@@ -184,6 +274,7 @@ def firewall_groups():
 
 
 @app.route('/api/firewall/group-usage/<gtype>/<gname>')
+@login_required
 def firewall_group_usage(gtype, gname):
     """
     Devuelve las reglas que usan un grupo específico.
@@ -225,6 +316,7 @@ def firewall_group_usage(gtype, gname):
 #  Conexión via API REST de VyOS
 # ──────────────────────────────────────────────────────────────
 @app.route('/fetch-config', methods=['POST'])
+@login_required
 def fetch_config():
     """Obtiene configuración via API REST de VyOS."""
     global CONFIG, ACTIVE_API, PEER_API, PEER_CONFIG, CLUSTER_INFO
@@ -272,6 +364,7 @@ def fetch_config():
 
 
 @app.route('/fetch-peer', methods=['POST'])
+@login_required
 def fetch_peer():
     """
     Conecta al nodo peer del cluster HA.
@@ -331,6 +424,7 @@ def fetch_peer():
 
 
 @app.route('/api/cluster/status')
+@login_required
 def cluster_status():
     """Devuelve el estado actual del cluster."""
     return jsonify({
@@ -340,6 +434,7 @@ def cluster_status():
 
 
 @app.route('/api/cluster/disconnect-peer', methods=['POST'])
+@login_required
 def disconnect_peer():
     """Desconecta del peer (vuelve a modo single-node)."""
     global PEER_API, PEER_CONFIG, CLUSTER_INFO
@@ -456,6 +551,7 @@ def compute_sync_diffs(primary_cfg, peer_cfg):
 
 
 @app.route('/api/cluster/sync-check')
+@login_required
 def cluster_sync_check():
     """Compara primary y peer. Si no hay peer, devuelve synchronized=true trivial."""
     global PEER_CONFIG
@@ -603,6 +699,7 @@ def apply_ops_dual(ops, to_peer_requested=None, require_sync=True):
 #  API de escritura (Firewall)
 # ──────────────────────────────────────────────────────────────
 @app.route('/api/firewall/rule', methods=['POST', 'PUT', 'DELETE'])
+@login_required
 def manage_firewall_rule():
     """Crear, modificar o eliminar regla de firewall."""
     if not ACTIVE_API:
@@ -642,6 +739,7 @@ def manage_firewall_rule():
 #  API de escritura (NAT)
 # ──────────────────────────────────────────────────────────────
 @app.route('/api/nat/rule', methods=['POST', 'PUT', 'DELETE'])
+@login_required
 def manage_nat_rule():
     """Crear, modificar o eliminar regla NAT."""
     if not ACTIVE_API:
@@ -683,6 +781,7 @@ def manage_nat_rule():
 #  API de escritura (Firewall Groups)
 # ──────────────────────────────────────────────────────────────
 @app.route('/api/firewall/group', methods=['POST', 'PUT', 'DELETE'])
+@login_required
 def manage_firewall_group():
     """Crear, modificar o eliminar grupo de firewall."""
     if not ACTIVE_API:
@@ -724,6 +823,7 @@ def manage_firewall_group():
 #  Batch Configure (Staged Changes)
 # ──────────────────────────────────────────────────────────────
 @app.route('/api/batch-configure', methods=['POST'])
+@login_required
 def batch_configure():
     """
     Aplica múltiples operaciones en una sola llamada.
@@ -926,6 +1026,7 @@ def build_diff_operations(base_path, diff):
 #  Guardar configuración
 # ──────────────────────────────────────────────────────────────
 @app.route('/api/save-config', methods=['POST'])
+@login_required
 def save_config_to_router():
     """Guarda configuración en el router. En cluster, guarda también en el peer por defecto."""
     if not ACTIVE_API:
@@ -961,6 +1062,7 @@ def save_config_to_router():
 #  Estado de conexión
 # ──────────────────────────────────────────────────────────────
 @app.route('/api/connection-status')
+@login_required
 def connection_status():
     """Devuelve el estado de la conexión."""
     return jsonify({
@@ -975,6 +1077,7 @@ def connection_status():
 #  Dashboard Stats
 # ──────────────────────────────────────────────────────────────
 @app.route('/api/dashboard-stats')
+@login_required
 def dashboard_stats():
     """Devuelve estadísticas para el dashboard."""
     if not CONFIG:
@@ -1043,6 +1146,7 @@ def dashboard_stats():
 #  Interfaces (Read Only)
 # ──────────────────────────────────────────────────────────────
 @app.route('/api/interfaces')
+@login_required
 def interfaces():
     """Devuelve configuración de interfaces."""
     if not CONFIG:
@@ -1054,6 +1158,7 @@ def interfaces():
 #  VRFs
 # ──────────────────────────────────────────────────────────────
 @app.route('/api/vrfs')
+@login_required
 def list_vrfs():
     """Devuelve lista de VRFs configurados."""
     if not CONFIG:
@@ -1066,6 +1171,7 @@ def list_vrfs():
 #  Static Routes
 # ──────────────────────────────────────────────────────────────
 @app.route('/api/static-routes')
+@login_required
 def static_routes():
     """Devuelve rutas estáticas de todos los VRFs."""
     if not CONFIG:
@@ -1089,6 +1195,7 @@ def static_routes():
 
 
 @app.route('/api/static-route', methods=['POST', 'DELETE'])
+@login_required
 def manage_static_route():
     """Crear o eliminar ruta estática (default VRF o VRF específico)."""
     if not ACTIVE_API:
@@ -1145,6 +1252,7 @@ def manage_static_route():
 #  BGP Configuration
 # ──────────────────────────────────────────────────────────────
 @app.route('/api/bgp')
+@login_required
 def bgp_config():
     """Devuelve configuración BGP."""
     if not CONFIG:
@@ -1153,6 +1261,7 @@ def bgp_config():
 
 
 @app.route('/api/bgp/neighbor', methods=['POST', 'DELETE'])
+@login_required
 def manage_bgp_neighbor():
     """Crear o eliminar neighbor BGP."""
     global CONFIG
@@ -1210,6 +1319,7 @@ def manage_bgp_neighbor():
 
 
 @app.route('/api/bgp/network', methods=['POST', 'DELETE'])
+@login_required
 def manage_bgp_network():
     """Añadir o eliminar network BGP."""
     global CONFIG
@@ -1242,6 +1352,7 @@ def manage_bgp_network():
 
 
 @app.route('/api/bgp/system-as', methods=['POST'])
+@login_required
 def set_bgp_system_as():
     """Configurar ASN local para BGP."""
     global CONFIG

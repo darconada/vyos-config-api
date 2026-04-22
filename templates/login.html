@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8"/>
+  <title>Acceso | VyOS Config Viewer</title>
+  <link rel="stylesheet" href="/static/style.css"/>
+  <link rel="stylesheet" href="/static/login.css"/>
+</head>
+<body data-theme="dark" class="auth-page">
+  <section class="auth-card">
+    <header class="auth-header">
+      <div class="auth-logo">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2L2 7l10 5 10-5-10-5z"></path>
+          <path d="M2 17l10 5 10-5"></path>
+          <path d="M2 12l10 5 10-5"></path>
+        </svg>
+      </div>
+      <h1>VyOS Config Viewer</h1>
+      <p>Introduce tu usuario y contrasena corporativos.</p>
+    </header>
+
+    {% if error %}
+    <div class="auth-message error" role="alert">{{ error }}</div>
+    {% endif %}
+
+    <form method="post" class="auth-form">
+      <label class="auth-field">
+        <span>Usuario</span>
+        <input type="text" name="username" value="{{ username or '' }}" autocomplete="username" required autofocus/>
+      </label>
+      <label class="auth-field">
+        <span>Contrasena</span>
+        <input type="password" name="password" autocomplete="current-password" required/>
+      </label>
+      <button type="submit">Iniciar sesion</button>
+    </form>
+  </section>
+
+  <script>
+    const body = document.body;
+    let storedTheme = null;
+    try { storedTheme = localStorage.getItem('theme'); } catch (err) {}
+    const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const initialTheme = storedTheme || (prefersDark ? 'dark' : 'light');
+    body.setAttribute('data-theme', initialTheme);
+    try { localStorage.setItem('theme', initialTheme); } catch (err) {}
+  </script>
+</body>
+</html>

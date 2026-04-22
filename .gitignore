@@ -23,3 +23,6 @@ Thumbs.db
 
 # Old nested directory
 vyos-config-viewer-api/
+
+# Secrets
+config/infra.yaml

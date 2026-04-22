@@ -4,6 +4,34 @@
 console.log('VyOS Config Viewer JS loaded (API REST version)');
 
 // =========================================
+// AUTH: redirect to /login on 401 from any fetch
+// =========================================
+(function installAuthInterceptor() {
+  const origFetch = window.fetch.bind(window);
+  window.fetch = async function (...args) {
+    const res = await origFetch(...args);
+    if (res.status === 401) {
+      window.location.href = '/login';
+      // Swallow the response in practice; caller will see the redirect happen.
+    }
+    return res;
+  };
+})();
+
+// Cache for server defaults (port, api_key) loaded lazily.
+let SERVER_DEFAULTS = null;
+async function loadServerDefaults() {
+  if (SERVER_DEFAULTS) return SERVER_DEFAULTS;
+  try {
+    const res = await fetch('/api/defaults');
+    if (res.ok) SERVER_DEFAULTS = await res.json();
+  } catch (e) {
+    console.warn('could not load /api/defaults', e);
+  }
+  return SERVER_DEFAULTS || {};
+}
+
+// =========================================
 // DOM REFERENCES
 // =========================================
 const uploadBtn = document.getElementById('uploadBtn');
@@ -2918,7 +2946,10 @@ async function showGroup(type, name) {
 // =========================================
 document.getElementById('fetchBtn').onclick = openFetchModal;
 
-function openFetchModal() {
+async function openFetchModal() {
+  const defaults = (await loadServerDefaults()).vyos || {};
+  const defaultPort = defaults.port || 8443;
+  const defaultApiKey = defaults.api_key || '';
   const html = `
     <div class="modal" id="fetchModal">
       <div class="modal-backdrop" onclick="closeModal('fetchModal')"></div>
@@ -2951,13 +2982,13 @@ function openFetchModal() {
               </div>
               <div class="modal-form-group">
                 <label class="modal-form-label">HTTPS Port</label>
-                <input type="text" id="fw_port" placeholder="8443" value="8443" />
+                <input type="text" id="fw_port" placeholder="8443" value="${defaultPort}" />
               </div>
             </div>
             <div class="modal-form-group">
               <label class="modal-form-label">API Key <span class="required">*</span></label>
-              <input type="password" id="fw_api_key" placeholder="Your VyOS API key" />
-              <span class="modal-form-hint">Configure with: set service https api keys id APP key 'YOUR-KEY'</span>
+              <input type="password" id="fw_api_key" placeholder="Your VyOS API key" value="${defaultApiKey.replace(/"/g, '&quot;')}" />
+              <span class="modal-form-hint">Precargado desde la configuracion del servidor; sobreescribe si necesitas otra.</span>
             </div>
           </div>
           <div id="fetchStatus"></div>
