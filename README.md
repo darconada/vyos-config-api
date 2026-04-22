@@ -1,7 +1,7 @@
 # VyOS Config Viewer API
 
 Web UI for viewing and managing VyOS router configurations through the
-official VyOS REST API — firewall, NAT, groups, interfaces, routing, and
+official VyOS REST API: firewall, NAT, groups, interfaces, routing, and
 HA cluster operations from a single place.
 
 ![Python](https://img.shields.io/badge/python-3.8+-blue.svg)
@@ -32,7 +32,7 @@ HA cluster operations from a single place.
 - **Sync-check**: normalised deep comparison of firewall rules, firewall groups, NAT rules, and static routes (default + VRFs) between the two nodes.
 - **Dual-apply**: every write goes to both nodes atomically after a pre-flight sync-check. If the peer fails mid-apply, a best-effort rollback is attempted on the primary.
 - **Divergence modal** with per-section diffs, opened automatically when a dual-apply is blocked.
-- **Cluster Sync toggle** in the header to temporarily disable dual-apply during single-node interventions — writes go only to the primary, no pre-flight, and the HA badge shows a `SOLO` indicator.
+- **Cluster Sync toggle** in the header to temporarily disable dual-apply during single-node interventions. Writes go only to the primary, no pre-flight, and the HA badge shows a `SOLO` indicator.
 
 ### Workflow helpers
 - **Staged mode**: queue multiple changes locally, apply them in a single batch; visual markers (MOD / DEL badges) show pending changes per rule.
@@ -100,10 +100,10 @@ set service https vrf mgmt
 - When you connect to a node whose hostname ends in `-01` or `-02` and that has VRRP groups configured, the app automatically tries to connect to the peer (`-02` ↔ `-01`) with the same API key.
 - If auto-connect fails (DNS, different port, different key), a fallback modal appears with editable host / port / api-key.
 - The **HA badge** in the header shows the current sync state:
-  - `SYNC ✓` (green) — both nodes identical; writes go to both.
-  - `DIVERGED ✗` (red, pulsing) — click to see the per-section diff; writes are blocked until divergence is resolved.
-  - `PEER?` (amber) — peer not connected yet; click to retry.
-  - `· SOLO` suffix — Cluster Sync toggle is OFF: writes go only to the primary.
+  - `SYNC ✓` (green): both nodes identical; writes go to both.
+  - `DIVERGED ✗` (red, pulsing): click to see the per-section diff; writes are blocked until divergence is resolved.
+  - `PEER?` (amber): peer not connected yet; click to retry.
+  - `· SOLO` suffix: Cluster Sync toggle is OFF; writes go only to the primary.
 - Need to intervene on a single node only? Toggle **Cluster Sync** off in the header (or click "Aplicar solo al primary" in the divergence modal). The peer connection stays, but writes skip the pre-flight check and target the primary only.
 
 ### Keyboard shortcuts
@@ -186,7 +186,7 @@ vyos-config-api/
 - The API key is transmitted over HTTPS; self-signed certificates are
   accepted to cope with the default VyOS setup.
 - Restrict API access by source IP in VyOS (`set service https allow-client address …`).
-- Don't expose this app to the public internet — it proxies write access
+- Don't expose this app to the public internet; it proxies write access
   to your routers.
 - Dual-apply uses best-effort rollback on peer failure: if the peer
   apply fails, the app tries to reverse the primary operation with
@@ -194,7 +194,7 @@ vyos-config-api/
   with the REST API; review the activity log if a rollback is reported
   as failed.
 - There is a small race window between the pre-flight sync-check and the
-  apply — a concurrent operator editing the peer in that gap can cause
+  apply. A concurrent operator editing the peer in that gap can cause
   drift. If this matters, coordinate changes or use the Cluster Sync
   toggle for explicit single-node interventions.
 
@@ -204,4 +204,4 @@ MIT License
 
 ## Contributing
 
-Contributions are welcome — feel free to open an issue or pull request.
+Contributions are welcome; feel free to open an issue or pull request.
