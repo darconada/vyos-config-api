@@ -46,6 +46,15 @@ let hasUnsavedChanges = false;
 let verboseMode = false;
 let pendingCommandExecution = null; // Stores pending command data for verbose mode
 
+// Cluster HA state (null if not in cluster)
+// Shape: { detected, primary_name, peer_name, peer_connected, peer_host?, peer_port? }
+let clusterInfo = null;
+let clusterSyncState = 'unknown'; // 'unknown' | 'checking' | 'sync' | 'diverged' | 'detected' (peer not connected)
+let lastClusterDiffs = [];
+// When true (default), writes go to both nodes with pre-flight sync-check.
+// When false, writes target only primary (no pre-flight) — use during single-node interventions.
+let dualApplyEnabled = true;
+
 // Staged mode state
 let stagedMode = false;
 let pendingOperations = []; // Array of { type, action, data, display }
@@ -181,6 +190,14 @@ function updateConnectionStatus(connected, hostname = null) {
   } else {
     connectionStatus.classList.remove('connected');
     connectionStatus.querySelector('.status-text').textContent = 'No config loaded';
+    // Reset cluster state on disconnect
+    clusterInfo = null;
+    lastClusterDiffs = [];
+    dualApplyEnabled = true;
+    const dualCheck = document.getElementById('dualApplyCheck');
+    if (dualCheck) dualCheck.checked = true;
+    document.getElementById('dualApplyToggle')?.classList.remove('sync-off');
+    updateClusterBadge(null);
   }
 }
 
@@ -207,6 +224,10 @@ fileInput.onchange = async () => {
     }
 
     CONFIG = j.data;
+    // File uploads are static — no live peer, reset any cluster state
+    clusterInfo = null;
+    lastClusterDiffs = [];
+    if (typeof updateClusterBadge === 'function') updateClusterBadge(null);
     updateConnectionStatus(true, file.name);
     drawMenu();
     renderDashboard();
@@ -428,7 +449,7 @@ function renderNatTable(title, natType, rules, cols) {
 
       html += `<tr class="${pendingClass}">
         <td><span class="badge">${id}</span>${pendingBadge}</td>
-        ${cols.map(c => `<td>${escapeHtml(get(r, c.key))}</td>`).join('')}
+        ${cols.map(c => `<td><div class="cell-wrap wide">${escapeHtml(get(r, c.key))}</div></td>`).join('')}
         ${isConnected ? `<td class="actions-col">
           <button class="btn-icon" onclick="openNatRuleModal('edit', '${natType}', '${id}')" title="Edit">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1112,23 +1133,17 @@ async function saveRoute() {
     showLoading('Creating route...');
 
     try {
-      const res = await fetch('/api/static-route', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(routeData)
-      });
-      const j = await res.json();
-
-      if (!res.ok) throw new Error(j.error || 'Failed to create route');
+      const j = await clusterApplyFetch('/api/static-route', 'POST', routeData);
 
       hasUnsavedChanges = true;
       updateSaveIndicator();
       await loadRoutes();
       showToast('success', 'Success', `Route ${network} created`);
-      logActivity('route', 'create', `Route ${network}`, 'success', `Created static route to ${network}`, commands);
+      logActivity('route', 'create', `Route ${network}`, 'success',
+                  `Created static route to ${network}${clusterNodesSuffix(j)}`, commands);
     } catch (e) {
       logActivity('route', 'create', `Route ${network}`, 'error', e.message);
-      showToast('error', 'Error', e.message);
+      if (!e.isDivergence) showToast('error', 'Error', e.message);
       loadRoutes();
     }
   };
@@ -1209,23 +1224,18 @@ async function deleteRoute(network, target, vrf = 'default') {
     showLoading('Deleting route...');
 
     try {
-      const res = await fetch('/api/static-route', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ network, next_hop: target || undefined, vrf: vrfParam })
-      });
-      const j = await res.json();
-
-      if (!res.ok) throw new Error(j.error || 'Failed to delete route');
+      const j = await clusterApplyFetch('/api/static-route', 'DELETE',
+        { network, next_hop: target || undefined, vrf: vrfParam });
 
       hasUnsavedChanges = true;
       updateSaveIndicator();
       await loadRoutes();
       showToast('success', 'Success', `Route ${network} deleted`);
-      logActivity('route', 'delete', `Route ${network}${vrfLabel}`, 'success', `Deleted static route to ${network}`, commands);
+      logActivity('route', 'delete', `Route ${network}${vrfLabel}`, 'success',
+                  `Deleted static route to ${network}${clusterNodesSuffix(j)}`, commands);
     } catch (e) {
       logActivity('route', 'delete', `Route ${network}${vrfLabel}`, 'error', e.message);
-      showToast('error', 'Error', e.message);
+      if (!e.isDivergence) showToast('error', 'Error', e.message);
       loadRoutes();
     }
   };
@@ -2430,13 +2440,13 @@ function renderRuleset() {
 
       html += `<tr id="row-${id}" class="${pendingClass}">
         <td><span class="badge">${row.rule_id}</span>${pendingBadge}</td>
-        <td>${cellHTML(r.source, 'address', 'network')}</td>
-        <td class="font-mono text-sm">${cellHTML(r.source, 'port')}</td>
-        <td>${cellHTML(r.destination, 'address', 'network')}</td>
-        <td class="font-mono text-sm">${cellHTML(r.destination, 'port')}</td>
+        <td><div class="cell-wrap wide">${cellHTML(r.source, 'address', 'network')}</div></td>
+        <td class="font-mono text-sm"><div class="cell-wrap">${cellHTML(r.source, 'port')}</div></td>
+        <td><div class="cell-wrap wide">${cellHTML(r.destination, 'address', 'network')}</div></td>
+        <td class="font-mono text-sm"><div class="cell-wrap">${cellHTML(r.destination, 'port')}</div></td>
         <td><span class="badge">${row.protocol}</span></td>
         <td><span class="action-badge ${actionClass}">${row.action}</span></td>
-        <td class="text-muted">${escapeHtml(row.description)}</td>
+        <td class="text-muted"><div class="cell-wrap wide">${escapeHtml(row.description)}</div></td>
         ${isConnected ? `<td class="actions-col">
           <button class="btn-icon" onclick="openFirewallRuleModal('edit', '${currentRulesetName}', '${id}')" title="Edit">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -2941,7 +2951,7 @@ function openFetchModal() {
               </div>
               <div class="modal-form-group">
                 <label class="modal-form-label">HTTPS Port</label>
-                <input type="text" id="fw_port" placeholder="443" value="443" />
+                <input type="text" id="fw_port" placeholder="8443" value="8443" />
               </div>
             </div>
             <div class="modal-form-group">
@@ -2978,7 +2988,7 @@ function openFetchModal() {
 
 async function doFetchConfig() {
   const host = document.getElementById('fw_host').value.trim();
-  const port = parseInt(document.getElementById('fw_port').value, 10) || 443;
+  const port = parseInt(document.getElementById('fw_port').value, 10) || 8443;
   const apiKey = document.getElementById('fw_api_key').value;
   const statusDiv = document.getElementById('fetchStatus');
   const btn = document.getElementById('doFetch');
@@ -3043,6 +3053,15 @@ async function doFetchConfig() {
     renderDashboard();
     showToast('success', 'Connected', `Successfully fetched config from ${host}`);
     logActivity('connection', 'connect', host, 'success', `Connected to VyOS router at ${host}:${port}`);
+
+    // Cluster detection: if primary is part of an HA cluster, try to auto-connect the peer
+    clusterInfo = j.cluster_info || null;
+    if (clusterInfo?.detected) {
+      updateClusterBadge('detected', clusterInfo);
+      autoConnectPeer();  // fire and forget (toasts on result)
+    } else {
+      updateClusterBadge(null);
+    }
   } catch (e) {
     logActivity('connection', 'connect', host, 'error', `Connection failed: ${e.message}`);
     statusDiv.innerHTML = `
@@ -3771,22 +3790,17 @@ async function saveFirewallRule() {
         rule: ruleData,
         ...(isEdit && diff ? { diff } : {})
       };
-      const res = await fetch('/api/firewall/rule', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody)
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to save rule');
+      const data = await clusterApplyFetch('/api/firewall/rule', 'POST', requestBody);
 
       showToast('success', 'Rule Saved', `Rule ${ruleId} saved successfully`);
-      logActivity('firewall', action, target, 'success', `Firewall rule ${ruleId} ${action}d successfully`, commands);
+      logActivity('firewall', action, target, 'success',
+                  `Firewall rule ${ruleId} ${action}d successfully${clusterNodesSuffix(data)}`, commands);
       hasUnsavedChanges = true;
       updateSaveIndicator();
       await reloadConfig();
       viewRuleset(ruleset);
     } catch (e) {
-      showToast('error', 'Error', e.message);
+      if (!e.isDivergence) showToast('error', 'Error', e.message);
       logActivity('firewall', action, target, 'error', `Failed to ${action} firewall rule: ${e.message}`, commands);
       content.innerHTML = '';
       viewRuleset(ruleset);
@@ -3838,21 +3852,18 @@ async function deleteFirewallRule(rulesetName, ruleId) {
   const doDelete = async () => {
     try {
       showLoading('Deleting rule...');
-      const res = await fetch('/api/firewall/rule', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ruleset: rulesetName, rule_id: ruleId })
-      });
-      if (!res.ok) throw new Error((await res.json()).error);
+      const data = await clusterApplyFetch('/api/firewall/rule', 'DELETE',
+        { ruleset: rulesetName, rule_id: ruleId });
 
       showToast('success', 'Rule Deleted', `Rule ${ruleId} deleted successfully`);
-      logActivity('firewall', 'delete', target, 'success', `Firewall rule ${ruleId} deleted successfully`, commands);
+      logActivity('firewall', 'delete', target, 'success',
+                  `Firewall rule ${ruleId} deleted successfully${clusterNodesSuffix(data)}`, commands);
       hasUnsavedChanges = true;
       updateSaveIndicator();
       await reloadConfig();
       viewRuleset(rulesetName);
     } catch (e) {
-      showToast('error', 'Error', e.message);
+      if (!e.isDivergence) showToast('error', 'Error', e.message);
       logActivity('firewall', 'delete', target, 'error', `Failed to delete firewall rule: ${e.message}`, commands);
       viewRuleset(rulesetName);
     }
@@ -4061,15 +4072,11 @@ async function saveNatRule() {
         rule: ruleData,
         ...(isEdit && diff ? { diff } : {})
       };
-      const res = await fetch('/api/nat/rule', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(requestBody)
-      });
-      if (!res.ok) throw new Error((await res.json()).error);
+      const data = await clusterApplyFetch('/api/nat/rule', 'POST', requestBody);
 
       showToast('success', 'NAT Rule Saved', `NAT rule ${ruleId} saved successfully`);
-      logActivity('nat', action, target, 'success', `NAT rule ${ruleId} ${action}d successfully`, commands);
+      logActivity('nat', action, target, 'success',
+                  `NAT rule ${ruleId} ${action}d successfully${clusterNodesSuffix(data)}`, commands);
       hasUnsavedChanges = true;
       updateSaveIndicator();
       // Reload NAT data
@@ -4080,7 +4087,7 @@ async function saveNatRule() {
       }
       loadNat();
     } catch (e) {
-      showToast('error', 'Error', e.message);
+      if (!e.isDivergence) showToast('error', 'Error', e.message);
       logActivity('nat', action, target, 'error', `Failed to ${action} NAT rule: ${e.message}`, commands);
       loadNat();
     } finally {
@@ -4131,15 +4138,12 @@ async function deleteNatRule(natType, ruleId) {
   const doDelete = async () => {
     try {
       showLoading('Deleting NAT rule...');
-      const res = await fetch('/api/nat/rule', {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ nat_type: natType, rule_id: ruleId })
-      });
-      if (!res.ok) throw new Error((await res.json()).error);
+      const data = await clusterApplyFetch('/api/nat/rule', 'DELETE',
+        { nat_type: natType, rule_id: ruleId });
 
       showToast('success', 'NAT Rule Deleted', `NAT rule ${ruleId} deleted successfully`);
-      logActivity('nat', 'delete', target, 'success', `NAT rule ${ruleId} deleted successfully`, commands);
+      logActivity('nat', 'delete', target, 'success',
+                  `NAT rule ${ruleId} deleted successfully${clusterNodesSuffix(data)}`, commands);
       hasUnsavedChanges = true;
       updateSaveIndicator();
       // Reload NAT data
@@ -4150,7 +4154,7 @@ async function deleteNatRule(natType, ruleId) {
       }
       loadNat();
     } catch (e) {
-      showToast('error', 'Error', e.message);
+      if (!e.isDivergence) showToast('error', 'Error', e.message);
       logActivity('nat', 'delete', target, 'error', `Failed to delete NAT rule: ${e.message}`, commands);
       loadNat();
     }
@@ -4169,18 +4173,32 @@ async function deleteNatRule(natType, ruleId) {
 // SAVE CONFIG TO ROUTER
 // =========================================
 async function saveConfigToRouter() {
-  const confirmed = await openConfirmModal('Save Configuration', 'Save the current configuration to the router? This will execute "save" on VyOS.');
+  const dual = shouldDualApply();
+  const clusterHint = isInCluster()
+    ? (dual ? ' La configuración se guardará en ambos nodos del cluster.'
+            : ' Cluster Sync OFF → solo se guardará en el primary.')
+    : '';
+  const confirmed = await openConfirmModal('Save Configuration',
+    `Save the current configuration to the router? This will execute "save" on VyOS.${clusterHint}`);
   if (!confirmed) return;
 
   try {
     showLoading('Saving to router...');
-    const res = await fetch('/api/save-config', { method: 'POST' });
-    if (!res.ok) throw new Error((await res.json()).error);
+    const body = isInCluster() ? { apply_to_peer: dual } : {};
+    const res = await fetch('/api/save-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const j = await res.json();
+    if (!res.ok) throw new Error(j.error || `HTTP ${res.status}`);
 
-    showToast('success', 'Configuration Saved', 'Configuration saved to the router successfully');
+    const where = (j.nodes && j.nodes.length === 2) ? ' on both nodes' : '';
+    showToast('success', 'Configuration Saved', `Configuration saved${where}`);
     hasUnsavedChanges = false;
     updateSaveIndicator();
-    logActivity('config', 'save', 'Router config', 'success', 'Configuration saved to router (config.boot)');
+    logActivity('config', 'save', 'Router config', 'success',
+                `Configuration saved to router (config.boot)${where ? ' [→ primary + peer]' : ''}`);
   } catch (e) {
     showToast('error', 'Error', e.message);
     logActivity('config', 'save', 'Router config', 'error', `Failed to save config: ${e.message}`);
@@ -4209,6 +4227,26 @@ document.getElementById('saveConfigBtn')?.addEventListener('click', saveConfigTo
 document.getElementById('verboseModeCheck')?.addEventListener('change', (e) => {
   verboseMode = e.target.checked;
   showToast('info', 'Verbose Mode', verboseMode ? 'Command preview enabled' : 'Command preview disabled');
+});
+
+// =========================================
+// CLUSTER SYNC TOGGLE (per-session override for dual-apply)
+// =========================================
+document.getElementById('dualApplyCheck')?.addEventListener('change', (e) => {
+  dualApplyEnabled = e.target.checked;
+  const toggle = document.getElementById('dualApplyToggle');
+  if (dualApplyEnabled) {
+    toggle?.classList.remove('sync-off');
+    showToast('info', 'Cluster Sync', 'Los cambios se aplicarán a ambos nodos');
+  } else {
+    toggle?.classList.add('sync-off');
+    showToast('warning', 'Cluster Sync OFF',
+              'Solo escribirás en el primary. Sin pre-flight de sync.');
+  }
+  // Re-render badge so the SOLO suffix appears/disappears
+  if (clusterSyncState && clusterSyncState !== 'unknown') {
+    updateClusterBadge(clusterSyncState);
+  }
 });
 
 // =========================================
@@ -4491,14 +4529,8 @@ async function executeAllPending() {
   try {
     showLoading(`Applying ${count} change(s)...`);
 
-    const res = await fetch('/api/batch-configure', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ operations: pendingOperations })
-    });
-
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to apply changes');
+    const data = await clusterApplyFetch('/api/batch-configure', 'POST',
+      { operations: pendingOperations });
 
     // Clear pending operations, markers, and original states
     pendingOperations = [];
@@ -4507,7 +4539,8 @@ async function executeAllPending() {
     updatePendingIndicator();
 
     showToast('success', 'Applied', `${count} change(s) applied successfully`);
-    logActivity('config', 'update', `Batch: ${count} operations`, 'success', `Applied ${count} staged change(s) to router`, allCommands);
+    logActivity('config', 'update', `Batch: ${count} operations`, 'success',
+                `Applied ${count} staged change(s) to router${clusterNodesSuffix(data)}`, allCommands);
     hasUnsavedChanges = true;
     updateSaveIndicator();
 
@@ -4515,7 +4548,7 @@ async function executeAllPending() {
     await reloadCurrentView();
 
   } catch (e) {
-    showToast('error', 'Error', e.message);
+    if (!e.isDivergence) showToast('error', 'Error', e.message);
     logActivity('config', 'update', `Batch: ${count} operations`, 'error', `Failed to apply batch changes: ${e.message}`, allCommands);
     // Keep pending operations on error for retry
     await reloadCurrentView();
@@ -5336,14 +5369,7 @@ async function executeGroupSave(groupData, mode, commands) {
   try {
     showLoading('Applying...');
 
-    const res = await fetch('/api/firewall/group', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(groupData)
-    });
-
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to save group');
+    const data = await clusterApplyFetch('/api/firewall/group', 'POST', groupData);
 
     // Update local data
     const groupRes = await fetch('/api/firewall/groups');
@@ -5360,11 +5386,11 @@ async function executeGroupSave(groupData, mode, commands) {
     // Log activity
     logActivity('group', mode === 'create' ? 'create' : 'update',
       `${groupData.group_type}-group: ${groupData.group_name}`,
-      'success', `${mode === 'create' ? 'Created' : 'Updated'} firewall group`, commands);
+      'success', `${mode === 'create' ? 'Created' : 'Updated'} firewall group${clusterNodesSuffix(data)}`, commands);
 
     renderGroups();
   } catch (e) {
-    showToast('error', 'Error', e.message);
+    if (!e.isDivergence) showToast('error', 'Error', e.message);
     logActivity('group', mode === 'create' ? 'create' : 'update',
       `${groupData.group_type}-group: ${groupData.group_name}`,
       'error', `Failed: ${e.message}`, commands);
@@ -5429,14 +5455,8 @@ async function executeGroupDelete(groupType, groupName, commands) {
   try {
     showLoading('Deleting...');
 
-    const res = await fetch('/api/firewall/group', {
-      method: 'DELETE',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ group_type: groupType, group_name: groupName })
-    });
-
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Failed to delete group');
+    const data = await clusterApplyFetch('/api/firewall/group', 'DELETE',
+      { group_type: groupType, group_name: groupName });
 
     // Update local data
     const groupRes = await fetch('/api/firewall/groups');
@@ -5450,11 +5470,11 @@ async function executeGroupDelete(groupType, groupName, commands) {
     updateSaveIndicator();
 
     logActivity('group', 'delete', `${groupType}-group: ${groupName}`,
-      'success', 'Deleted firewall group', commands);
+      'success', `Deleted firewall group${clusterNodesSuffix(data)}`, commands);
 
     renderGroups();
   } catch (e) {
-    showToast('error', 'Error', e.message);
+    if (!e.isDivergence) showToast('error', 'Error', e.message);
     logActivity('group', 'delete', `${groupType}-group: ${groupName}`,
       'error', `Failed: ${e.message}`, commands);
     renderGroups();
@@ -5815,6 +5835,378 @@ window.addEventListener('beforeunload', (e) => {
     return e.returnValue;
   }
 });
+
+// =========================================
+// CLUSTER HA (detection, peer connect, sync check)
+// =========================================
+function isInCluster() {
+  return !!(clusterInfo && clusterInfo.detected && clusterInfo.peer_connected);
+}
+
+// True only when we should actually propagate writes to the peer right now.
+// isInCluster() is the environment check; this adds the user's toggle override.
+function shouldDualApply() {
+  return isInCluster() && dualApplyEnabled;
+}
+
+function updateClusterBadge(state, info = null) {
+  const badge = document.getElementById('clusterBadge');
+  const label = document.getElementById('clusterBadgeLabel');
+  const stateEl = document.getElementById('clusterBadgeState');
+  const dualToggle = document.getElementById('dualApplyToggle');
+  if (!badge) return;
+
+  if (!state) {
+    badge.classList.add('hidden');
+    badge.classList.remove('state-detected', 'state-sync', 'state-diverged', 'state-checking', 'state-solo');
+    dualToggle?.classList.add('hidden');
+    clusterSyncState = 'unknown';
+    return;
+  }
+
+  badge.classList.remove('hidden', 'state-detected', 'state-sync', 'state-diverged', 'state-checking', 'state-solo');
+  const primary = (info?.primary_name || clusterInfo?.primary_name || '').split('-').pop();
+  const peer = (info?.peer_name || clusterInfo?.peer_name || '').split('-').pop();
+  label.textContent = `HA ${primary}↔${peer}`;
+
+  // Show the Cluster Sync toggle in the header when we have a peer connected
+  if (clusterInfo?.peer_connected) {
+    dualToggle?.classList.remove('hidden');
+  } else {
+    dualToggle?.classList.add('hidden');
+  }
+
+  const soloSuffix = (!dualApplyEnabled && clusterInfo?.peer_connected) ? ' · SOLO' : '';
+
+  clusterSyncState = state;
+  if (state === 'detected') {
+    badge.classList.add('state-detected');
+    stateEl.textContent = 'PEER?';
+    badge.title = `Cluster detectado. Click para conectar al peer ${clusterInfo?.peer_name || ''}`;
+    badge.onclick = () => autoConnectPeer(true);
+  } else if (state === 'checking') {
+    badge.classList.add('state-checking');
+    stateEl.textContent = 'CHECKING…';
+    badge.onclick = null;
+  } else if (state === 'sync') {
+    badge.classList.add('state-sync');
+    stateEl.textContent = 'SYNC ✓' + soloSuffix;
+    badge.title = soloSuffix
+      ? 'Ambos nodos en sync, pero Cluster Sync está OFF: los cambios irán solo al primary.'
+      : 'Ambos nodos sincronizados. Click para re-verificar.';
+    badge.onclick = () => runSyncCheck(true);
+  } else if (state === 'diverged') {
+    badge.classList.add('state-diverged');
+    stateEl.textContent = 'DIVERGED ✗' + soloSuffix;
+    badge.title = `Los nodos no están sincronizados. Click para ver diferencias.`;
+    badge.onclick = () => showDivergenceModal(lastClusterDiffs);
+  }
+
+  if (soloSuffix) badge.classList.add('state-solo');
+}
+
+async function autoConnectPeer(forceRetry = false) {
+  if (!clusterInfo?.detected) return;
+  if (!forceRetry && clusterInfo.peer_connected) return;
+
+  updateClusterBadge('checking');
+  try {
+    const res = await fetch('/fetch-peer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({})  // backend uses peer_name + primary api-key/port
+    });
+    const j = await res.json();
+    if (!res.ok) {
+      // Auto-connect falló: abrir modal de fallback manual
+      showToast('warning', 'Peer auto-connect failed',
+                `No se pudo conectar automáticamente a ${clusterInfo.peer_name}. Introduce los datos.`);
+      openPeerFallbackModal(j.error || 'Auto-connect falló');
+      updateClusterBadge('detected');
+      return;
+    }
+    clusterInfo = j.cluster_info || clusterInfo;
+    clusterInfo.peer_connected = true;
+    logActivity('cluster', 'peer-connect', clusterInfo.peer_name, 'success',
+                `Peer conectado en ${clusterInfo.peer_host}:${clusterInfo.peer_port}`);
+    if (j.hostname_mismatch) {
+      showToast('warning', 'Hostname mismatch',
+                `Peer responde como ${j.peer_hostname}, esperaba ${j.expected}. Continuamos.`);
+    } else {
+      showToast('success', 'Peer connected', `Conectado a ${clusterInfo.peer_name}`);
+    }
+    runSyncCheck();
+  } catch (e) {
+    showToast('error', 'Peer connect error', e.message);
+    updateClusterBadge('detected');
+  }
+}
+
+function openPeerFallbackModal(initialError = '') {
+  const existing = document.getElementById('peerFallbackModal');
+  if (existing) existing.remove();
+  const html = `
+    <div class="modal" id="peerFallbackModal">
+      <div class="modal-backdrop" onclick="closeModal('peerFallbackModal')"></div>
+      <div class="modal-content modal-md">
+        <div class="modal-header">
+          <h3>Conectar al peer del cluster</h3>
+          <button class="modal-close" onclick="closeModal('peerFallbackModal')">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+            </svg>
+          </button>
+        </div>
+        <div class="modal-body">
+          ${initialError ? `<div class="modal-alert error" style="margin-bottom:1rem;">
+            <div class="modal-alert-content">
+              <div class="modal-alert-title">Auto-connect falló</div>
+              <div class="modal-alert-message">${escapeHtml(initialError)}</div>
+            </div>
+          </div>` : ''}
+          <div class="modal-alert info" style="margin-bottom: 1rem;">
+            <div class="modal-alert-content">
+              <div class="modal-alert-title">Peer esperado: ${escapeHtml(clusterInfo?.peer_name || '')}</div>
+              <div class="modal-alert-message">Por defecto se reutiliza la api-key del primario. Editable si fuera distinta.</div>
+            </div>
+          </div>
+          <div class="modal-form-group">
+            <label class="modal-form-label">Host / IP <span class="required">*</span></label>
+            <input type="text" id="peerFallbackHost" placeholder="10.0.0.2 o ${escapeHtml(clusterInfo?.peer_name || '')}"
+                   value="${escapeHtml(clusterInfo?.peer_name || '')}" />
+          </div>
+          <div class="modal-form-row">
+            <div class="modal-form-group">
+              <label class="modal-form-label">HTTPS Port</label>
+              <input type="text" id="peerFallbackPort" placeholder="8443" />
+            </div>
+            <div class="modal-form-group" style="flex: 2;">
+              <label class="modal-form-label">API Key (opcional — usa la del primario si vacía)</label>
+              <input type="password" id="peerFallbackKey" placeholder="deja vacío para reutilizar" />
+            </div>
+          </div>
+          <div id="peerFallbackStatus"></div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" onclick="closeModal('peerFallbackModal')">Cancelar</button>
+          <button class="btn btn-primary" id="peerFallbackSubmit">Conectar</button>
+        </div>
+      </div>
+    </div>`;
+  document.body.insertAdjacentHTML('beforeend', html);
+  document.getElementById('peerFallbackSubmit').onclick = submitPeerFallback;
+}
+
+async function submitPeerFallback() {
+  const host = document.getElementById('peerFallbackHost').value.trim();
+  const port = document.getElementById('peerFallbackPort').value.trim();
+  const key = document.getElementById('peerFallbackKey').value;
+  const statusDiv = document.getElementById('peerFallbackStatus');
+  const btn = document.getElementById('peerFallbackSubmit');
+
+  if (!host) {
+    statusDiv.innerHTML = `<div class="modal-alert error"><div class="modal-alert-content"><div class="modal-alert-title">Host requerido</div></div></div>`;
+    return;
+  }
+
+  btn.disabled = true;
+  btn.innerHTML = '<div class="loading-spinner"></div> Conectando…';
+
+  const body = { host };
+  if (port) body.port = parseInt(port, 10);
+  if (key) body.api_key = key;
+
+  try {
+    const res = await fetch('/fetch-peer', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const j = await res.json();
+    if (!res.ok) {
+      statusDiv.innerHTML = `<div class="modal-alert error"><div class="modal-alert-content"><div class="modal-alert-title">Conexión fallida</div><div class="modal-alert-message">${escapeHtml(j.error || 'unknown')}</div></div></div>`;
+      btn.disabled = false;
+      btn.textContent = 'Reintentar';
+      return;
+    }
+    clusterInfo = j.cluster_info || clusterInfo;
+    clusterInfo.peer_connected = true;
+    closeModal('peerFallbackModal');
+    logActivity('cluster', 'peer-connect', clusterInfo.peer_name, 'success',
+                `Peer conectado (manual) en ${clusterInfo.peer_host}:${clusterInfo.peer_port}`);
+    showToast('success', 'Peer connected', `Conectado a ${clusterInfo.peer_name}`);
+    runSyncCheck();
+  } catch (e) {
+    statusDiv.innerHTML = `<div class="modal-alert error"><div class="modal-alert-content"><div class="modal-alert-title">Error</div><div class="modal-alert-message">${escapeHtml(e.message)}</div></div></div>`;
+    btn.disabled = false;
+    btn.textContent = 'Reintentar';
+  }
+}
+
+async function runSyncCheck(verbose = false) {
+  if (!isInCluster()) {
+    updateClusterBadge(clusterInfo?.detected ? 'detected' : null);
+    return { synchronized: true };
+  }
+  updateClusterBadge('checking');
+  try {
+    const res = await fetch('/api/cluster/sync-check');
+    const j = await res.json();
+    if (!res.ok) {
+      showToast('error', 'Sync check failed', j.error || 'unknown');
+      updateClusterBadge('detected');
+      return { synchronized: false, error: j.error };
+    }
+    lastClusterDiffs = j.differences || [];
+    if (j.synchronized) {
+      updateClusterBadge('sync');
+      if (verbose) showToast('success', 'In sync', 'Ambos nodos están sincronizados');
+    } else {
+      updateClusterBadge('diverged');
+      if (verbose) {
+        showDivergenceModal(lastClusterDiffs);
+      } else {
+        showToast('warning', 'Cluster diverged', `${lastClusterDiffs.length} diferencias. Click en el badge HA para verlas.`);
+      }
+    }
+    return j;
+  } catch (e) {
+    showToast('error', 'Sync check error', e.message);
+    updateClusterBadge('detected');
+    return { synchronized: false, error: e.message };
+  }
+}
+
+function showDivergenceModal(diffs) {
+  const existing = document.getElementById('clusterDiffModal');
+  if (existing) existing.remove();
+
+  const rowsBySection = {};
+  for (const d of diffs) {
+    (rowsBySection[d.section] = rowsBySection[d.section] || []).push(d);
+  }
+
+  const sections = Object.keys(rowsBySection).sort();
+  const body = sections.length === 0
+    ? `<p class="text-muted">No hay divergencias. Los nodos están sincronizados.</p>`
+    : sections.map(sec => `
+        <fieldset class="form-fieldset" style="margin-bottom:0.75rem;">
+          <legend>${escapeHtml(sec)} <span class="badge badge-danger">${rowsBySection[sec].length}</span></legend>
+          <ul class="group-entries-list">
+            ${rowsBySection[sec].map(d => `
+              <li><span class="entry-value">${escapeHtml(d.id)}</span>
+                <span class="text-muted" style="margin-left:0.75rem;">${escapeHtml(d.kind)}</span>
+              </li>`).join('')}
+          </ul>
+        </fieldset>`).join('');
+
+  const html = `
+    <div class="modal" id="clusterDiffModal">
+      <div class="modal-backdrop" onclick="closeModal('clusterDiffModal')"></div>
+      <div class="modal-content modal-lg">
+        <div class="modal-header">
+          <h3>Diferencias entre nodos del cluster</h3>
+          <button class="modal-close" onclick="closeModal('clusterDiffModal')">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+            </svg>
+          </button>
+        </div>
+        <div class="modal-body">
+          <div class="modal-alert warning" style="margin-bottom:1rem;">
+            <div class="modal-alert-content">
+              <div class="modal-alert-title">${diffs.length} diferencias detectadas</div>
+              <div class="modal-alert-message">
+                El dual-apply queda bloqueado hasta que los nodos estén sincronizados.
+                Puedes sincronizar manualmente (por SSH o por la UI, nodo a nodo) y volver a verificar.
+              </div>
+            </div>
+          </div>
+          ${body}
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" onclick="closeModal('clusterDiffModal')">Cerrar</button>
+          <button class="btn btn-danger" onclick="disconnectPeer(true)">Aplicar solo al primary</button>
+          <button class="btn btn-primary" onclick="runSyncCheck(true); closeModal('clusterDiffModal')">Re-verificar</button>
+        </div>
+      </div>
+    </div>`;
+  document.body.insertAdjacentHTML('beforeend', html);
+}
+
+async function disconnectPeer(closeDivergenceModal = false) {
+  try {
+    const res = await fetch('/api/cluster/disconnect-peer', { method: 'POST' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (clusterInfo) clusterInfo = { ...clusterInfo, peer_connected: false };
+    lastClusterDiffs = [];
+    updateClusterBadge(clusterInfo?.detected ? 'detected' : null);
+    if (closeDivergenceModal) closeModal('clusterDiffModal');
+    showToast('info', 'Peer desconectado',
+              'Las próximas operaciones irán solo al primary. Reconecta el peer cuando resuelvas la divergencia.');
+    logActivity('cluster', 'peer-disconnect', clusterInfo?.peer_name || '',
+                'success', 'Peer desconectado: modo single-node activado');
+  } catch (e) {
+    showToast('error', 'Error', e.message);
+  }
+}
+
+// Helper: include apply_to_peer in write requests when in cluster (default ON)
+function withClusterApply(body) {
+  if (!isInCluster()) return body;
+  return { ...body, apply_to_peer: true };
+}
+
+/**
+ * Fetch wrapper for write endpoints that transparently handles cluster mode:
+ *   - Adds apply_to_peer=true when in cluster
+ *   - Handles 409 (cluster diverged) by showing the divergence modal
+ *   - Throws with the server's error message on other failures
+ *   - Triggers a post-apply sync-check to keep the badge fresh
+ * Returns parsed JSON body on success.
+ */
+async function clusterApplyFetch(url, method, bodyObj) {
+  const inCluster = isInCluster();
+  const dual = shouldDualApply();
+  // Send apply_to_peer explicitly when in cluster:
+  //   true  → backend runs pre-flight sync-check and applies to both
+  //   false → backend skips peer (single-node write, no pre-flight)
+  const merged = inCluster
+    ? { ...(bodyObj || {}), apply_to_peer: dual }
+    : (bodyObj || {});
+  const res = await fetch(url, {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(merged)
+  });
+  let data = null;
+  try { data = await res.json(); } catch {}
+
+  if (res.status === 409 && data?.differences) {
+    lastClusterDiffs = data.differences;
+    updateClusterBadge('diverged');
+    showDivergenceModal(data.differences);
+    const err = new Error('Cluster no sincronizado — apply bloqueado');
+    err.isDivergence = true;
+    throw err;
+  }
+  if (!res.ok) {
+    throw new Error(data?.error || `HTTP ${res.status}`);
+  }
+
+  // Refresh the HA badge after any write when we're in a cluster (even if we
+  // only hit the primary — the sync state probably drifted).
+  if (inCluster) setTimeout(() => runSyncCheck(false), 0);
+
+  return data;
+}
+
+// Suffix for activity log messages to reflect where the change was applied
+function clusterNodesSuffix(responseData) {
+  const applied = responseData?.applied_to;
+  if (Array.isArray(applied) && applied.length === 2) return ' [→ primary + peer]';
+  if (Array.isArray(applied) && applied.length === 1) return ' [→ primary]';
+  return '';
+}
 
 // =========================================
 // INITIALIZATION

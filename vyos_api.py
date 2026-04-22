@@ -32,6 +32,8 @@ class VyOSAPI:
             timeout: Timeout para requests en segundos (default: 60)
             configure_timeout: Timeout para operaciones de configuración (default: 120)
         """
+        self.host = host
+        self.port = port
         self.base_url = f"https://{host}:{port}"
         self.api_key = api_key
         self.verify_ssl = verify_ssl

@@ -339,6 +339,32 @@ The `adapt_14()` function now copies the following sections from VyOS 1.4 config
 - `policy`
 - `interfaces`
 - `vrf`
+- `high-availability` (added for HA cluster detection)
+
+---
+
+## Known improvements / future work
+
+### HA cluster sync-check — reduce redundant peer fetches
+
+The current dual-apply flow fetches the peer's full config up to **3 times per write**:
+
+1. Pre-flight `PEER_API.get_config()` inside `apply_ops_dual` (before applying).
+2. `PEER_API.get_config()` after applying to peer (refreshes `PEER_CONFIG` cache).
+3. Frontend `runSyncCheck(false)` via `setTimeout` after `clusterApplyFetch` — fires one more `PEER_API.get_config()`.
+
+Pure comparison (`compute_sync_diffs`) is fast — O(n) Python dict deep-equal, microseconds for hundreds of rules. The cost is the HTTP roundtrip + JSON parse of large configs on the VyOS peer (~1-3s each for big configs).
+
+**Potential optimizations (not implemented — deferred by user):**
+- Short TTL cache (~15-30s) on `PEER_CONFIG` so consecutive writes reuse the fetch.
+- Drop the post-write `runSyncCheck` — a successful dual-apply implies sync.
+- Reuse the pre-flight snapshot as "post state" until the next operation starts.
+
+**Why deferred**: optimizations reduce coverage against a concurrent operator editing the peer mid-session. Current behavior trades extra HTTP calls for guaranteed freshness. The user prefers to revisit only if they observe real slowness.
+
+**Escape hatches that already exist** (don't require code changes):
+- Cluster Sync toggle OFF → no pre-flight, writes go only to primary.
+- Not connecting the peer → no dual-apply at all, zero overhead.
 
 ---
 
