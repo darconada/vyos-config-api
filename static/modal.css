@@ -1419,6 +1419,20 @@ tr.pending-delete .pending-badge {
    26. GROUP EDIT MODAL - ENTRIES LIST
    ========================================= */
 
+#groupEditForm.view-mode > .form-row,
+#groupEditForm.view-mode > .form-group,
+#groupEditForm.view-mode .group-entries-header,
+#groupEditForm.view-mode #groupEntryValidationHint,
+#groupEditForm.view-mode fieldset > legend {
+  display: none;
+}
+
+#groupEditForm.view-mode fieldset.form-fieldset {
+  border: none;
+  padding: 0;
+  margin: 0;
+}
+
 .group-entries-container {
   border: 1px solid var(--border-color);
   border-radius: var(--radius-md);

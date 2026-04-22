@@ -5067,8 +5067,10 @@ function showGroupDetails(groupType, groupName) {
     `).join('');
   }
 
-  // Hide form elements for view mode
-  document.getElementById('groupEditForm').style.display = 'none';
+  // Switch form to view-only mode (keep entries list visible, hide editable inputs via CSS)
+  const form = document.getElementById('groupEditForm');
+  form.style.display = 'block';
+  form.classList.add('view-mode');
   document.getElementById('groupUsageInfo').classList.add('hidden');
   footer.innerHTML = '<button class="btn btn-secondary" onclick="closeModal(\'groupEditModal\')">Close</button>';
 
@@ -5084,6 +5086,7 @@ async function openGroupModal(mode, groupType = 'address', groupName = '') {
 
   // Reset form visibility
   form.style.display = 'block';
+  form.classList.remove('view-mode');
 
   // Set mode
   document.getElementById('groupEditMode').value = mode;
