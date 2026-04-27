@@ -3562,32 +3562,41 @@ function populateRulesetSelector(selectId, selectedValue = null) {
   });
 }
 
+// Cache of generated <option> HTML per group type, keyed by a signature of the
+// group names. Avoids the O(n^2) innerHTML+= rebuild on every modal open and
+// rebuilds only when the set of group names changes.
+const groupSelectorCache = {
+  'address-group': { sig: null, html: null },
+  'network-group': { sig: null, html: null },
+  'port-group':    { sig: null, html: null }
+};
+
 function populateGroupSelectors() {
   const groups = CONFIG?.firewall?.group || {};
-  const addrGroups = Object.keys(groups['address-group'] || {});
-  const netGroups = Object.keys(groups['network-group'] || {});
-  const portGroups = Object.keys(groups['port-group'] || {});
 
-  // Address groups
-  ['fwRuleSrcAddrGroup', 'fwRuleDstAddrGroup'].forEach(id => {
-    const sel = document.getElementById(id);
-    sel.innerHTML = '<option value="">--</option>';
-    addrGroups.forEach(g => { sel.innerHTML += `<option value="${g}">${g}</option>`; });
-  });
+  const htmlFor = (type) => {
+    const keys = Object.keys(groups[type] || {});
+    const sig = keys.join('|');
+    const cache = groupSelectorCache[type];
+    if (cache.sig !== sig) {
+      const parts = ['<option value="">--</option>'];
+      for (const g of keys) parts.push(`<option value="${g}">${g}</option>`);
+      cache.sig = sig;
+      cache.html = parts.join('');
+    }
+    return cache.html;
+  };
 
-  // Network groups (separate from address groups)
-  ['fwRuleSrcNetGroup', 'fwRuleDstNetGroup'].forEach(id => {
-    const sel = document.getElementById(id);
-    sel.innerHTML = '<option value="">--</option>';
-    netGroups.forEach(g => { sel.innerHTML += `<option value="${g}">${g}</option>`; });
-  });
+  const addrHTML = htmlFor('address-group');
+  const netHTML  = htmlFor('network-group');
+  const portHTML = htmlFor('port-group');
 
-  // Port groups
-  ['fwRuleSrcPortGroup', 'fwRuleDstPortGroup'].forEach(id => {
-    const sel = document.getElementById(id);
-    sel.innerHTML = '<option value="">--</option>';
-    portGroups.forEach(g => { sel.innerHTML += `<option value="${g}">${g}</option>`; });
-  });
+  document.getElementById('fwRuleSrcAddrGroup').innerHTML = addrHTML;
+  document.getElementById('fwRuleDstAddrGroup').innerHTML = addrHTML;
+  document.getElementById('fwRuleSrcNetGroup').innerHTML  = netHTML;
+  document.getElementById('fwRuleDstNetGroup').innerHTML  = netHTML;
+  document.getElementById('fwRuleSrcPortGroup').innerHTML = portHTML;
+  document.getElementById('fwRuleDstPortGroup').innerHTML = portHTML;
 }
 
 async function reloadConfig() {
@@ -3632,54 +3641,59 @@ function openFirewallRuleModal(mode = 'create', rulesetName = null, ruleId = nul
   const form = document.getElementById('firewallRuleForm');
   form.reset();
   document.getElementById('fwRuleMode').value = mode;
-  populateRulesetSelector('fwRuleRuleset', rulesetName || currentRulesetName);
-  populateGroupSelectors();
 
-  // Reset jump target visibility
-  document.getElementById('fwJumpTargetGroup').classList.add('hidden');
-
-  // Reset original rule state
-  originalFirewallRule = null;
-
+  // Set title and reset state up-front so the modal has meaningful content
+  // the moment it appears, before the heavier population work runs.
   if (mode === 'edit' && rulesetName && ruleId) {
     document.getElementById('firewallRuleTitle').textContent = `Edit Rule ${ruleId}`;
-    const rule = CONFIG?.firewall?.name?.[rulesetName]?.rule?.[ruleId];
-    if (rule) {
-      // Store original rule for differential updates
-      // Use original server state if available (for rules with pending changes)
-      const marker = `firewall:${rulesetName}:${ruleId}`;
-      if (originalServerStates.has(marker)) {
-        originalFirewallRule = deepClone(originalServerStates.get(marker));
-      } else {
-        originalFirewallRule = deepClone(rule);
-      }
-
-      document.getElementById('fwRuleId').value = ruleId;
-      document.getElementById('fwRuleAction').value = rule.action || 'accept';
-      document.getElementById('fwRuleProtocol').value = rule.protocol || '';
-      document.getElementById('fwRuleDescription').value = rule.description || '';
-      document.getElementById('fwRuleSrcAddress').value = rule.source?.address || '';
-      document.getElementById('fwRuleSrcPort').value = rule.source?.port || '';
-      document.getElementById('fwRuleDstAddress').value = rule.destination?.address || '';
-      document.getElementById('fwRuleDstPort').value = rule.destination?.port || '';
-      // Groups - separate address-group and network-group
-      document.getElementById('fwRuleSrcAddrGroup').value = rule.source?.group?.['address-group'] || '';
-      document.getElementById('fwRuleSrcNetGroup').value = rule.source?.group?.['network-group'] || '';
-      document.getElementById('fwRuleSrcPortGroup').value = rule.source?.group?.['port-group'] || '';
-      document.getElementById('fwRuleDstAddrGroup').value = rule.destination?.group?.['address-group'] || '';
-      document.getElementById('fwRuleDstNetGroup').value = rule.destination?.group?.['network-group'] || '';
-      document.getElementById('fwRuleDstPortGroup').value = rule.destination?.group?.['port-group'] || '';
-      // Jump target
-      if (rule.action === 'jump' && rule['jump-target']) {
-        toggleJumpTarget();
-        document.getElementById('fwRuleJumpTarget').value = rule['jump-target'];
-      }
-    }
   } else {
     document.getElementById('firewallRuleTitle').textContent = 'New Firewall Rule';
     document.getElementById('fwRuleId').value = '';
   }
+  document.getElementById('fwJumpTargetGroup').classList.add('hidden');
+  originalFirewallRule = null;
+
+  // Open the modal first so the user gets immediate visual feedback on click.
+  // The selector population and field assignments are deferred to the next
+  // animation frame, letting the browser paint the modal before doing work
+  // that scales with the number of firewall groups.
   openModal('firewallRuleModal');
+
+  requestAnimationFrame(() => {
+    populateRulesetSelector('fwRuleRuleset', rulesetName || currentRulesetName);
+    populateGroupSelectors();
+
+    if (mode !== 'edit' || !rulesetName || !ruleId) return;
+
+    const rule = CONFIG?.firewall?.name?.[rulesetName]?.rule?.[ruleId];
+    if (!rule) return;
+
+    const marker = `firewall:${rulesetName}:${ruleId}`;
+    if (originalServerStates.has(marker)) {
+      originalFirewallRule = deepClone(originalServerStates.get(marker));
+    } else {
+      originalFirewallRule = deepClone(rule);
+    }
+
+    document.getElementById('fwRuleId').value = ruleId;
+    document.getElementById('fwRuleAction').value = rule.action || 'accept';
+    document.getElementById('fwRuleProtocol').value = rule.protocol || '';
+    document.getElementById('fwRuleDescription').value = rule.description || '';
+    document.getElementById('fwRuleSrcAddress').value = rule.source?.address || '';
+    document.getElementById('fwRuleSrcPort').value = rule.source?.port || '';
+    document.getElementById('fwRuleDstAddress').value = rule.destination?.address || '';
+    document.getElementById('fwRuleDstPort').value = rule.destination?.port || '';
+    document.getElementById('fwRuleSrcAddrGroup').value = rule.source?.group?.['address-group'] || '';
+    document.getElementById('fwRuleSrcNetGroup').value = rule.source?.group?.['network-group'] || '';
+    document.getElementById('fwRuleSrcPortGroup').value = rule.source?.group?.['port-group'] || '';
+    document.getElementById('fwRuleDstAddrGroup').value = rule.destination?.group?.['address-group'] || '';
+    document.getElementById('fwRuleDstNetGroup').value = rule.destination?.group?.['network-group'] || '';
+    document.getElementById('fwRuleDstPortGroup').value = rule.destination?.group?.['port-group'] || '';
+    if (rule.action === 'jump' && rule['jump-target']) {
+      toggleJumpTarget();
+      document.getElementById('fwRuleJumpTarget').value = rule['jump-target'];
+    }
+  });
 }
 
 async function saveFirewallRule() {
