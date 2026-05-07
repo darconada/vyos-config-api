@@ -2285,6 +2285,23 @@ async function loadFirewall() {
   }
 }
 
+// Bounded-concurrency map. Avoids slamming the backend with hundreds of
+// parallel fetches on big rulesets (caused 502s from the upstream accept
+// queue filling up).
+async function mapWithLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 async function viewRuleset(rs) {
   content.innerHTML = showSkeletonTable(10, 8);
   updateBreadcrumb([
@@ -2322,7 +2339,7 @@ async function viewRuleset(rs) {
     });
 
     groupCache = {};
-    await Promise.all([...refs].map(async ref => {
+    await mapWithLimit([...refs], 8, async ref => {
       const [type, name] = ref.split('|');
       const key = `${type}-${name}`;
       const r = await fetch(`/api/firewall/group/${type}/${name}`);
@@ -2330,7 +2347,7 @@ async function viewRuleset(rs) {
       if (type === 'address') groupCache[key] = obj.address;
       if (type === 'network') groupCache[key] = obj.network;
       if (type === 'port') groupCache[key] = obj.port;
-    }));
+    });
 
     filters = {};
     ipFilters = { source: null, destination: null };
