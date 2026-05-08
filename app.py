@@ -6,6 +6,10 @@ Flask backend con conexión a VyOS via API REST oficial (1.4+)
 import os
 import re
 import sys
+import time
+import threading
+import functools
+import concurrent.futures
 import secrets as _secrets
 from flask import Flask, render_template, request, jsonify, redirect, session, url_for
 import json
@@ -48,6 +52,114 @@ PEER_CONFIG = None
 RAW_PEER_CONFIG = None
 # Info del cluster: { detected, primary_name, peer_name, peer_connected }
 CLUSTER_INFO = None
+
+
+# ──────────────────────────────────────────────────────────────
+#  Write-lock (un solo escritor a la vez)
+# ──────────────────────────────────────────────────────────────
+# Lock global para serializar operaciones de escritura entre usuarios.
+# Vive en memoria (se pierde al reiniciar gunicorn → no necesita liberación
+# manual tras restart). Tras WRITE_LOCK_TTL segundos sin heartbeat, se libera
+# automáticamente y otro usuario puede tomarlo.
+WRITE_LOCK = None  # None | {'user': str, 'acquired_at': float, 'last_seen': float}
+_WRITE_LOCK_MUTEX = threading.Lock()
+WRITE_LOCK_TTL = 300  # 5 minutos de inactividad → auto-expire
+
+
+def _lock_state_now():
+    """Devuelve el estado del lock aplicando auto-expiración por TTL."""
+    global WRITE_LOCK
+    if WRITE_LOCK is None:
+        return None
+    if time.time() - WRITE_LOCK['last_seen'] > WRITE_LOCK_TTL:
+        WRITE_LOCK = None
+        return None
+    return dict(WRITE_LOCK)
+
+
+def _current_user():
+    """Devuelve el username (string). session['user'] es un dict {'username': ...}."""
+    raw = session.get('user')
+    if isinstance(raw, dict):
+        return raw.get('username') or ''
+    return raw or ''
+
+
+def write_lock_required(f):
+    """Endpoint protegido: solo el dueño del lock puede invocarlo."""
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        user = _current_user()
+        with _WRITE_LOCK_MUTEX:
+            state = _lock_state_now()
+            if state is None or state['user'] != user:
+                return jsonify({
+                    'error': 'Write lock required',
+                    'lock': state,
+                    'me': user,
+                }), 423  # Locked
+            # Refrescamos last_seen como side-effect: cualquier write cuenta como actividad.
+            WRITE_LOCK['last_seen'] = time.time()
+        return f(*args, **kwargs)
+    return wrapper
+
+
+@app.route('/api/lock', methods=['GET'])
+@login_required
+def get_lock():
+    with _WRITE_LOCK_MUTEX:
+        state = _lock_state_now()
+    return jsonify({'lock': state, 'me': _current_user(), 'ttl': WRITE_LOCK_TTL})
+
+
+@app.route('/api/lock', methods=['POST'])
+@login_required
+def acquire_lock():
+    """Adquirir el lock. Si está libre o expirado lo toma. Si está ocupado por
+    otro y `force=true`, lo roba (con auditoría implícita en logs)."""
+    global WRITE_LOCK
+    body = request.get_json(silent=True) or {}
+    force = bool(body.get('force'))
+    user = _current_user()
+    now = time.time()
+    with _WRITE_LOCK_MUTEX:
+        state = _lock_state_now()
+        if state and state['user'] != user and not force:
+            return jsonify({
+                'error': 'Lock held by another user',
+                'lock': state,
+                'me': user,
+            }), 409
+        WRITE_LOCK = {'user': user, 'acquired_at': now, 'last_seen': now}
+        forced_from = state['user'] if (state and state['user'] != user) else None
+    if forced_from:
+        print(f'[lock] {user} forced lock from {forced_from}', file=sys.stderr)
+    return jsonify({'lock': WRITE_LOCK, 'me': user, 'forced_from': forced_from})
+
+
+@app.route('/api/lock/heartbeat', methods=['POST'])
+@login_required
+def heartbeat_lock():
+    """Mantiene vivo el lock del dueño actual. 409 si lo perdió (TTL/forzado)."""
+    global WRITE_LOCK
+    user = _current_user()
+    with _WRITE_LOCK_MUTEX:
+        state = _lock_state_now()
+        if state and state['user'] == user:
+            WRITE_LOCK['last_seen'] = time.time()
+            return jsonify({'lock': WRITE_LOCK})
+    return jsonify({'error': 'Lock not held by you', 'lock': state}), 409
+
+
+@app.route('/api/lock', methods=['DELETE'])
+@login_required
+def release_lock():
+    global WRITE_LOCK
+    user = _current_user()
+    with _WRITE_LOCK_MUTEX:
+        if WRITE_LOCK and WRITE_LOCK['user'] == user:
+            WRITE_LOCK = None
+    return jsonify({'lock': None, 'me': user})
 
 
 # ──────────────────────────────────────────────────────────────
@@ -802,46 +914,64 @@ def apply_ops_dual(ops, to_peer_requested=None, require_sync=True):
                 'peer_name': CLUSTER_INFO.get('peer_name')
             })
 
-    # Apply al primary
-    primary_err = None
-    try:
-        ACTIVE_API.configure(ops)
-    except VyOSAPIError as e:
-        primary_err = str(e)
-
-    if primary_err is not None:
-        # Crítico: aunque la API haya cortado por timeout, VyOS puede haber
-        # aplicado igualmente. Refrescamos CONFIG SIEMPRE para que la UI no
-        # quede mintiendo con un estado obsoleto.
-        try:
-            raw = ACTIVE_API.get_config()
-            RAW_CONFIG = raw
-            CONFIG = load_config(raw)
-        except VyOSAPIError:
-            pass
-        raise DualApplyError(500, {
-            'error': f'Primary apply failed: {primary_err}',
-            'hint': 'CONFIG ha sido refrescado: si la operación finalmente se aplicó '
-                    'en primary la UI lo verá en el próximo render. El peer no se ha tocado.'
-        })
-
-    # Update in-memory de CONFIG (sin refetch) si se puede; si no, fallback a refetch.
-    if not (RAW_CONFIG is not None and apply_ops_in_memory(RAW_CONFIG, ops)):
-        try:
-            raw = ACTIVE_API.get_config()
-            RAW_CONFIG = raw
-        except VyOSAPIError:
-            pass
-    if RAW_CONFIG is not None:
-        CONFIG = load_config(RAW_CONFIG)
-
+    # Caso single-node: aplicar solo a primary (no hay nada que paralelizar).
     if not do_peer:
+        try:
+            ACTIVE_API.configure(ops)
+        except VyOSAPIError as e:
+            try:
+                raw = ACTIVE_API.get_config()
+                RAW_CONFIG = raw
+                CONFIG = load_config(raw)
+            except VyOSAPIError:
+                pass
+            raise DualApplyError(500, {
+                'error': f'Primary apply failed: {str(e)}',
+                'hint': 'CONFIG refrescado: si la operación se aplicó silenciosamente '
+                        'tras timeout, la UI lo verá en el próximo render.'
+            })
+        if not (RAW_CONFIG is not None and apply_ops_in_memory(RAW_CONFIG, ops)):
+            try:
+                raw = ACTIVE_API.get_config()
+                RAW_CONFIG = raw
+            except VyOSAPIError:
+                pass
+        if RAW_CONFIG is not None:
+            CONFIG = load_config(RAW_CONFIG)
         return {'applied_to': ['primary'], 'nodes': 1}
 
-    # Apply al peer
-    try:
-        PEER_API.configure(ops)
-        # Update in-memory de PEER_CONFIG; fallback a refetch si la heurística falla.
+    # Apply EN PARALELO a primary y peer. En configs grandes cada commit puede
+    # tardar 1-2 min; secuencial duplicaría la espera. Cada thread bloquea en
+    # I/O HTTP (requests libera el GIL), así que la concurrencia es real.
+    primary_err = None
+    peer_err = None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2,
+                                               thread_name_prefix='dual-apply') as ex:
+        f_primary = ex.submit(ACTIVE_API.configure, ops)
+        f_peer = ex.submit(PEER_API.configure, ops)
+        try:
+            f_primary.result()
+        except VyOSAPIError as e:
+            primary_err = str(e)
+        except Exception as e:
+            primary_err = f'unexpected: {str(e)}'
+        try:
+            f_peer.result()
+        except VyOSAPIError as e:
+            peer_err = str(e)
+        except Exception as e:
+            peer_err = f'unexpected: {str(e)}'
+
+    # Caso 1: ambos OK → update in-memory de las dos caches.
+    if primary_err is None and peer_err is None:
+        if not (RAW_CONFIG is not None and apply_ops_in_memory(RAW_CONFIG, ops)):
+            try:
+                raw = ACTIVE_API.get_config()
+                RAW_CONFIG = raw
+            except VyOSAPIError:
+                pass
+        if RAW_CONFIG is not None:
+            CONFIG = load_config(RAW_CONFIG)
         if not (RAW_PEER_CONFIG is not None and apply_ops_in_memory(RAW_PEER_CONFIG, ops)):
             try:
                 raw_peer = PEER_API.get_config()
@@ -851,22 +981,43 @@ def apply_ops_dual(ops, to_peer_requested=None, require_sync=True):
         if RAW_PEER_CONFIG is not None:
             PEER_CONFIG = load_config(RAW_PEER_CONFIG)
         return {'applied_to': ['primary', 'peer'], 'nodes': 2}
-    except VyOSAPIError as e:
-        peer_err = str(e)
-        # Refrescamos PEER_CONFIG por si VyOS aplicó silenciosamente tras un timeout.
+
+    # Caso 4: ambos fallaron → refrescar las dos caches y devolver error.
+    # No tiene sentido rollback (no hay ningún lado consistente al que volver).
+    if primary_err is not None and peer_err is not None:
+        try:
+            raw = ACTIVE_API.get_config()
+            RAW_CONFIG = raw
+            CONFIG = load_config(raw)
+        except VyOSAPIError:
+            pass
         try:
             raw_peer = PEER_API.get_config()
             RAW_PEER_CONFIG = raw_peer
             PEER_CONFIG = load_config(raw_peer)
         except VyOSAPIError:
             pass
-        # Rollback best-effort en primary
+        raise DualApplyError(500, {
+            'error': f'Both nodes failed. primary: {primary_err}. peer: {peer_err}',
+            'hint': 'Caches refrescadas. Si VyOS aplicó silenciosamente tras timeout, '
+                    'lo verás al render.'
+        })
+
+    # Casos 2/3: un lado OK, el otro KO → rollback del lado que triunfó para
+    # restaurar consistencia. Refrescamos también el lado que falló por si
+    # aplicó silenciosamente tras timeout.
+    if primary_err is None:  # peer falló
+        try:
+            raw_peer = PEER_API.get_config()
+            RAW_PEER_CONFIG = raw_peer
+            PEER_CONFIG = load_config(raw_peer)
+        except VyOSAPIError:
+            pass
         rollback_ops = _reverse_ops(ops)
         rollback_status = 'skipped'
         if rollback_ops:
             try:
                 ACTIVE_API.configure(rollback_ops)
-                # Tras rollback, mejor refetch real del primary (estamos en ruta de error).
                 try:
                     raw = ACTIVE_API.get_config()
                     RAW_CONFIG = raw
@@ -883,12 +1034,41 @@ def apply_ops_dual(ops, to_peer_requested=None, require_sync=True):
             'hint': 'Si rollback=ok el primary fue revertido. Si failed revisa manualmente.'
         })
 
+    # primary falló, peer OK → rollback peer.
+    try:
+        raw = ACTIVE_API.get_config()
+        RAW_CONFIG = raw
+        CONFIG = load_config(raw)
+    except VyOSAPIError:
+        pass
+    rollback_ops = _reverse_ops(ops)
+    rollback_status = 'skipped'
+    if rollback_ops:
+        try:
+            PEER_API.configure(rollback_ops)
+            try:
+                raw_peer = PEER_API.get_config()
+                RAW_PEER_CONFIG = raw_peer
+                PEER_CONFIG = load_config(raw_peer)
+            except VyOSAPIError:
+                pass
+            rollback_status = 'ok'
+        except VyOSAPIError as ex:
+            rollback_status = f'failed: {str(ex)}'
+    raise DualApplyError(500, {
+        'error': f'Primary apply failed: {primary_err}',
+        'applied_to_peer': True,
+        'rollback': rollback_status,
+        'hint': 'Si rollback=ok el peer fue revertido. Si failed revisa manualmente.'
+    })
+
 
 # ──────────────────────────────────────────────────────────────
 #  API de escritura (Firewall)
 # ──────────────────────────────────────────────────────────────
 @app.route('/api/firewall/rule', methods=['POST', 'PUT', 'DELETE'])
 @login_required
+@write_lock_required
 def manage_firewall_rule():
     """Crear, modificar o eliminar regla de firewall."""
     if not ACTIVE_API:
@@ -929,6 +1109,7 @@ def manage_firewall_rule():
 # ──────────────────────────────────────────────────────────────
 @app.route('/api/nat/rule', methods=['POST', 'PUT', 'DELETE'])
 @login_required
+@write_lock_required
 def manage_nat_rule():
     """Crear, modificar o eliminar regla NAT."""
     if not ACTIVE_API:
@@ -971,6 +1152,7 @@ def manage_nat_rule():
 # ──────────────────────────────────────────────────────────────
 @app.route('/api/firewall/group', methods=['POST', 'PUT', 'DELETE'])
 @login_required
+@write_lock_required
 def manage_firewall_group():
     """Crear, modificar o eliminar grupo de firewall."""
     if not ACTIVE_API:
@@ -1013,6 +1195,7 @@ def manage_firewall_group():
 # ──────────────────────────────────────────────────────────────
 @app.route('/api/batch-configure', methods=['POST'])
 @login_required
+@write_lock_required
 def batch_configure():
     """
     Aplica múltiples operaciones en una sola llamada.
@@ -1216,6 +1399,7 @@ def build_diff_operations(base_path, diff):
 # ──────────────────────────────────────────────────────────────
 @app.route('/api/save-config', methods=['POST'])
 @login_required
+@write_lock_required
 def save_config_to_router():
     """Guarda configuración en el router. En cluster, guarda también en el peer por defecto."""
     if not ACTIVE_API:
@@ -1385,6 +1569,7 @@ def static_routes():
 
 @app.route('/api/static-route', methods=['POST', 'DELETE'])
 @login_required
+@write_lock_required
 def manage_static_route():
     """Crear o eliminar ruta estática (default VRF o VRF específico)."""
     if not ACTIVE_API:
@@ -1451,6 +1636,7 @@ def bgp_config():
 
 @app.route('/api/bgp/neighbor', methods=['POST', 'DELETE'])
 @login_required
+@write_lock_required
 def manage_bgp_neighbor():
     """Crear o eliminar neighbor BGP."""
     global CONFIG
@@ -1509,6 +1695,7 @@ def manage_bgp_neighbor():
 
 @app.route('/api/bgp/network', methods=['POST', 'DELETE'])
 @login_required
+@write_lock_required
 def manage_bgp_network():
     """Añadir o eliminar network BGP."""
     global CONFIG
@@ -1542,6 +1729,7 @@ def manage_bgp_network():
 
 @app.route('/api/bgp/system-as', methods=['POST'])
 @login_required
+@write_lock_required
 def set_bgp_system_as():
     """Configurar ASN local para BGP."""
     global CONFIG

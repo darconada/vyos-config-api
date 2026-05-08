@@ -83,6 +83,18 @@ let lastClusterDiffs = [];
 // When false, writes target only primary (no pre-flight) — use during single-node interventions.
 let dualApplyEnabled = true;
 
+// Write-lock state (single writer at a time across all logged-in users)
+// Shape: { user, acquired_at, last_seen } | null
+let writeLockState = null;
+let writeLockMe = null;
+let writeLockIsMine = false;
+let writeLockTtl = 300;
+let writeLockHeartbeatTimer = null;
+let writeLockPollTimer = null;
+let writeLockLastFreeNotified = false; // evita spam de toasts cuando se libera
+const WRITE_LOCK_HEARTBEAT_MS = 30_000;
+const WRITE_LOCK_POLL_MS = 10_000;
+
 // Staged mode state
 let stagedMode = true;
 let pendingOperations = []; // Array of { type, action, data, display }
@@ -1171,7 +1183,7 @@ async function saveRoute() {
                   `Created static route to ${network}${clusterNodesSuffix(j)}`, commands);
     } catch (e) {
       logActivity('route', 'create', `Route ${network}`, 'error', e.message);
-      if (!e.isDivergence) showToast('error', 'Error', e.message);
+      if (!e.isDivergence && !e.isLocked) showToast('error', 'Error', e.message);
       loadRoutes();
     }
   };
@@ -1263,7 +1275,7 @@ async function deleteRoute(network, target, vrf = 'default') {
                   `Deleted static route to ${network}${clusterNodesSuffix(j)}`, commands);
     } catch (e) {
       logActivity('route', 'delete', `Route ${network}${vrfLabel}`, 'error', e.message);
-      if (!e.isDivergence) showToast('error', 'Error', e.message);
+      if (!e.isDivergence && !e.isLocked) showToast('error', 'Error', e.message);
       loadRoutes();
     }
   };
@@ -1886,6 +1898,7 @@ async function saveBGPSystemAs() {
       body: JSON.stringify({ system_as: parseInt(systemAs) })
     });
     const j = await res.json();
+    checkWriteLockedResponse(res, j);
 
     if (!res.ok) throw new Error(j.error || 'Failed to set system AS');
 
@@ -1898,7 +1911,7 @@ async function saveBGPSystemAs() {
     ]);
   } catch (e) {
     logActivity('bgp', 'update', 'System AS', 'error', e.message);
-    showToast('error', 'Error', e.message);
+    if (!e.isLocked) showToast('error', 'Error', e.message);
     loadBGP();
   }
 }
@@ -2029,6 +2042,7 @@ async function saveBGPNeighbor() {
       body: JSON.stringify(neighborData)
     });
     const j = await res.json();
+    checkWriteLockedResponse(res, j);
 
     if (!res.ok) throw new Error(j.error || 'Failed to add neighbor');
 
@@ -2041,7 +2055,7 @@ async function saveBGPNeighbor() {
     ]);
   } catch (e) {
     logActivity('bgp', 'create', `Neighbor ${neighborIP}`, 'error', e.message);
-    showToast('error', 'Error', e.message);
+    if (!e.isLocked) showToast('error', 'Error', e.message);
     loadBGP();
   }
 }
@@ -2079,6 +2093,7 @@ async function deleteBGPNeighbor(neighborIP) {
       body: JSON.stringify({ neighbor: neighborIP })
     });
     const j = await res.json();
+    checkWriteLockedResponse(res, j);
 
     if (!res.ok) throw new Error(j.error || 'Failed to delete neighbor');
 
@@ -2091,7 +2106,7 @@ async function deleteBGPNeighbor(neighborIP) {
     ]);
   } catch (e) {
     logActivity('bgp', 'delete', `Neighbor ${neighborIP}`, 'error', e.message);
-    showToast('error', 'Error', e.message);
+    if (!e.isLocked) showToast('error', 'Error', e.message);
     loadBGP();
   }
 }
@@ -2164,6 +2179,7 @@ async function saveBGPNetwork() {
       body: JSON.stringify({ network })
     });
     const j = await res.json();
+    checkWriteLockedResponse(res, j);
 
     if (!res.ok) throw new Error(j.error || 'Failed to add network');
 
@@ -2176,7 +2192,7 @@ async function saveBGPNetwork() {
     ]);
   } catch (e) {
     logActivity('bgp', 'create', `Network ${network}`, 'error', e.message);
-    showToast('error', 'Error', e.message);
+    if (!e.isLocked) showToast('error', 'Error', e.message);
     loadBGP();
   }
 }
@@ -2214,6 +2230,7 @@ async function deleteBGPNetwork(network) {
       body: JSON.stringify({ network })
     });
     const j = await res.json();
+    checkWriteLockedResponse(res, j);
 
     if (!res.ok) throw new Error(j.error || 'Failed to delete network');
 
@@ -2226,7 +2243,7 @@ async function deleteBGPNetwork(network) {
     ]);
   } catch (e) {
     logActivity('bgp', 'delete', `Network ${network}`, 'error', e.message);
-    showToast('error', 'Error', e.message);
+    if (!e.isLocked) showToast('error', 'Error', e.message);
     loadBGP();
   }
 }
@@ -3099,6 +3116,8 @@ async function doFetchConfig() {
     document.getElementById('verboseDivider')?.classList.remove('hidden');
     // Aplicar visual de staged-active si por defecto está activo (es lo habitual ahora).
     if (stagedMode) document.getElementById('stagedToggle')?.classList.add('staged-active');
+    // Arrancar el polling del write-lock (visible solo tras conectar).
+    startWriteLockPolling();
     drawMenu();
     renderDashboard();
     showToast('success', 'Connected', `Successfully fetched config from ${host}`);
@@ -3864,7 +3883,7 @@ async function saveFirewallRule() {
       await reloadConfig();
       viewRuleset(ruleset);
     } catch (e) {
-      if (!e.isDivergence) showToast('error', 'Error', e.message);
+      if (!e.isDivergence && !e.isLocked) showToast('error', 'Error', e.message);
       logActivity('firewall', action, target, 'error', `Failed to ${action} firewall rule: ${e.message}`, commands);
       content.innerHTML = '';
       viewRuleset(ruleset);
@@ -3927,7 +3946,7 @@ async function deleteFirewallRule(rulesetName, ruleId) {
       await reloadConfig();
       viewRuleset(rulesetName);
     } catch (e) {
-      if (!e.isDivergence) showToast('error', 'Error', e.message);
+      if (!e.isDivergence && !e.isLocked) showToast('error', 'Error', e.message);
       logActivity('firewall', 'delete', target, 'error', `Failed to delete firewall rule: ${e.message}`, commands);
       viewRuleset(rulesetName);
     }
@@ -4151,7 +4170,7 @@ async function saveNatRule() {
       }
       loadNat();
     } catch (e) {
-      if (!e.isDivergence) showToast('error', 'Error', e.message);
+      if (!e.isDivergence && !e.isLocked) showToast('error', 'Error', e.message);
       logActivity('nat', action, target, 'error', `Failed to ${action} NAT rule: ${e.message}`, commands);
       loadNat();
     } finally {
@@ -4218,7 +4237,7 @@ async function deleteNatRule(natType, ruleId) {
       }
       loadNat();
     } catch (e) {
-      if (!e.isDivergence) showToast('error', 'Error', e.message);
+      if (!e.isDivergence && !e.isLocked) showToast('error', 'Error', e.message);
       logActivity('nat', 'delete', target, 'error', `Failed to delete NAT rule: ${e.message}`, commands);
       loadNat();
     }
@@ -4255,6 +4274,7 @@ async function saveConfigToRouter() {
       body: JSON.stringify(body)
     });
     const j = await res.json();
+    checkWriteLockedResponse(res, j);
     if (!res.ok) throw new Error(j.error || `HTTP ${res.status}`);
 
     const where = (j.nodes && j.nodes.length === 2) ? ' on both nodes' : '';
@@ -4264,7 +4284,7 @@ async function saveConfigToRouter() {
     logActivity('config', 'save', 'Router config', 'success',
                 `Configuration saved to router (config.boot)${where ? ' [→ primary + peer]' : ''}`);
   } catch (e) {
-    showToast('error', 'Error', e.message);
+    if (!e.isLocked) showToast('error', 'Error', e.message);
     logActivity('config', 'save', 'Router config', 'error', `Failed to save config: ${e.message}`);
   } finally {
     // Restore content
@@ -4612,7 +4632,7 @@ async function executeAllPending() {
     await reloadCurrentView();
 
   } catch (e) {
-    if (!e.isDivergence) showToast('error', 'Error', e.message);
+    if (!e.isDivergence && !e.isLocked) showToast('error', 'Error', e.message);
     logActivity('config', 'update', `Batch: ${count} operations`, 'error', `Failed to apply batch changes: ${e.message}`, allCommands);
     // Keep pending operations on error for retry
     await reloadCurrentView();
@@ -5454,7 +5474,7 @@ async function executeGroupSave(groupData, mode, commands) {
 
     renderGroups();
   } catch (e) {
-    if (!e.isDivergence) showToast('error', 'Error', e.message);
+    if (!e.isDivergence && !e.isLocked) showToast('error', 'Error', e.message);
     logActivity('group', mode === 'create' ? 'create' : 'update',
       `${groupData.group_type}-group: ${groupData.group_name}`,
       'error', `Failed: ${e.message}`, commands);
@@ -5538,7 +5558,7 @@ async function executeGroupDelete(groupType, groupName, commands) {
 
     renderGroups();
   } catch (e) {
-    if (!e.isDivergence) showToast('error', 'Error', e.message);
+    if (!e.isDivergence && !e.isLocked) showToast('error', 'Error', e.message);
     logActivity('group', 'delete', `${groupType}-group: ${groupName}`,
       'error', `Failed: ${e.message}`, commands);
     renderGroups();
@@ -6245,6 +6265,14 @@ async function clusterApplyFetch(url, method, bodyObj) {
   let data = null;
   try { data = await res.json(); } catch {}
 
+  if (res.status === 423 && data?.lock !== undefined) {
+    handleWriteLockedResponse(data);
+    const err = new Error(data.lock
+      ? `Bloqueado por ${data.lock.user}`
+      : 'Necesitas adquirir el lock de escritura');
+    err.isLocked = true;
+    throw err;
+  }
   if (res.status === 409 && data?.differences) {
     lastClusterDiffs = data.differences;
     updateClusterBadge('diverged');
@@ -6273,6 +6301,233 @@ function clusterNodesSuffix(responseData) {
   if (Array.isArray(applied) && applied.length === 1) return ' [→ primary]';
   return '';
 }
+
+// =========================================
+// WRITE-LOCK (single-writer coordination)
+// =========================================
+
+function fmtLockAge(state) {
+  if (!state || !state.acquired_at) return '';
+  const sec = Math.max(0, Math.round(Date.now() / 1000 - state.acquired_at));
+  if (sec < 60) return `hace ${sec}s`;
+  const m = Math.floor(sec / 60);
+  return `hace ${m} min`;
+}
+
+function fmtLockIdle(state) {
+  if (!state || !state.last_seen) return '';
+  return Math.max(0, Math.round(Date.now() / 1000 - state.last_seen));
+}
+
+function updateWriteLockBadge() {
+  const badge = document.getElementById('writeLockBadge');
+  const text = document.getElementById('writeLockText');
+  if (!badge || !text) return;
+
+  badge.classList.remove('lock-free', 'lock-mine', 'lock-other', 'lock-stale');
+
+  if (writeLockIsMine) {
+    badge.classList.add('lock-mine');
+    text.textContent = `Tienes el lock`;
+    badge.title = `Lock adquirido ${fmtLockAge(writeLockState)}. Click para liberar.`;
+    badge.onclick = () => releaseWriteLock();
+  } else if (writeLockState) {
+    const idle = fmtLockIdle(writeLockState);
+    const stale = idle > writeLockTtl * 0.8;
+    badge.classList.add(stale ? 'lock-stale' : 'lock-other');
+    text.textContent = `${writeLockState.user}`;
+    badge.title = stale
+      ? `Lock por ${writeLockState.user} (inactivo ${idle}s, expira pronto). Click para forzar.`
+      : `Lock en uso por ${writeLockState.user}. Click para intentar adquirir.`;
+    badge.onclick = () => promptAcquireOrForceLock(stale);
+  } else {
+    badge.classList.add('lock-free');
+    text.textContent = 'Adquirir lock';
+    badge.title = 'Nadie tiene el lock. Click para adquirir y entrar en modo escritura.';
+    badge.onclick = () => acquireWriteLock(false);
+  }
+}
+
+async function refreshWriteLockState() {
+  try {
+    const res = await fetch('/api/lock');
+    if (!res.ok) return;
+    const j = await res.json();
+    const wasMine = writeLockIsMine;
+    const wasFree = writeLockState === null && !writeLockIsMine;
+    writeLockMe = j.me || writeLockMe;
+    writeLockTtl = j.ttl || writeLockTtl;
+    writeLockState = j.lock;
+    writeLockIsMine = !!(j.lock && j.lock.user === j.me);
+
+    if (wasMine && !writeLockIsMine) {
+      handleWriteLockLost();
+    }
+
+    // Notificar una sola vez cuando el lock pasa a libre
+    if (j.lock === null && !wasFree && !writeLockLastFreeNotified) {
+      writeLockLastFreeNotified = true;
+      showToast('info', 'Lock liberado',
+        'El lock de escritura ahora está libre, puedes adquirirlo.');
+    }
+    if (j.lock !== null) writeLockLastFreeNotified = false;
+
+    updateWriteLockBadge();
+  } catch (e) {
+    console.error('lock poll failed', e);
+  }
+}
+
+async function acquireWriteLock(force) {
+  try {
+    const res = await fetch('/api/lock', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force: !!force })
+    });
+    const j = await res.json();
+    if (!res.ok) {
+      if (res.status === 409) {
+        showToast('warning', 'Bloqueado',
+          `${j.lock?.user || 'otro usuario'} tiene el lock. Espera o fuérzalo.`);
+      } else {
+        showToast('error', 'Error', j.error || 'No se pudo adquirir el lock');
+      }
+      writeLockState = j.lock || null;
+      writeLockIsMine = false;
+      updateWriteLockBadge();
+      return false;
+    }
+    writeLockState = j.lock;
+    writeLockMe = j.me || writeLockMe;
+    writeLockIsMine = true;
+    startWriteLockHeartbeat();
+    updateWriteLockBadge();
+    if (j.forced_from) {
+      showToast('success', 'Lock forzado',
+        `Lock tomado de ${j.forced_from} (estaba inactivo).`);
+    } else {
+      showToast('success', 'Modo escritura',
+        'Has adquirido el lock; los demás solo podrán leer.');
+    }
+    return true;
+  } catch (e) {
+    showToast('error', 'Error', e.message);
+    return false;
+  }
+}
+
+async function promptAcquireOrForceLock(allowForce) {
+  const owner = writeLockState?.user || 'otro usuario';
+  const idle = fmtLockIdle(writeLockState);
+  if (allowForce) {
+    const confirmed = await openConfirmModal(
+      'Forzar lock',
+      `${owner} lleva inactivo ${idle}s. ¿Quitarle el lock y tomarlo?`
+    );
+    if (confirmed) await acquireWriteLock(true);
+    return;
+  }
+  showToast('warning', 'Bloqueado',
+    `${owner} tiene el lock. Aparecerá la opción de forzar cuando esté inactivo.`);
+}
+
+async function releaseWriteLock() {
+  try {
+    await fetch('/api/lock', { method: 'DELETE' });
+  } catch {}
+  writeLockState = null;
+  writeLockIsMine = false;
+  stopWriteLockHeartbeat();
+  updateWriteLockBadge();
+  showToast('info', 'Lock liberado', 'Ya no estás en modo escritura.');
+}
+
+function startWriteLockHeartbeat() {
+  stopWriteLockHeartbeat();
+  writeLockHeartbeatTimer = setInterval(async () => {
+    try {
+      const res = await fetch('/api/lock/heartbeat', { method: 'POST' });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        writeLockState = j.lock || null;
+        handleWriteLockLost();
+      }
+    } catch {}
+  }, WRITE_LOCK_HEARTBEAT_MS);
+}
+
+function stopWriteLockHeartbeat() {
+  if (writeLockHeartbeatTimer) clearInterval(writeLockHeartbeatTimer);
+  writeLockHeartbeatTimer = null;
+}
+
+function startWriteLockPolling() {
+  if (writeLockPollTimer) clearInterval(writeLockPollTimer);
+  writeLockPollTimer = setInterval(refreshWriteLockState, WRITE_LOCK_POLL_MS);
+  refreshWriteLockState();
+  document.getElementById('writeLockBadge')?.classList.remove('hidden');
+}
+
+function handleWriteLockLost() {
+  const hadIt = writeLockIsMine;
+  writeLockIsMine = false;
+  stopWriteLockHeartbeat();
+  if (hadIt) {
+    if (typeof pendingOperations !== 'undefined' && pendingOperations.length > 0) {
+      pendingOperations = [];
+      pendingRuleMarkers.clear();
+      originalServerStates.clear();
+      if (typeof updatePendingIndicator === 'function') updatePendingIndicator();
+      showToast('warning', 'Lock perdido',
+        'Se descartaron los cambios pendientes (otro usuario tomó el lock o expiró por inactividad).');
+    } else {
+      showToast('warning', 'Lock perdido',
+        'El lock expiró por inactividad o lo tomó otro usuario.');
+    }
+  }
+  updateWriteLockBadge();
+}
+
+// Comprueba una respuesta de escritura: si devolvió 423 (lock no adquirido),
+// gestiona el toast/badge y lanza un error con e.isLocked = true para que el
+// caller pueda silenciar su propio toast genérico.
+function checkWriteLockedResponse(res, data) {
+  if (res.status === 423 && data && data.lock !== undefined) {
+    handleWriteLockedResponse(data);
+    const err = new Error(data.lock
+      ? `Bloqueado por ${data.lock.user}`
+      : 'Necesitas adquirir el lock de escritura');
+    err.isLocked = true;
+    throw err;
+  }
+}
+
+function handleWriteLockedResponse(data) {
+  // El backend nos dijo que no tenemos el lock al intentar escribir.
+  writeLockState = data.lock || null;
+  writeLockIsMine = false;
+  stopWriteLockHeartbeat();
+  updateWriteLockBadge();
+  if (data.lock) {
+    showToast('warning', 'Bloqueado',
+      `${data.lock.user} tiene el lock. Pulsa el badge para intentar adquirirlo.`);
+  } else {
+    // Lock libre pero no lo teníamos: ofrecer adquirirlo
+    showToast('warning', 'Sin lock',
+      'No tienes el lock de escritura. Pulsa el badge para adquirirlo.');
+  }
+}
+
+// Liberar el lock cuando el usuario cierra la pestaña (best-effort vía sendBeacon)
+window.addEventListener('beforeunload', () => {
+  if (writeLockIsMine) {
+    try {
+      navigator.sendBeacon('/api/lock', new Blob([], { type: 'application/json' }));
+    } catch {}
+    // sendBeacon no soporta DELETE; el TTL acaba liberándolo en cualquier caso.
+  }
+});
 
 // =========================================
 // INITIALIZATION
