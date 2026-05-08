@@ -30,14 +30,24 @@ HA cluster operations from a single place.
 - **Automatic cluster detection** at connect time using the naming convention `*-01` / `*-02` plus the presence of VRRP groups.
 - **Automatic peer connection** reusing the primary's API key; a fallback modal prompts for host / port / api-key if auto-connect fails.
 - **Sync-check**: normalised deep comparison of firewall rules, firewall groups, NAT rules, and static routes (default + VRFs) between the two nodes.
-- **Dual-apply**: every write goes to both nodes atomically after a pre-flight sync-check. If the peer fails mid-apply, a best-effort rollback is attempted on the primary.
+- **Dual-apply (parallel)**: writes go to primary and peer concurrently via a `ThreadPoolExecutor`, roughly halving wall time on large configs (1-2 min commits). Pre-flight sync-check still runs first. Four outcomes handled: both ok / primary only / peer only / both fail; partial successes trigger a rollback of the side that succeeded.
+- **In-memory cache update**: after a successful apply the cached primary/peer config is patched in place from the ops list instead of refetching the full config (1-3 s saved per write on big configs). Falls back to a real fetch when the heuristic cannot apply the op safely.
 - **Divergence modal** with per-section diffs, opened automatically when a dual-apply is blocked.
 - **Cluster Sync toggle** in the header to temporarily disable dual-apply during single-node interventions. Writes go only to the primary, no pre-flight, and the HA badge shows a `SOLO` indicator.
 
-### Workflow helpers
+### Multi-user
+- **Per-user sessions**: each logged-in user keeps their own router connection, config snapshot, and cluster context. Two operators can work on different routers/clusters concurrently without stepping on each other.
+- **Write lock per cluster**: only one writer at a time per cluster. A user with the lock can apply changes; everyone else sees a read-only banner. Locks are independent across clusters, so two users on different clusters never block each other.
+- **Lock badge** in the header shows `Lock acquired @ <cluster>` (you), `Locked by <user> @ <cluster>` (someone else), or `Unlocked @ <cluster>` (free).
+- **Idle-based force-take**: after 4 minutes of inactivity the badge offers a "force lock" button with confirm.
+- **Pre-action gating**: opening any write modal (firewall rule, NAT rule, group, route, BGP) without holding the lock prompts you to acquire it instead of letting you fill the form for nothing.
+- **Auto-release**: the lock is released on logout, on TTL expiry (5 min idle), and when the user reconnects to a different cluster.
+
+### Audit & Workflow helpers
+- **Persistent audit log**: every login, connect, lock acquire/release/force, write operation and config save is appended to `logs/audit.jsonl` with user, timestamp, target, status, cluster_id, applied nodes, and the exact VyOS commands. Rotates at 5 MB × 10 files.
+- **Audit log viewer** under the "Activity" section in the side menu: filter by user, action prefix, or text search. Anyone logged in can read the full history; events are append-only (no clear-from-UI).
 - **Staged mode**: queue multiple changes locally, apply them in a single batch; visual markers (MOD / DEL badges) show pending changes per rule.
 - **Verbose mode**: preview the VyOS commands that will be executed before applying.
-- **Activity log**: every action in the session is logged with timestamp, status, and the exact VyOS commands; dual-apply entries are suffixed with `[→ primary + peer]`.
 - **Multiple themes**: light, dark, and retro.
 
 ## Requirements
@@ -127,11 +137,22 @@ set service https vrf mgmt
 |--------|----------|-------------|
 | POST   | `/fetch-config`                   | Connect to a VyOS router (primary) |
 | POST   | `/fetch-peer`                     | Connect to the cluster peer (optional `host`, `port`, `api_key`) |
-| GET    | `/api/connection-status`          | Connection + cluster state |
-| GET    | `/api/cluster/status`             | Cluster info |
+| GET    | `/api/connection-status`          | Connection + cluster state for the current user |
+| GET    | `/api/cluster/status`             | Cluster info for the current user |
 | GET    | `/api/cluster/sync-check`         | Compare primary vs peer; returns diffs |
 | POST   | `/api/cluster/disconnect-peer`    | Drop the peer connection (single-node mode) |
 | POST   | `/upload`                         | Load a VyOS JSON config from file |
+
+### Lock & audit
+| Method       | Endpoint | Description |
+|--------------|----------|-------------|
+| GET          | `/api/lock`                  | Current lock state for the user's active cluster |
+| POST         | `/api/lock`                  | Acquire the lock (`{"force": true}` to take it from an idle holder) |
+| POST         | `/api/lock/heartbeat`        | Refresh the holder's `last_seen` (frontend pings every 30 s) |
+| DELETE       | `/api/lock`                  | Release the lock |
+| GET          | `/api/audit`                 | Audit events with filters: `user`, `action` prefix, `since`, `q`, `limit` |
+| GET          | `/api/audit/users`           | Distinct usernames seen in the audit log |
+| GET          | `/api/audit/actions`         | Distinct action names seen in the audit log |
 
 ### Read
 | Method | Endpoint | Description |
@@ -169,12 +190,19 @@ set service https vrf mgmt
 
 ```
 vyos-config-api/
-├── app.py              # Flask backend: endpoints, cluster logic, sync comparator
+├── app.py              # Flask backend: endpoints, sessions, cluster logic, write lock
 ├── vyos_api.py         # VyOS REST API client (retrieve, configure, save)
+├── auth.py             # LDAP authentication
+├── audit_log.py        # Persistent audit log (JSONL with rotation)
 ├── requirements.txt    # Python dependencies
 ├── CLAUDE.md           # Developer notes / project state
+├── config/
+│   └── infra.yaml      # LDAP + VyOS defaults (gitignored)
+├── logs/
+│   └── audit.jsonl     # Audit events (gitignored, rotated at 5 MB × 10)
 ├── templates/
-│   └── index.html      # UI shell
+│   ├── index.html      # UI shell
+│   └── login.html      # Login form
 └── static/
     ├── app.js          # Frontend logic
     ├── style.css       # Main styles
@@ -191,12 +219,18 @@ vyos-config-api/
 - Dual-apply uses best-effort rollback on peer failure: if the peer
   apply fails, the app tries to reverse the primary operation with
   inverse `set`→`delete` operations. True two-phase commit isn't possible
-  with the REST API; review the activity log if a rollback is reported
+  with the REST API; review the audit log if a rollback is reported
   as failed.
 - There is a small race window between the pre-flight sync-check and the
   apply. A concurrent operator editing the peer in that gap can cause
   drift. If this matters, coordinate changes or use the Cluster Sync
   toggle for explicit single-node interventions.
+- The write lock is in-memory per backend process and resets on restart.
+  All locks are released on graceful logout; orphaned locks (browser
+  closed) auto-expire after 5 minutes of inactivity.
+- The audit log is local to the backend host. For long-term retention
+  copy `logs/audit.jsonl*` off the box periodically; the rotation policy
+  keeps roughly 50 MB before the oldest entries are dropped.
 
 ## License
 

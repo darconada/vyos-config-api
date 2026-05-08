@@ -83,12 +83,13 @@ let lastClusterDiffs = [];
 // When false, writes target only primary (no pre-flight) — use during single-node interventions.
 let dualApplyEnabled = true;
 
-// Write-lock state (single writer at a time across all logged-in users)
-// Shape: { user, acquired_at, last_seen } | null
+// Write-lock state (single writer at a time per cluster).
+// Shape del backend: { user, acquired_at, last_seen } | null
 let writeLockState = null;
 let writeLockMe = null;
 let writeLockIsMine = false;
 let writeLockTtl = 300;
+let writeLockClusterId = null;  // cluster al que apunta el lock que vemos
 let writeLockHeartbeatTimer = null;
 let writeLockPollTimer = null;
 let writeLockLastFreeNotified = false; // evita spam de toasts cuando se libera
@@ -539,39 +540,33 @@ function clearNatFilters(title) {
 // =========================================
 let activityLogIdCounter = 0;
 
-// Add entry to activity log
-function logActivity(type, action, target, status, message, commands = []) {
-  const entry = {
-    id: ++activityLogIdCounter,
-    timestamp: new Date(),
-    type,      // 'firewall', 'nat', 'config', 'connection'
-    action,    // 'create', 'update', 'delete', 'save', 'connect', 'staged', 'revert'
-    target,    // e.g., 'Rule 20 in LAN-IN', 'Destination NAT rule 100'
-    status,    // 'success', 'error', 'staged', 'reverted'
-    message,   // Human-readable message
-    commands   // Array of VyOS commands (for expandable view)
-  };
-  activityLog.unshift(entry); // Add to beginning (newest first)
-
-  // Keep max 500 entries
-  if (activityLog.length > 500) {
-    activityLog.pop();
-  }
-
-  // If currently viewing Activity section, refresh
-  if (currentSection === 'Activity') {
-    renderActivityLog();
+// logActivity es ahora un no-op: el backend escribe el audit log persistente
+// automáticamente desde @after_request, así que el frontend ya no necesita
+// mantener una copia en sesión. Se conserva la firma para no romper llamadas.
+function logActivity(_type, _action, _target, _status, _message, _commands = []) {
+  // Si el usuario está viendo Audit log, el polling/refresh ya lo trae del backend.
+  if (currentSection === 'Activity' && typeof refreshAuditLog === 'function') {
+    refreshAuditLog();
   }
 }
 
-// Format timestamp for display
-function formatLogTimestamp(date) {
-  return date.toLocaleTimeString('en-US', {
-    hour12: false,
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit'
+// Format timestamp (acepta ISO string del backend o Date local).
+function formatLogTimestamp(value) {
+  const d = value instanceof Date ? value : new Date(value);
+  if (isNaN(d.getTime())) return String(value || '');
+  // Si es del mismo día mostramos solo hora; si no, fecha + hora.
+  const today = new Date();
+  const sameDay = d.getFullYear() === today.getFullYear()
+    && d.getMonth() === today.getMonth()
+    && d.getDate() === today.getDate();
+  const time = d.toLocaleTimeString('en-GB', {
+    hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit'
   });
+  if (sameDay) return time;
+  const date = d.toLocaleDateString('en-GB', {
+    year: 'numeric', month: '2-digit', day: '2-digit'
+  });
+  return `${date} ${time}`;
 }
 
 // Get status badge class
@@ -607,77 +602,182 @@ function getActionIcon(action) {
   }
 }
 
-// Render activity log view
-function renderActivityLog() {
-  if (activityLog.length === 0) {
-    content.innerHTML = `
-      <div class="empty-state">
-        <div class="empty-state-icon">
-          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-            <polyline points="14 2 14 8 20 8"/>
-            <line x1="16" y1="13" x2="8" y2="13"/>
-            <line x1="16" y1="17" x2="8" y2="17"/>
-          </svg>
-        </div>
-        <h3 class="empty-state-title">No Activity Yet</h3>
-        <p class="empty-state-text">Operations performed during this session will appear here.</p>
-      </div>
-    `;
-    return;
+// =========================================
+// AUDIT LOG (backend-persisted, shared)
+// =========================================
+const auditFilters = { user: '', action: '', q: '', limit: 200 };
+let auditEntries = [];
+let auditUsersCache = [];
+let auditActionsCache = [];
+
+function actionTypeBadge(action) {
+  // El primer segmento del action ('firewall.create' → 'firewall') determina el "tipo"
+  const first = (action || '').split('.')[0] || 'system';
+  return first;
+}
+
+function actionVerb(action) {
+  // Para getActionIcon: usamos el ÚLTIMO segmento (create/update/delete/save/...).
+  const parts = (action || '').split('.');
+  return parts[parts.length - 1] || 'unknown';
+}
+
+function buildAuditQueryString() {
+  const p = new URLSearchParams();
+  if (auditFilters.user) p.set('user', auditFilters.user);
+  if (auditFilters.action) p.set('action', auditFilters.action);
+  if (auditFilters.q) p.set('q', auditFilters.q);
+  if (auditFilters.limit) p.set('limit', auditFilters.limit);
+  return p.toString();
+}
+
+async function refreshAuditLog() {
+  try {
+    const qs = buildAuditQueryString();
+    const res = await fetch('/api/audit' + (qs ? '?' + qs : ''));
+    if (!res.ok) return;
+    const j = await res.json();
+    auditEntries = j.entries || [];
+    renderAuditEntries();
+  } catch (e) {
+    console.error('audit refresh failed', e);
   }
+}
 
-  const logHtml = activityLog.map(entry => {
-    const hasCommands = entry.commands && entry.commands.length > 0;
-    const commandsHtml = hasCommands ? `
-      <div class="log-commands-toggle" onclick="toggleLogCommands(${entry.id})">
-        <svg class="toggle-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <polyline points="9 18 15 12 9 6"/>
-        </svg>
-        <span>${entry.commands.length} command${entry.commands.length > 1 ? 's' : ''}</span>
-      </div>
-      <div class="log-commands hidden" id="logCommands-${entry.id}">
-        <pre class="log-commands-pre">${entry.commands.map(c => escapeHtml(c.cmd || c)).join('\n')}</pre>
-      </div>
-    ` : '';
+async function loadAuditLog() {
+  // Trae entradas + usuarios + actions disponibles (en paralelo).
+  try {
+    const [entriesRes, usersRes, actionsRes] = await Promise.all([
+      fetch('/api/audit?' + buildAuditQueryString()),
+      fetch('/api/audit/users'),
+      fetch('/api/audit/actions'),
+    ]);
+    if (entriesRes.ok) auditEntries = (await entriesRes.json()).entries || [];
+    if (usersRes.ok) auditUsersCache = (await usersRes.json()).users || [];
+    if (actionsRes.ok) auditActionsCache = (await actionsRes.json()).actions || [];
+  } catch (e) {
+    console.error('audit load failed', e);
+  }
+  renderAuditLog();
+}
 
-    return `
-      <div class="log-entry log-entry-${entry.status}">
-        <div class="log-entry-header">
-          <span class="log-time">${formatLogTimestamp(entry.timestamp)}</span>
-          <span class="log-action-icon" title="${entry.action}">${getActionIcon(entry.action)}</span>
-          <span class="log-type badge badge-outline">${entry.type}</span>
-          <span class="log-target">${escapeHtml(entry.target)}</span>
-          <span class="log-status badge ${getStatusBadgeClass(entry.status)}">${entry.status}</span>
-        </div>
-        <div class="log-entry-body">
-          <span class="log-message">${escapeHtml(entry.message)}</span>
-          ${commandsHtml}
-        </div>
-      </div>
-    `;
-  }).join('');
+// Render the full audit log section: filters bar + entries.
+function renderAuditLog() {
+  const userOpts = ['<option value="">All users</option>']
+    .concat(auditUsersCache.map(u =>
+      `<option value="${escapeHtml(u)}" ${auditFilters.user === u ? 'selected' : ''}>${escapeHtml(u)}</option>`))
+    .join('');
+  const actionOpts = ['<option value="">All actions</option>']
+    .concat(auditActionsCache.map(a =>
+      `<option value="${escapeHtml(a)}" ${auditFilters.action === a ? 'selected' : ''}>${escapeHtml(a)}</option>`))
+    .join('');
 
   content.innerHTML = `
     <div class="activity-log-container">
       <div class="activity-log-header">
-        <h2>Activity Log</h2>
+        <h2>Audit log</h2>
         <div class="activity-log-actions">
-          <span class="log-count">${activityLog.length} entries</span>
-          <button class="btn btn-secondary btn-sm" onclick="clearActivityLog()" title="Clear log">
+          <span class="log-count" id="auditCount">${auditEntries.length} entries</span>
+          <button class="btn btn-secondary btn-sm" onclick="refreshAuditLog()" title="Refresh">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <polyline points="3 6 5 6 21 6"/>
-              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+              <polyline points="23 4 23 10 17 10"/>
+              <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
             </svg>
-            Clear
+            Refresh
           </button>
         </div>
       </div>
-      <div class="activity-log-entries">
-        ${logHtml}
+      <div class="audit-filters">
+        <select id="auditFilterUser" class="form-control form-control-sm">${userOpts}</select>
+        <select id="auditFilterAction" class="form-control form-control-sm">${actionOpts}</select>
+        <input type="text" id="auditFilterQ" class="form-control form-control-sm"
+               placeholder="Search target / details" value="${escapeHtml(auditFilters.q)}">
+        <select id="auditFilterLimit" class="form-control form-control-sm">
+          ${[100, 200, 500, 1000, 2000].map(n =>
+            `<option value="${n}" ${auditFilters.limit === n ? 'selected' : ''}>Last ${n}</option>`).join('')}
+        </select>
       </div>
+      <div class="activity-log-entries" id="auditEntries"></div>
     </div>
   `;
+
+  // Filtros: cualquier cambio dispara refresh.
+  document.getElementById('auditFilterUser').onchange = (e) => {
+    auditFilters.user = e.target.value;
+    refreshAuditLog();
+  };
+  document.getElementById('auditFilterAction').onchange = (e) => {
+    auditFilters.action = e.target.value;
+    refreshAuditLog();
+  };
+  document.getElementById('auditFilterLimit').onchange = (e) => {
+    auditFilters.limit = parseInt(e.target.value, 10) || 200;
+    refreshAuditLog();
+  };
+  let qDebounce = null;
+  document.getElementById('auditFilterQ').oninput = (e) => {
+    auditFilters.q = e.target.value.trim();
+    clearTimeout(qDebounce);
+    qDebounce = setTimeout(refreshAuditLog, 250);
+  };
+
+  renderAuditEntries();
+}
+
+function renderAuditEntries() {
+  const container = document.getElementById('auditEntries');
+  const counter = document.getElementById('auditCount');
+  if (counter) counter.textContent = `${auditEntries.length} entries`;
+  if (!container) return;
+
+  if (!auditEntries.length) {
+    container.innerHTML = `
+      <div class="empty-state">
+        <h3 class="empty-state-title">No events match the filters</h3>
+        <p class="empty-state-text">Try clearing or relaxing the filters.</p>
+      </div>`;
+    return;
+  }
+
+  container.innerHTML = auditEntries.map((entry, idx) => {
+    const cmds = entry.commands || [];
+    const id = `audit-${idx}`;
+    const cmdsHtml = cmds.length ? `
+      <div class="log-commands-toggle" onclick="toggleLogCommands('${id}')">
+        <svg class="toggle-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="9 18 15 12 9 6"/>
+        </svg>
+        <span>${cmds.length} command${cmds.length > 1 ? 's' : ''}</span>
+      </div>
+      <div class="log-commands hidden" id="logCommands-${id}">
+        <pre class="log-commands-pre">${cmds.map(c => escapeHtml(c.cmd || c)).join('\n')}</pre>
+      </div>` : '';
+    const nodes = (entry.nodes || []).join(', ');
+    const nodesBadge = nodes ? `<span class="log-nodes badge badge-outline" title="Applied to">${escapeHtml(nodes)}</span>` : '';
+    const details = entry.details ? `<span class="log-message">${escapeHtml(entry.details)}</span>` : '';
+    const statusKey = entry.status === 'ok' ? 'success' : entry.status;
+    return `
+      <div class="log-entry log-entry-${statusKey}">
+        <div class="log-entry-header">
+          <span class="log-time">${formatLogTimestamp(entry.ts)}</span>
+          <span class="log-action-icon" title="${escapeHtml(entry.action)}">${getActionIcon(actionVerb(entry.action))}</span>
+          <span class="log-user badge badge-outline" title="User">${escapeHtml(entry.user || 'anonymous')}</span>
+          <span class="log-type badge badge-outline">${escapeHtml(actionTypeBadge(entry.action))}</span>
+          <span class="log-target">${escapeHtml(entry.target || '')}</span>
+          ${nodesBadge}
+          <span class="log-status badge ${getStatusBadgeClass(statusKey)}">${escapeHtml(entry.status)}</span>
+        </div>
+        <div class="log-entry-body">
+          ${details}
+          ${cmdsHtml}
+        </div>
+      </div>`;
+  }).join('');
+}
+
+// Mantengo el nombre antiguo para no tocar el menu/loadSection.
+function renderActivityLog() {
+  return loadAuditLog();
 }
 
 // Toggle commands visibility in log entry
@@ -687,16 +787,6 @@ function toggleLogCommands(id) {
   if (commandsDiv) {
     commandsDiv.classList.toggle('hidden');
     toggleDiv?.classList.toggle('expanded');
-  }
-}
-
-// Clear activity log
-async function clearActivityLog() {
-  const confirmed = await openConfirmModal('Clear Activity Log?', 'This will remove all log entries from this session.');
-  if (confirmed) {
-    activityLog = [];
-    renderActivityLog();
-    showToast('info', 'Cleared', 'Activity log cleared');
   }
 }
 
@@ -1070,6 +1160,7 @@ function getRoutePendingStatus(network, target) {
 
 // Open route creation modal
 async function openRouteModal(mode) {
+  if (!await ensureWriteLock('manage a static route')) return;
   const modal = document.getElementById('routeModal');
   if (!modal) {
     // Create modal dynamically
@@ -1227,6 +1318,7 @@ function buildRouteCommands(routeData) {
 }
 
 async function deleteRoute(network, target, vrf = 'default') {
+  if (!await ensureWriteLock(`delete route ${network}`)) return;
   const vrfLabel = vrf !== 'default' ? ` (VRF: ${vrf})` : '';
   const confirmed = await openConfirmModal(
     'Delete Static Route?',
@@ -1848,7 +1940,8 @@ function getBGPPendingStatus(type, id) {
 }
 
 // BGP Modals
-function openBGPSystemAsModal() {
+async function openBGPSystemAsModal() {
+  if (!await ensureWriteLock('configure the BGP system AS')) return;
   const existingModal = document.getElementById('bgpSystemAsModal');
   if (existingModal) existingModal.remove();
 
@@ -1916,7 +2009,8 @@ async function saveBGPSystemAs() {
   }
 }
 
-function openBGPNeighborModal(mode) {
+async function openBGPNeighborModal(mode) {
+  if (!await ensureWriteLock(mode === 'edit' ? 'edit a BGP neighbor' : 'add a BGP neighbor')) return;
   const existingModal = document.getElementById('bgpNeighborModal');
   if (existingModal) existingModal.remove();
 
@@ -2061,6 +2155,7 @@ async function saveBGPNeighbor() {
 }
 
 async function deleteBGPNeighbor(neighborIP) {
+  if (!await ensureWriteLock(`delete BGP neighbor ${neighborIP}`)) return;
   const confirmed = await openConfirmModal(
     'Delete BGP Neighbor?',
     `Are you sure you want to delete neighbor ${neighborIP}?`
@@ -2111,7 +2206,8 @@ async function deleteBGPNeighbor(neighborIP) {
   }
 }
 
-function openBGPNetworkModal(mode) {
+async function openBGPNetworkModal(mode) {
+  if (!await ensureWriteLock('add a BGP network')) return;
   const existingModal = document.getElementById('bgpNetworkModal');
   if (existingModal) existingModal.remove();
 
@@ -2198,6 +2294,7 @@ async function saveBGPNetwork() {
 }
 
 async function deleteBGPNetwork(network) {
+  if (!await ensureWriteLock(`delete BGP network ${network}`)) return;
   const confirmed = await openConfirmModal(
     'Delete BGP Network?',
     `Are you sure you want to stop advertising ${network}?`
@@ -3052,6 +3149,11 @@ async function openFetchModal() {
 }
 
 async function doFetchConfig() {
+  // Guard anti doble-submit (Enter teclado dos veces, click rápido, etc.).
+  // El click ya respeta btn.disabled, pero el Enter en los inputs lo saltaba.
+  const guardBtn = document.getElementById('doFetch');
+  if (guardBtn?.disabled) return;
+
   const host = document.getElementById('fw_host').value.trim();
   const port = parseInt(document.getElementById('fw_port').value, 10) || 8443;
   const apiKey = document.getElementById('fw_api_key').value;
@@ -3670,7 +3772,8 @@ function toggleJumpTarget() {
   }
 }
 
-function openFirewallRuleModal(mode = 'create', rulesetName = null, ruleId = null) {
+async function openFirewallRuleModal(mode = 'create', rulesetName = null, ruleId = null) {
+  if (!await ensureWriteLock(mode === 'edit' ? 'edit a firewall rule' : 'create a firewall rule')) return;
   if (!isConnected) {
     showToast('warning', 'Not Connected', 'Connect to the router first');
     return;
@@ -3913,6 +4016,7 @@ async function deleteFirewallRule(rulesetName, ruleId) {
     showToast('warning', 'Not Connected', 'Connect to the router first');
     return;
   }
+  if (!await ensureWriteLock(`delete rule ${ruleId}`)) return;
 
   const confirmed = await openConfirmModal('Delete Rule?', `Are you sure you want to delete rule ${ruleId} from ${rulesetName}?`);
   if (!confirmed) return;
@@ -3977,7 +4081,8 @@ function toggleNatExclude() {
   }
 }
 
-function openNatRuleModal(mode = 'create', natType = 'destination', ruleId = null) {
+async function openNatRuleModal(mode = 'create', natType = 'destination', ruleId = null) {
+  if (!await ensureWriteLock(mode === 'edit' ? 'edit a NAT rule' : 'create a NAT rule')) return;
   if (!isConnected) {
     showToast('warning', 'Not Connected', 'Connect to the router first');
     return;
@@ -4199,6 +4304,7 @@ async function deleteNatRule(natType, ruleId) {
     showToast('warning', 'Not Connected', 'Connect to the router first');
     return;
   }
+  if (!await ensureWriteLock(`delete NAT rule ${ruleId}`)) return;
 
   const confirmed = await openConfirmModal('Delete NAT Rule?', `Are you sure you want to delete NAT rule ${ruleId} (${natType})?`);
   if (!confirmed) return;
@@ -4256,6 +4362,7 @@ async function deleteNatRule(natType, ruleId) {
 // SAVE CONFIG TO ROUTER
 // =========================================
 async function saveConfigToRouter() {
+  if (!await ensureWriteLock('save the running config to disk')) return;
   const dual = shouldDualApply();
   const clusterHint = isInCluster()
     ? (dual ? ' La configuración se guardará en ambos nodos del cluster.'
@@ -4591,6 +4698,7 @@ async function applyAllChanges() {
     showToast('info', 'No Changes', 'No pending changes to apply');
     return;
   }
+  if (!await ensureWriteLock(`apply ${pendingOperations.length} pending change(s)`)) return;
 
   // If verbose mode is enabled, show preview of all commands first
   if (verboseMode) {
@@ -5196,6 +5304,7 @@ function showGroupDetails(groupType, groupName) {
 
 // Open group modal for create/edit
 async function openGroupModal(mode, groupType = 'address', groupName = '') {
+  if (!await ensureWriteLock(mode === 'edit' ? 'edit a firewall group' : 'create a firewall group')) return;
   const modal = document.getElementById('groupEditModal');
   const form = document.getElementById('groupEditForm');
   const title = document.getElementById('groupEditTitle');
@@ -5484,6 +5593,7 @@ async function executeGroupSave(groupData, mode, commands) {
 
 // Delete a group
 async function deleteGroup(groupType, groupName) {
+  if (!await ensureWriteLock(`delete group ${groupName}`)) return;
   // Check usage first
   try {
     const res = await fetch(`/api/firewall/group-usage/${groupType}/${groupName}`);
@@ -6326,26 +6436,31 @@ function updateWriteLockBadge() {
 
   badge.classList.remove('lock-free', 'lock-mine', 'lock-other', 'lock-stale');
 
+  const clusterSuffix = writeLockClusterId ? ` @ ${writeLockClusterId}` : '';
   if (writeLockIsMine) {
     badge.classList.add('lock-mine');
-    text.textContent = `Tienes el lock`;
-    badge.title = `Lock adquirido ${fmtLockAge(writeLockState)}. Click para liberar.`;
+    text.textContent = `Lock acquired${clusterSuffix}`;
+    badge.title = `You hold the write lock on ${writeLockClusterId || 'this cluster'} (acquired ${fmtLockAge(writeLockState)}). Click to release.`;
     badge.onclick = () => releaseWriteLock();
   } else if (writeLockState) {
     const idle = fmtLockIdle(writeLockState);
     const stale = idle > writeLockTtl * 0.8;
     badge.classList.add(stale ? 'lock-stale' : 'lock-other');
-    text.textContent = `${writeLockState.user}`;
+    text.textContent = stale
+      ? `Locked by ${writeLockState.user} (idle ${idle}s)${clusterSuffix}`
+      : `Locked by ${writeLockState.user}${clusterSuffix}`;
     badge.title = stale
-      ? `Lock por ${writeLockState.user} (inactivo ${idle}s, expira pronto). Click para forzar.`
-      : `Lock en uso por ${writeLockState.user}. Click para intentar adquirir.`;
+      ? `${writeLockState.user} has been idle ${idle}s on ${writeLockClusterId || 'this cluster'} — click to force-take the lock.`
+      : `${writeLockState.user} holds the write lock on ${writeLockClusterId || 'this cluster'}. Click to try to acquire.`;
     badge.onclick = () => promptAcquireOrForceLock(stale);
   } else {
     badge.classList.add('lock-free');
-    text.textContent = 'Adquirir lock';
-    badge.title = 'Nadie tiene el lock. Click para adquirir y entrar en modo escritura.';
+    text.textContent = `Unlocked${clusterSuffix}`;
+    badge.title = `Nobody holds the write lock on ${writeLockClusterId || 'this cluster'}. Click to acquire write access.`;
     badge.onclick = () => acquireWriteLock(false);
   }
+  // Mantener el banner read-only sincronizado con el estado del badge.
+  updateReadOnlyBanner();
 }
 
 async function refreshWriteLockState() {
@@ -6358,6 +6473,7 @@ async function refreshWriteLockState() {
     writeLockMe = j.me || writeLockMe;
     writeLockTtl = j.ttl || writeLockTtl;
     writeLockState = j.lock;
+    writeLockClusterId = j.cluster_id || null;
     writeLockIsMine = !!(j.lock && j.lock.user === j.me);
 
     if (wasMine && !writeLockIsMine) {
@@ -6367,8 +6483,8 @@ async function refreshWriteLockState() {
     // Notificar una sola vez cuando el lock pasa a libre
     if (j.lock === null && !wasFree && !writeLockLastFreeNotified) {
       writeLockLastFreeNotified = true;
-      showToast('info', 'Lock liberado',
-        'El lock de escritura ahora está libre, puedes adquirirlo.');
+      showToast('info', 'Lock released',
+        'The write lock is now free. Click the badge to take it.');
     }
     if (j.lock !== null) writeLockLastFreeNotified = false;
 
@@ -6388,10 +6504,10 @@ async function acquireWriteLock(force) {
     const j = await res.json();
     if (!res.ok) {
       if (res.status === 409) {
-        showToast('warning', 'Bloqueado',
-          `${j.lock?.user || 'otro usuario'} tiene el lock. Espera o fuérzalo.`);
+        showToast('warning', 'Locked',
+          `${j.lock?.user || 'another user'} holds the lock. Wait or force it from the badge.`);
       } else {
-        showToast('error', 'Error', j.error || 'No se pudo adquirir el lock');
+        showToast('error', 'Error', j.error || 'Could not acquire the write lock');
       }
       writeLockState = j.lock || null;
       writeLockIsMine = false;
@@ -6400,15 +6516,16 @@ async function acquireWriteLock(force) {
     }
     writeLockState = j.lock;
     writeLockMe = j.me || writeLockMe;
+    writeLockClusterId = j.cluster_id || writeLockClusterId;
     writeLockIsMine = true;
     startWriteLockHeartbeat();
     updateWriteLockBadge();
     if (j.forced_from) {
-      showToast('success', 'Lock forzado',
-        `Lock tomado de ${j.forced_from} (estaba inactivo).`);
+      showToast('success', 'Lock taken',
+        `Forced from ${j.forced_from} (idle).`);
     } else {
-      showToast('success', 'Modo escritura',
-        'Has adquirido el lock; los demás solo podrán leer.');
+      showToast('success', 'Write enabled',
+        'You can now apply changes; other users are read-only.');
     }
     return true;
   } catch (e) {
@@ -6418,18 +6535,18 @@ async function acquireWriteLock(force) {
 }
 
 async function promptAcquireOrForceLock(allowForce) {
-  const owner = writeLockState?.user || 'otro usuario';
+  const owner = writeLockState?.user || 'another user';
   const idle = fmtLockIdle(writeLockState);
   if (allowForce) {
     const confirmed = await openConfirmModal(
-      'Forzar lock',
-      `${owner} lleva inactivo ${idle}s. ¿Quitarle el lock y tomarlo?`
+      'Force-take the lock?',
+      `${owner} has been idle for ${idle}s. Take the lock from them?`
     );
     if (confirmed) await acquireWriteLock(true);
     return;
   }
-  showToast('warning', 'Bloqueado',
-    `${owner} tiene el lock. Aparecerá la opción de forzar cuando esté inactivo.`);
+  showToast('warning', 'Locked',
+    `${owner} holds the lock. The "force" option will appear once they are idle.`);
 }
 
 async function releaseWriteLock() {
@@ -6440,7 +6557,7 @@ async function releaseWriteLock() {
   writeLockIsMine = false;
   stopWriteLockHeartbeat();
   updateWriteLockBadge();
-  showToast('info', 'Lock liberado', 'Ya no estás en modo escritura.');
+  showToast('info', 'Lock released', 'You are now read-only.');
 }
 
 function startWriteLockHeartbeat() {
@@ -6479,11 +6596,11 @@ function handleWriteLockLost() {
       pendingRuleMarkers.clear();
       originalServerStates.clear();
       if (typeof updatePendingIndicator === 'function') updatePendingIndicator();
-      showToast('warning', 'Lock perdido',
-        'Se descartaron los cambios pendientes (otro usuario tomó el lock o expiró por inactividad).');
+      showToast('warning', 'Lock lost',
+        'Pending changes were discarded (someone took the lock or it expired).');
     } else {
-      showToast('warning', 'Lock perdido',
-        'El lock expiró por inactividad o lo tomó otro usuario.');
+      showToast('warning', 'Lock lost',
+        'The write lock expired or was taken by another user.');
     }
   }
   updateWriteLockBadge();
@@ -6496,8 +6613,8 @@ function checkWriteLockedResponse(res, data) {
   if (res.status === 423 && data && data.lock !== undefined) {
     handleWriteLockedResponse(data);
     const err = new Error(data.lock
-      ? `Bloqueado por ${data.lock.user}`
-      : 'Necesitas adquirir el lock de escritura');
+      ? `Locked by ${data.lock.user}`
+      : 'You need the write lock');
     err.isLocked = true;
     throw err;
   }
@@ -6510,13 +6627,72 @@ function handleWriteLockedResponse(data) {
   stopWriteLockHeartbeat();
   updateWriteLockBadge();
   if (data.lock) {
-    showToast('warning', 'Bloqueado',
-      `${data.lock.user} tiene el lock. Pulsa el badge para intentar adquirirlo.`);
+    showToast('warning', 'Locked',
+      `${data.lock.user} holds the write lock. Click the badge to try acquiring it.`);
   } else {
     // Lock libre pero no lo teníamos: ofrecer adquirirlo
-    showToast('warning', 'Sin lock',
-      'No tienes el lock de escritura. Pulsa el badge para adquirirlo.');
+    showToast('warning', 'No lock',
+      'You do not hold the write lock. Click the badge to acquire it.');
   }
+}
+
+// Sincroniza la banda "Read-only mode" con el estado actual del lock.
+function updateReadOnlyBanner() {
+  const banner = document.getElementById('readOnlyBanner');
+  const text = document.getElementById('readOnlyBannerText');
+  const btn = document.getElementById('readOnlyBannerBtn');
+  if (!banner || !text || !btn) return;
+
+  const showBanner = !writeLockIsMine && isConnected;
+  if (!showBanner) {
+    banner.classList.add('hidden');
+    return;
+  }
+  const where = writeLockClusterId ? ` on ${writeLockClusterId}` : '';
+  banner.classList.remove('hidden', 'lock-stale');
+  if (writeLockState) {
+    const idle = fmtLockIdle(writeLockState);
+    const stale = idle > writeLockTtl * 0.8;
+    if (stale) banner.classList.add('lock-stale');
+    text.textContent = stale
+      ? `Read-only${where} — ${writeLockState.user} has been idle ${idle}s (force available)`
+      : `Read-only${where} — ${writeLockState.user} holds the write lock`;
+    btn.textContent = stale ? 'Force lock' : 'Try to acquire';
+    btn.onclick = () => promptAcquireOrForceLock(stale);
+  } else {
+    text.textContent = `Read-only${where} — nobody holds the write lock`;
+    btn.textContent = 'Acquire lock';
+    btn.onclick = () => acquireWriteLock(false);
+  }
+}
+
+// Helper: garantiza que el usuario tiene el lock antes de iniciar una acción
+// de escritura. Si no, ofrece adquirirlo (cuando está libre) o muestra toast
+// (cuando lo tiene otro). Devuelve true si tras la interacción ya tiene el lock.
+async function ensureWriteLock(action) {
+  if (writeLockIsMine) return true;
+  if (!writeLockState) {
+    const confirmed = await openConfirmModal(
+      'Acquire write lock?',
+      `To ${action} you need the write lock. Acquire it now?`
+    );
+    if (!confirmed) return false;
+    return await acquireWriteLock(false);
+  }
+  const owner = writeLockState.user;
+  const idle = fmtLockIdle(writeLockState);
+  const stale = idle > writeLockTtl * 0.8;
+  if (stale) {
+    const confirmed = await openConfirmModal(
+      'Force-take the lock?',
+      `${owner} has been idle ${idle}s. Take the lock and ${action}?`
+    );
+    if (!confirmed) return false;
+    return await acquireWriteLock(true);
+  }
+  showToast('warning', 'Locked',
+    `${owner} holds the write lock. Wait or force it from the badge.`);
+  return false;
 }
 
 // Liberar el lock cuando el usuario cierra la pestaña (best-effort vía sendBeacon)

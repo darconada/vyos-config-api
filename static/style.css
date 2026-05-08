@@ -376,6 +376,58 @@ a:hover {
   50%      { box-shadow: 0 0 0 4px rgba(229, 62, 62, 0); }
 }
 
+/* Audit log filters bar */
+.audit-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding: 0.5rem 0 0.75rem;
+  align-items: center;
+}
+.audit-filters .form-control {
+  min-width: 160px;
+  max-width: 260px;
+}
+.audit-filters .form-control-sm {
+  height: 2rem;
+  padding: 0 0.5rem;
+  font-size: 0.8125rem;
+}
+
+/* Read-only banner (shown when another user holds the write lock) */
+.read-only-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  background-color: rgba(240, 160, 32, 0.12);
+  border-bottom: 1px solid var(--warning-color, #f0a020);
+  color: var(--warning-color, #f0a020);
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+.read-only-banner.lock-stale {
+  background-color: rgba(49, 130, 206, 0.12);
+  border-bottom-color: var(--info-color, #3182ce);
+  color: var(--info-color, #3182ce);
+}
+.read-only-banner-action {
+  margin-left: auto;
+  padding: 0.25rem 0.625rem;
+  border: 1px solid currentColor;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: inherit;
+  font-size: 0.75rem;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+}
+.read-only-banner-action:hover {
+  background-color: currentColor;
+  color: var(--bg-card);
+}
+
 /* Write-lock badge */
 .lock-badge {
   display: inline-flex;

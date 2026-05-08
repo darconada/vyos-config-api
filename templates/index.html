@@ -21,6 +21,16 @@
   <!-- Toast Container -->
   <div id="toastContainer" class="toast-container"></div>
 
+  <!-- Read-only banner (visible when another user holds the write lock) -->
+  <div id="readOnlyBanner" class="read-only-banner hidden">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+      <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+    </svg>
+    <span id="readOnlyBannerText">Read-only mode</span>
+    <button class="read-only-banner-action" id="readOnlyBannerBtn" type="button">Acquire lock</button>
+  </div>
+
   <!-- Header -->
   <header class="app-header">
     <div class="header-left">

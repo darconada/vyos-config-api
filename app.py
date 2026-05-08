@@ -11,10 +11,11 @@ import threading
 import functools
 import concurrent.futures
 import secrets as _secrets
-from flask import Flask, render_template, request, jsonify, redirect, session, url_for
+from flask import Flask, render_template, request, jsonify, redirect, session, url_for, g
 import json
 from vyos_api import VyOSAPI, VyOSAPIError
 from auth import authenticate_with_ldap, login_required, load_vyos_defaults
+import audit_log
 
 app = Flask(__name__)
 
@@ -32,49 +33,93 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
 )
 
-# Variable global para almacenar la configuración
-CONFIG = None
-# Raw del primary tal y como lo devuelve la API (sin pasar por adapt_14).
-# Lo guardamos para poder actualizarlo in-memory a partir de las ops sin
-# tener que volver a llamar a get_config tras cada apply.
-RAW_CONFIG = None
-# Conexión API activa (para operaciones de escritura)
-ACTIVE_API = None
+# ──────────────────────────────────────────────────────────────
+#  Sesiones por usuario
+# ──────────────────────────────────────────────────────────────
+# Cada usuario logueado mantiene su propia conexión a un router (o cluster).
+# Antes había globales (CONFIG, ACTIVE_API, ...) que se pisaban entre usuarios
+# que conectaban a routers distintos; ahora viven aquí indexadas por username.
+#
+# Estructura por usuario:
+#   {
+#     'active_api':       VyOSAPI | None,    # cliente del primary
+#     'peer_api':         VyOSAPI | None,    # cliente del peer (si en cluster)
+#     'config':           dict | None,       # config interna (post adapt_14)
+#     'raw_config':       dict | None,       # raw tal cual de la API
+#     'peer_config':      dict | None,
+#     'raw_peer_config':  dict | None,
+#     'cluster_info':     dict | None,
+#     'last_seen':        float (epoch),     # para purgar zombies
+#   }
+USER_SESSIONS = {}
+_USER_SESSIONS_MUTEX = threading.Lock()
+USER_SESSION_TTL = 1800  # 30 min sin actividad → la sesión se descarta
+
+
+def _get_session(create=False):
+    """Devuelve la sesión del usuario actual; crea vacía si create=True."""
+    user = _current_user()
+    if not user:
+        return None
+    with _USER_SESSIONS_MUTEX:
+        sess = USER_SESSIONS.get(user)
+        if sess is None and create:
+            sess = USER_SESSIONS[user] = {}
+        if sess is not None:
+            sess['last_seen'] = time.time()
+        return sess
+
+
+def _purge_idle_sessions():
+    """Limpia sesiones que no han recibido peticiones recientes."""
+    now = time.time()
+    with _USER_SESSIONS_MUTEX:
+        for u in list(USER_SESSIONS.keys()):
+            if now - USER_SESSIONS[u].get('last_seen', now) > USER_SESSION_TTL:
+                USER_SESSIONS.pop(u, None)
+
+
+def _cluster_id_for(sess):
+    """Devuelve un identificador estable del cluster del usuario.
+
+    En cluster HA: la base del hostname (ej. 'es-por-ded2-cgw01' a partir de
+    'es-por-ded2-cgw01-01'). Compartido por -01 y -02 → un solo lock para
+    los dos nodos. En single-node: el host del primary.
+    """
+    if not sess:
+        return None
+    info = sess.get('cluster_info')
+    if info and info.get('detected'):
+        pn = info.get('primary_name', '') or ''
+        m = _CLUSTER_NAME_RE.match(pn)
+        if m:
+            return m.group(1)
+        return pn or None
+    api = sess.get('active_api')
+    return getattr(api, 'host', None) if api else None
+
 
 # ──────────────────────────────────────────────────────────────
-#  Estado de cluster HA (peer)
+#  Write-lock por cluster (un escritor a la vez por cluster)
 # ──────────────────────────────────────────────────────────────
-# Conexión al nodo peer en caso de cluster HA
-PEER_API = None
-# Configuración cacheada del peer (se refresca en sync-check / peer connect)
-PEER_CONFIG = None
-# Raw del peer (mismo motivo que RAW_CONFIG).
-RAW_PEER_CONFIG = None
-# Info del cluster: { detected, primary_name, peer_name, peer_connected }
-CLUSTER_INFO = None
-
-
-# ──────────────────────────────────────────────────────────────
-#  Write-lock (un solo escritor a la vez)
-# ──────────────────────────────────────────────────────────────
-# Lock global para serializar operaciones de escritura entre usuarios.
-# Vive en memoria (se pierde al reiniciar gunicorn → no necesita liberación
-# manual tras restart). Tras WRITE_LOCK_TTL segundos sin heartbeat, se libera
-# automáticamente y otro usuario puede tomarlo.
-WRITE_LOCK = None  # None | {'user': str, 'acquired_at': float, 'last_seen': float}
+# Lock por cluster_id. Permite que dos usuarios trabajen en clusters distintos
+# en paralelo sin pisarse. Tras WRITE_LOCK_TTL sin heartbeat se libera solo.
+WRITE_LOCKS = {}  # cluster_id -> {'user', 'acquired_at', 'last_seen'}
 _WRITE_LOCK_MUTEX = threading.Lock()
-WRITE_LOCK_TTL = 300  # 5 minutos de inactividad → auto-expire
+WRITE_LOCK_TTL = 300
 
 
-def _lock_state_now():
-    """Devuelve el estado del lock aplicando auto-expiración por TTL."""
-    global WRITE_LOCK
-    if WRITE_LOCK is None:
+def _lock_state_for(cluster_id):
+    """Devuelve el estado del lock de `cluster_id` aplicando auto-expiración."""
+    if not cluster_id:
         return None
-    if time.time() - WRITE_LOCK['last_seen'] > WRITE_LOCK_TTL:
-        WRITE_LOCK = None
+    state = WRITE_LOCKS.get(cluster_id)
+    if state is None:
         return None
-    return dict(WRITE_LOCK)
+    if time.time() - state['last_seen'] > WRITE_LOCK_TTL:
+        WRITE_LOCKS.pop(cluster_id, None)
+        return None
+    return dict(state)
 
 
 def _current_user():
@@ -85,21 +130,92 @@ def _current_user():
     return raw or ''
 
 
+# ──────────────────────────────────────────────────────────────
+#  Emisión automática del audit log para endpoints de escritura
+# ──────────────────────────────────────────────────────────────
+@app.before_request
+def _audit_init():
+    g.audit_action = None
+    g.audit_target = None
+    g.audit_nodes = None
+    g.audit_commands = None
+    g.audit_details = None
+    g.audit_cluster_id = None
+    # Aprovechamos esta hook para purgar sesiones zombies de forma perezosa.
+    try:
+        _purge_idle_sessions()
+    except Exception:
+        pass
+
+
+@app.after_request
+def _audit_emit(response):
+    action = getattr(g, 'audit_action', None)
+    if not action:
+        return response
+    target = getattr(g, 'audit_target', '') or ''
+    nodes = getattr(g, 'audit_nodes', None)
+    commands = getattr(g, 'audit_commands', None)
+    details = getattr(g, 'audit_details', '') or ''
+    cluster_id = getattr(g, 'audit_cluster_id', None)
+    status = 'ok'
+    if response.status_code >= 400:
+        status = 'error'
+        if not details:
+            try:
+                payload = response.get_json(silent=True) or {}
+                details = payload.get('error', '') or ''
+            except Exception:
+                pass
+    try:
+        audit_log.emit(
+            user=_current_user(),
+            action=action,
+            target=target,
+            status=status,
+            nodes=nodes,
+            details=details,
+            commands=commands,
+            cluster_id=cluster_id,
+        )
+    except Exception as e:
+        print(f'[audit] emit failed: {e}', file=sys.stderr)
+    return response
+
+
+def _set_audit(action, target='', nodes=None, commands=None):
+    """Helper para llamar desde cada endpoint de escritura."""
+    g.audit_action = action
+    g.audit_target = target
+    g.audit_nodes = nodes
+    g.audit_commands = commands
+    if not getattr(g, 'audit_cluster_id', None):
+        sess = _get_session()
+        g.audit_cluster_id = _cluster_id_for(sess) if sess else None
+
+
 def write_lock_required(f):
-    """Endpoint protegido: solo el dueño del lock puede invocarlo."""
+    """Endpoint protegido: solo el dueño del lock del cluster activo puede invocarlo."""
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
         user = _current_user()
+        sess = _get_session()
+        cluster_id = _cluster_id_for(sess)
+        if not cluster_id:
+            return jsonify({
+                'error': 'No active connection. Connect to a router first.',
+                'lock': None, 'me': user, 'cluster_id': None,
+            }), 423
         with _WRITE_LOCK_MUTEX:
-            state = _lock_state_now()
+            state = _lock_state_for(cluster_id)
             if state is None or state['user'] != user:
                 return jsonify({
                     'error': 'Write lock required',
                     'lock': state,
                     'me': user,
+                    'cluster_id': cluster_id,
                 }), 423  # Locked
-            # Refrescamos last_seen como side-effect: cualquier write cuenta como actividad.
-            WRITE_LOCK['last_seen'] = time.time()
+            WRITE_LOCKS[cluster_id]['last_seen'] = time.time()
         return f(*args, **kwargs)
     return wrapper
 
@@ -107,59 +223,127 @@ def write_lock_required(f):
 @app.route('/api/lock', methods=['GET'])
 @login_required
 def get_lock():
+    sess = _get_session()
+    cluster_id = _cluster_id_for(sess) if sess else None
     with _WRITE_LOCK_MUTEX:
-        state = _lock_state_now()
-    return jsonify({'lock': state, 'me': _current_user(), 'ttl': WRITE_LOCK_TTL})
+        state = _lock_state_for(cluster_id) if cluster_id else None
+    return jsonify({
+        'lock': state,
+        'me': _current_user(),
+        'ttl': WRITE_LOCK_TTL,
+        'cluster_id': cluster_id,
+    })
 
 
 @app.route('/api/lock', methods=['POST'])
 @login_required
 def acquire_lock():
-    """Adquirir el lock. Si está libre o expirado lo toma. Si está ocupado por
-    otro y `force=true`, lo roba (con auditoría implícita en logs)."""
-    global WRITE_LOCK
+    """Adquirir el lock del cluster activo. Si está libre o expirado lo toma.
+    Si está ocupado por otro y `force=true`, lo roba."""
+    sess = _get_session()
+    cluster_id = _cluster_id_for(sess) if sess else None
+    if not cluster_id:
+        return jsonify({
+            'error': 'No active connection. Connect to a router first.',
+            'lock': None, 'me': _current_user(), 'cluster_id': None,
+        }), 400
     body = request.get_json(silent=True) or {}
     force = bool(body.get('force'))
     user = _current_user()
     now = time.time()
     with _WRITE_LOCK_MUTEX:
-        state = _lock_state_now()
+        state = _lock_state_for(cluster_id)
         if state and state['user'] != user and not force:
             return jsonify({
                 'error': 'Lock held by another user',
                 'lock': state,
                 'me': user,
+                'cluster_id': cluster_id,
             }), 409
-        WRITE_LOCK = {'user': user, 'acquired_at': now, 'last_seen': now}
+        WRITE_LOCKS[cluster_id] = {'user': user, 'acquired_at': now, 'last_seen': now}
         forced_from = state['user'] if (state and state['user'] != user) else None
     if forced_from:
-        print(f'[lock] {user} forced lock from {forced_from}', file=sys.stderr)
-    return jsonify({'lock': WRITE_LOCK, 'me': user, 'forced_from': forced_from})
+        print(f'[lock] {user} forced lock on {cluster_id} from {forced_from}', file=sys.stderr)
+        _set_audit('lock.force', target=f'{cluster_id} from={forced_from}')
+    else:
+        _set_audit('lock.acquire', target=cluster_id)
+    return jsonify({
+        'lock': WRITE_LOCKS[cluster_id], 'me': user,
+        'cluster_id': cluster_id, 'forced_from': forced_from,
+    })
 
 
 @app.route('/api/lock/heartbeat', methods=['POST'])
 @login_required
 def heartbeat_lock():
     """Mantiene vivo el lock del dueño actual. 409 si lo perdió (TTL/forzado)."""
-    global WRITE_LOCK
+    sess = _get_session()
+    cluster_id = _cluster_id_for(sess) if sess else None
     user = _current_user()
+    if not cluster_id:
+        return jsonify({'error': 'No active connection', 'lock': None,
+                        'cluster_id': None}), 409
     with _WRITE_LOCK_MUTEX:
-        state = _lock_state_now()
+        state = _lock_state_for(cluster_id)
         if state and state['user'] == user:
-            WRITE_LOCK['last_seen'] = time.time()
-            return jsonify({'lock': WRITE_LOCK})
-    return jsonify({'error': 'Lock not held by you', 'lock': state}), 409
+            WRITE_LOCKS[cluster_id]['last_seen'] = time.time()
+            return jsonify({'lock': WRITE_LOCKS[cluster_id], 'cluster_id': cluster_id})
+    return jsonify({'error': 'Lock not held by you', 'lock': state,
+                    'cluster_id': cluster_id}), 409
 
 
 @app.route('/api/lock', methods=['DELETE'])
 @login_required
 def release_lock():
-    global WRITE_LOCK
+    sess = _get_session()
+    cluster_id = _cluster_id_for(sess) if sess else None
     user = _current_user()
-    with _WRITE_LOCK_MUTEX:
-        if WRITE_LOCK and WRITE_LOCK['user'] == user:
-            WRITE_LOCK = None
-    return jsonify({'lock': None, 'me': user})
+    released = False
+    if cluster_id:
+        with _WRITE_LOCK_MUTEX:
+            state = WRITE_LOCKS.get(cluster_id)
+            if state and state['user'] == user:
+                WRITE_LOCKS.pop(cluster_id, None)
+                released = True
+    if released:
+        _set_audit('lock.release', target=cluster_id)
+    return jsonify({'lock': None, 'me': user, 'cluster_id': cluster_id})
+
+
+# ──────────────────────────────────────────────────────────────
+#  Audit log (vista web persistente compartida)
+# ──────────────────────────────────────────────────────────────
+@app.route('/api/audit')
+@login_required
+def audit_list():
+    """Devuelve eventos del audit, recientes primero, con filtros opcionales."""
+    user = (request.args.get('user') or '').strip() or None
+    action = (request.args.get('action') or '').strip() or None
+    since = (request.args.get('since') or '').strip() or None
+    q = (request.args.get('q') or '').strip() or None
+    try:
+        limit = int(request.args.get('limit', 200))
+    except (TypeError, ValueError):
+        limit = 200
+    limit = max(1, min(limit, 2000))
+    try:
+        entries = audit_log.read_entries(user=user, action=action, since=since,
+                                         limit=limit, q=q)
+    except Exception as e:
+        return jsonify({'error': f'Audit read failed: {e}', 'entries': []}), 500
+    return jsonify({'entries': entries, 'count': len(entries)})
+
+
+@app.route('/api/audit/users')
+@login_required
+def audit_users():
+    return jsonify({'users': audit_log.list_users()})
+
+
+@app.route('/api/audit/actions')
+@login_required
+def audit_actions():
+    return jsonify({'actions': audit_log.list_actions()})
 
 
 # ──────────────────────────────────────────────────────────────
@@ -282,6 +466,9 @@ def login_submit():
         ok = authenticate_with_ldap(username, password)
     except Exception as e:
         print(f"[error] LDAP auth failure: {e}", file=sys.stderr)
+        # Forzamos el user en g porque session['user'] aún no existe.
+        audit_log.emit(user=username, action='login', target=username,
+                       status='error', details='LDAP service unreachable')
         return render_template(
             'login.html',
             error='Error contactando con el servicio de autenticacion.',
@@ -290,8 +477,11 @@ def login_submit():
 
     if ok:
         session['user'] = {'username': username}
+        _set_audit('login', target=username)
         return redirect(url_for('index'))
 
+    audit_log.emit(user=username, action='login', target=username,
+                   status='error', details='invalid credentials')
     return render_template(
         'login.html',
         error='Credenciales invalidas o usuario sin permiso.',
@@ -301,6 +491,22 @@ def login_submit():
 
 @app.route('/logout', methods=['POST'])
 def logout():
+    user = _current_user() or 'anonymous'
+    audit_log.emit(user=user, action='logout', target=user)
+    if user and user != 'anonymous':
+        # Liberar los locks que tenga el usuario en cualquier cluster — si no, los demás
+        # tendrían que esperar al TTL para tomarlos.
+        released_clusters = []
+        with _WRITE_LOCK_MUTEX:
+            for cid in [c for c, s in WRITE_LOCKS.items() if s.get('user') == user]:
+                WRITE_LOCKS.pop(cid, None)
+                released_clusters.append(cid)
+        for cid in released_clusters:
+            audit_log.emit(user=user, action='lock.release', target=cid,
+                           cluster_id=cid, details='auto-released on logout')
+        # Soltar la sesión persistente del usuario (libera la conexión al router).
+        with _USER_SESSIONS_MUTEX:
+            USER_SESSIONS.pop(user, None)
     session.clear()
     return redirect(url_for('login_form'))
 
@@ -333,13 +539,15 @@ def api_defaults():
 @app.route('/upload', methods=['POST'])
 @login_required
 def upload():
-    global CONFIG
     f = request.files.get('file')
     if not f:
         return jsonify({'status': 'error', 'message': 'No file uploaded'}), 400
     try:
-        CONFIG = load_config(json.load(f))
-        return jsonify({'status': 'ok', 'data': CONFIG})
+        cfg = load_config(json.load(f))
+        sess = _get_session(create=True)
+        sess['config'] = cfg
+        sess['raw_config'] = cfg  # con upload no tenemos raw distinto del adaptado
+        return jsonify({'status': 'ok', 'data': cfg})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 400
 
@@ -350,33 +558,41 @@ def upload():
 @app.route('/api/firewall/rulesets')
 @login_required
 def firewall_rulesets():
-    if not CONFIG:
+    sess = _get_session()
+    cfg = sess.get('config') if sess else None
+    if not cfg:
         return jsonify([])
-    return jsonify(list(CONFIG.get('firewall', {}).get('name', {}).keys()))
+    return jsonify(list(cfg.get('firewall', {}).get('name', {}).keys()))
 
 
 @app.route('/api/firewall/ruleset/<rs>')
 @login_required
 def firewall_ruleset(rs):
-    if not CONFIG:
+    sess = _get_session()
+    cfg = sess.get('config') if sess else None
+    if not cfg:
         return jsonify({})
-    return jsonify(CONFIG.get('firewall', {}).get('name', {}).get(rs, {}))
+    return jsonify(cfg.get('firewall', {}).get('name', {}).get(rs, {}))
 
 
 @app.route('/api/firewall/group/<gtype>/<gname>')
 @login_required
 def firewall_group(gtype, gname):
-    if not CONFIG:
+    sess = _get_session()
+    cfg = sess.get('config') if sess else None
+    if not cfg:
         return jsonify({})
-    return jsonify(CONFIG.get('firewall', {}).get('group', {}).get(f"{gtype}-group", {}).get(gname, {}))
+    return jsonify(cfg.get('firewall', {}).get('group', {}).get(f"{gtype}-group", {}).get(gname, {}))
 
 
 @app.route('/api/<section>')
 @login_required
 def get_section(section):
-    if not CONFIG:
+    sess = _get_session()
+    cfg = sess.get('config') if sess else None
+    if not cfg:
         return jsonify({})
-    return jsonify(CONFIG.get(section.lower(), {}))
+    return jsonify(cfg.get(section.lower(), {}))
 
 
 # ──────────────────────────────────────────────────────────────
@@ -386,9 +602,11 @@ def get_section(section):
 @login_required
 def firewall_groups():
     """Lista todos los grupos de firewall."""
-    if not CONFIG:
+    sess = _get_session()
+    cfg = sess.get('config') if sess else None
+    if not cfg:
         return jsonify({})
-    return jsonify(CONFIG.get('firewall', {}).get('group', {}))
+    return jsonify(cfg.get('firewall', {}).get('group', {}))
 
 
 @app.route('/api/firewall/group-usage/<gtype>/<gname>')
@@ -398,13 +616,15 @@ def firewall_group_usage(gtype, gname):
     Devuelve las reglas que usan un grupo específico.
     Útil para verificar antes de eliminar un grupo.
     """
-    if not CONFIG:
+    sess = _get_session()
+    cfg = sess.get('config') if sess else None
+    if not cfg:
         return jsonify({'firewall': [], 'nat': []})
 
     references = {'firewall': [], 'nat': []}
 
     # Buscar en reglas de firewall
-    for rs_name, rs_data in CONFIG.get('firewall', {}).get('name', {}).items():
+    for rs_name, rs_data in cfg.get('firewall', {}).get('name', {}).items():
         for rule_id, rule in rs_data.get('rule', {}).items():
             for side in ['source', 'destination']:
                 group = rule.get(side, {}).get('group', {})
@@ -417,7 +637,7 @@ def firewall_group_usage(gtype, gname):
 
     # Buscar en reglas NAT (también pueden usar grupos)
     for nat_type in ['source', 'destination']:
-        for rule_id, rule in CONFIG.get('nat', {}).get(nat_type, {}).get('rule', {}).items():
+        for rule_id, rule in cfg.get('nat', {}).get(nat_type, {}).get('rule', {}).items():
             for side in ['source', 'destination']:
                 group = rule.get(side, {}).get('group', {})
                 if group.get(f'{gtype}-group') == gname:
@@ -436,9 +656,7 @@ def firewall_group_usage(gtype, gname):
 @app.route('/fetch-config', methods=['POST'])
 @login_required
 def fetch_config():
-    """Obtiene configuración via API REST de VyOS."""
-    global CONFIG, RAW_CONFIG, ACTIVE_API, PEER_API, PEER_CONFIG, RAW_PEER_CONFIG, CLUSTER_INFO
-
+    """Obtiene configuración via API REST de VyOS y la asocia a la sesión del usuario."""
     data = request.get_json() or {}
     host = data.get('host', '').strip()
     api_key = data.get('api_key', '').strip()
@@ -451,33 +669,48 @@ def fetch_config():
 
     try:
         api = VyOSAPI(host, api_key, port)
-        # Guardamos host/port en el cliente para poder derivar el peer luego
         api.host = host
         api.port = port
 
-        raw = api.get_config()  # Obtiene config completa
-        RAW_CONFIG = raw  # Cacheamos el raw para updates in-memory
-        CONFIG = load_config(raw)  # Aplica adaptador 1.3/1.4
+        raw = api.get_config()
+        cfg = load_config(raw)
 
-        # Guardar conexión activa para operaciones de escritura
-        ACTIVE_API = api
+        cluster = detect_cluster(cfg)
 
-        # Nueva conexión → reseteamos cualquier peer previo
-        PEER_API = None
-        PEER_CONFIG = None
-        RAW_PEER_CONFIG = None
+        sess = _get_session(create=True)
+        # Si el usuario estaba conectado a OTRO cluster y tenía su lock,
+        # liberamos ese lock antiguo: ya no va a usar ese cluster, dejarlo
+        # pinchado bloquearía a otros usuarios hasta el TTL.
+        prev_cluster_id = _cluster_id_for(sess)
+        user = _current_user()
+        sess['active_api'] = api
+        sess['raw_config'] = raw
+        sess['config'] = cfg
+        sess['peer_api'] = None
+        sess['peer_config'] = None
+        sess['raw_peer_config'] = None
+        sess['cluster_info'] = cluster
+        new_cluster_id = _cluster_id_for(sess)
+        if prev_cluster_id and prev_cluster_id != new_cluster_id and user:
+            with _WRITE_LOCK_MUTEX:
+                state = WRITE_LOCKS.get(prev_cluster_id)
+                if state and state.get('user') == user:
+                    WRITE_LOCKS.pop(prev_cluster_id, None)
+                    audit_log.emit(user=user, action='lock.release',
+                                   target=prev_cluster_id,
+                                   cluster_id=prev_cluster_id,
+                                   details='auto-released on cluster switch')
 
-        # Detectar si forma parte de un cluster HA
-        cluster = detect_cluster(CONFIG)
-        CLUSTER_INFO = cluster  # None si no hay cluster
-
-        response = {'status': 'ok', 'data': CONFIG}
+        response = {'status': 'ok', 'data': cfg}
         if cluster:
             response['cluster_info'] = {**cluster, 'peer_connected': False}
 
+        _set_audit('connect', target=f'{host}:{port}', nodes=['primary'])
         return jsonify(response)
 
     except VyOSAPIError as e:
+        _set_audit('connect', target=f'{host}:{port}')
+        g.audit_details = str(e)
         return jsonify({'error': str(e)}), 500
     except Exception as e:
         return jsonify({'error': f'Unexpected error: {str(e)}'}), 500
@@ -486,30 +719,25 @@ def fetch_config():
 @app.route('/fetch-peer', methods=['POST'])
 @login_required
 def fetch_peer():
-    """
-    Conecta al nodo peer del cluster HA.
-
-    Por defecto reutiliza la api-key y puerto del nodo primario (ACTIVE_API).
-    El frontend puede pasar un `api_key` y/o `port` para sobreescribirlos
-    (se usa el fallback manual cuando el auto-connect falla).
-    """
-    global PEER_API, PEER_CONFIG, RAW_PEER_CONFIG, CLUSTER_INFO
-
-    if not ACTIVE_API:
+    """Conecta al nodo peer del cluster HA en la sesión del usuario actual."""
+    sess = _get_session()
+    if not sess or not sess.get('active_api'):
         return jsonify({'error': 'No primary connection. Connect to a router first.'}), 400
-    if not CLUSTER_INFO or not CLUSTER_INFO.get('detected'):
+    cluster_info = sess.get('cluster_info')
+    if not cluster_info or not cluster_info.get('detected'):
         return jsonify({'error': 'Primary node is not part of a cluster'}), 400
+
+    active_api = sess['active_api']
 
     data = request.get_json() or {}
     peer_host = (data.get('host') or '').strip()
     if not peer_host:
-        # Default: hostname derivado del primario (…-01 ↔ …-02)
-        peer_host = CLUSTER_INFO.get('peer_name') or ''
+        peer_host = cluster_info.get('peer_name') or ''
     if not peer_host:
         return jsonify({'error': 'peer host is required'}), 400
 
-    peer_key = (data.get('api_key') or '').strip() or ACTIVE_API.api_key
-    peer_port = int(data.get('port') or getattr(ACTIVE_API, 'port', 443))
+    peer_key = (data.get('api_key') or '').strip() or active_api.api_key
+    peer_port = int(data.get('port') or getattr(active_api, 'port', 443))
 
     try:
         peer = VyOSAPI(peer_host, peer_key, peer_port)
@@ -518,21 +746,20 @@ def fetch_peer():
         raw = peer.get_config()
         peer_cfg = load_config(raw)
 
-        # Validación: el hostname del peer debe ser el gemelo del primario
         peer_hostname = peer_cfg.get('system', {}).get('host-name')
-        expected_peer = CLUSTER_INFO.get('peer_name')
+        expected_peer = cluster_info.get('peer_name')
         hostname_mismatch = (peer_hostname != expected_peer)
 
-        PEER_API = peer
-        PEER_CONFIG = peer_cfg
-        RAW_PEER_CONFIG = raw
-        CLUSTER_INFO = {**CLUSTER_INFO, 'peer_connected': True,
-                        'peer_host': peer_host, 'peer_port': peer_port,
-                        'peer_hostname_reported': peer_hostname}
+        sess['peer_api'] = peer
+        sess['peer_config'] = peer_cfg
+        sess['raw_peer_config'] = raw
+        sess['cluster_info'] = {**cluster_info, 'peer_connected': True,
+                                'peer_host': peer_host, 'peer_port': peer_port,
+                                'peer_hostname_reported': peer_hostname}
 
         return jsonify({
             'status': 'ok',
-            'cluster_info': CLUSTER_INFO,
+            'cluster_info': sess['cluster_info'],
             'hostname_mismatch': hostname_mismatch,
             'peer_hostname': peer_hostname,
             'expected': expected_peer
@@ -547,23 +774,28 @@ def fetch_peer():
 @app.route('/api/cluster/status')
 @login_required
 def cluster_status():
-    """Devuelve el estado actual del cluster."""
+    """Devuelve el estado actual del cluster del usuario actual."""
+    sess = _get_session()
+    cluster_info = sess.get('cluster_info') if sess else None
+    peer_connected = bool(sess and sess.get('peer_api'))
     return jsonify({
-        'cluster_info': CLUSTER_INFO,
-        'peer_connected': PEER_API is not None
+        'cluster_info': cluster_info,
+        'peer_connected': peer_connected,
     })
 
 
 @app.route('/api/cluster/disconnect-peer', methods=['POST'])
 @login_required
 def disconnect_peer():
-    """Desconecta del peer (vuelve a modo single-node)."""
-    global PEER_API, PEER_CONFIG, RAW_PEER_CONFIG, CLUSTER_INFO
-    PEER_API = None
-    PEER_CONFIG = None
-    RAW_PEER_CONFIG = None
-    if CLUSTER_INFO:
-        CLUSTER_INFO = {**CLUSTER_INFO, 'peer_connected': False}
+    """Desconecta del peer en la sesión del usuario (vuelve a modo single-node)."""
+    sess = _get_session()
+    if not sess:
+        return jsonify({'status': 'ok'})
+    sess['peer_api'] = None
+    sess['peer_config'] = None
+    sess['raw_peer_config'] = None
+    if sess.get('cluster_info'):
+        sess['cluster_info'] = {**sess['cluster_info'], 'peer_connected': False}
     return jsonify({'status': 'ok'})
 
 
@@ -675,36 +907,37 @@ def compute_sync_diffs(primary_cfg, peer_cfg):
 @app.route('/api/cluster/sync-check')
 @login_required
 def cluster_sync_check():
-    """Compara primary y peer. Si no hay peer, devuelve synchronized=true trivial."""
-    global CONFIG, PEER_CONFIG, RAW_CONFIG, RAW_PEER_CONFIG
-    if not ACTIVE_API:
+    """Compara primary y peer del usuario actual. Si no hay peer, synchronized=true trivial."""
+    sess = _get_session()
+    if not sess or not sess.get('active_api'):
         return jsonify({'error': 'No active connection'}), 400
-    if not (CLUSTER_INFO and CLUSTER_INFO.get('detected') and PEER_API):
+    cluster_info = sess.get('cluster_info')
+    if not (cluster_info and cluster_info.get('detected') and sess.get('peer_api')):
         return jsonify({'synchronized': True, 'cluster': False, 'differences': []})
 
     # Refrescar AMBAS caches para evitar falsos "synchronized=true" tras
     # un timeout en el que VyOS aplicó silenciosamente y nuestro cache quedó stale.
     try:
-        raw_primary = ACTIVE_API.get_config()
-        RAW_CONFIG = raw_primary
-        CONFIG = load_config(raw_primary)
+        raw_primary = sess['active_api'].get_config()
+        sess['raw_config'] = raw_primary
+        sess['config'] = load_config(raw_primary)
     except VyOSAPIError as e:
         return jsonify({'error': f'Primary unreachable: {str(e)}'}), 502
 
     try:
-        raw_peer = PEER_API.get_config()
-        RAW_PEER_CONFIG = raw_peer
-        PEER_CONFIG = load_config(raw_peer)
+        raw_peer = sess['peer_api'].get_config()
+        sess['raw_peer_config'] = raw_peer
+        sess['peer_config'] = load_config(raw_peer)
     except VyOSAPIError as e:
         return jsonify({'error': f'Peer unreachable: {str(e)}'}), 502
 
-    differences = compute_sync_diffs(CONFIG, PEER_CONFIG)
+    differences = compute_sync_diffs(sess['config'], sess['peer_config'])
     return jsonify({
         'synchronized': len(differences) == 0,
         'cluster': True,
         'differences': differences,
-        'primary_name': CLUSTER_INFO.get('primary_name'),
-        'peer_name': CLUSTER_INFO.get('peer_name')
+        'primary_name': cluster_info.get('primary_name'),
+        'peer_name': cluster_info.get('peer_name')
     })
 
 
@@ -864,9 +1097,10 @@ def _reverse_ops(ops):
     return out
 
 
-def _want_peer(to_peer_requested):
-    """Decide si aplicar al peer, combinando request con estado global."""
-    in_cluster = bool(CLUSTER_INFO and CLUSTER_INFO.get('detected') and PEER_API)
+def _want_peer(sess, to_peer_requested):
+    """Decide si aplicar al peer del cluster del usuario."""
+    cluster_info = sess.get('cluster_info') if sess else None
+    in_cluster = bool(cluster_info and cluster_info.get('detected') and sess and sess.get('peer_api'))
     if not in_cluster:
         return False
     if to_peer_requested is None:
@@ -874,55 +1108,59 @@ def _want_peer(to_peer_requested):
     return bool(to_peer_requested)
 
 
-def apply_ops_dual(ops, to_peer_requested=None, require_sync=True):
+def apply_ops_dual(sess, ops, to_peer_requested=None, require_sync=True):
     """
-    Aplica una lista de operaciones VyOS al primary y opcionalmente al peer.
+    Aplica una lista de operaciones VyOS al primary y opcionalmente al peer
+    de la sesión `sess` del usuario actual.
 
     Args:
+      sess: sesión del usuario (dict de USER_SESSIONS).
       ops: lista [{op, path}, ...]
       to_peer_requested: True/False/None (None = default del cluster)
       require_sync: si True y aplica al peer, hace pre-flight sync-check
 
-    Returns: dict con información ({applied, nodes, peer_synced_before, ...})
     Raises DualApplyError (serializa a HTTP) en:
       - 409: cluster no sincronizado (pre-flight)
       - 502: peer inaccesible
       - 500: fallo de apply (primary o peer)
     """
-    global CONFIG, PEER_CONFIG, RAW_CONFIG, RAW_PEER_CONFIG
-
     if not ops:
         return {'applied': 0, 'nodes': []}
+    if not sess or not sess.get('active_api'):
+        raise DualApplyError(400, {'error': 'No active connection'})
 
-    do_peer = _want_peer(to_peer_requested)
+    active_api = sess['active_api']
+    do_peer = _want_peer(sess, to_peer_requested)
 
     # Pre-flight sync check (solo si se va a aplicar al peer)
     if do_peer and require_sync:
+        peer_api = sess['peer_api']
         try:
-            raw_peer = PEER_API.get_config()
-            RAW_PEER_CONFIG = raw_peer
-            PEER_CONFIG = load_config(raw_peer)
+            raw_peer = peer_api.get_config()
+            sess['raw_peer_config'] = raw_peer
+            sess['peer_config'] = load_config(raw_peer)
         except VyOSAPIError as e:
             raise DualApplyError(502, {'error': f'Peer inaccesible: {str(e)}'})
-        diffs = compute_sync_diffs(CONFIG, PEER_CONFIG)
+        diffs = compute_sync_diffs(sess['config'], sess['peer_config'])
         if diffs:
+            cluster_info = sess.get('cluster_info') or {}
             raise DualApplyError(409, {
                 'error': 'Los nodos del cluster no están sincronizados. Apply bloqueado.',
                 'synchronized': False,
                 'differences': diffs,
-                'primary_name': CLUSTER_INFO.get('primary_name'),
-                'peer_name': CLUSTER_INFO.get('peer_name')
+                'primary_name': cluster_info.get('primary_name'),
+                'peer_name': cluster_info.get('peer_name')
             })
 
     # Caso single-node: aplicar solo a primary (no hay nada que paralelizar).
     if not do_peer:
         try:
-            ACTIVE_API.configure(ops)
+            active_api.configure(ops)
         except VyOSAPIError as e:
             try:
-                raw = ACTIVE_API.get_config()
-                RAW_CONFIG = raw
-                CONFIG = load_config(raw)
+                raw = active_api.get_config()
+                sess['raw_config'] = raw
+                sess['config'] = load_config(raw)
             except VyOSAPIError:
                 pass
             raise DualApplyError(500, {
@@ -930,25 +1168,24 @@ def apply_ops_dual(ops, to_peer_requested=None, require_sync=True):
                 'hint': 'CONFIG refrescado: si la operación se aplicó silenciosamente '
                         'tras timeout, la UI lo verá en el próximo render.'
             })
-        if not (RAW_CONFIG is not None and apply_ops_in_memory(RAW_CONFIG, ops)):
+        if not (sess.get('raw_config') is not None and apply_ops_in_memory(sess['raw_config'], ops)):
             try:
-                raw = ACTIVE_API.get_config()
-                RAW_CONFIG = raw
+                raw = active_api.get_config()
+                sess['raw_config'] = raw
             except VyOSAPIError:
                 pass
-        if RAW_CONFIG is not None:
-            CONFIG = load_config(RAW_CONFIG)
+        if sess.get('raw_config') is not None:
+            sess['config'] = load_config(sess['raw_config'])
         return {'applied_to': ['primary'], 'nodes': 1}
 
-    # Apply EN PARALELO a primary y peer. En configs grandes cada commit puede
-    # tardar 1-2 min; secuencial duplicaría la espera. Cada thread bloquea en
-    # I/O HTTP (requests libera el GIL), así que la concurrencia es real.
+    # Apply EN PARALELO a primary y peer.
+    peer_api = sess['peer_api']
     primary_err = None
     peer_err = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=2,
                                                thread_name_prefix='dual-apply') as ex:
-        f_primary = ex.submit(ACTIVE_API.configure, ops)
-        f_peer = ex.submit(PEER_API.configure, ops)
+        f_primary = ex.submit(active_api.configure, ops)
+        f_peer = ex.submit(peer_api.configure, ops)
         try:
             f_primary.result()
         except VyOSAPIError as e:
@@ -964,37 +1201,36 @@ def apply_ops_dual(ops, to_peer_requested=None, require_sync=True):
 
     # Caso 1: ambos OK → update in-memory de las dos caches.
     if primary_err is None and peer_err is None:
-        if not (RAW_CONFIG is not None and apply_ops_in_memory(RAW_CONFIG, ops)):
+        if not (sess.get('raw_config') is not None and apply_ops_in_memory(sess['raw_config'], ops)):
             try:
-                raw = ACTIVE_API.get_config()
-                RAW_CONFIG = raw
+                raw = active_api.get_config()
+                sess['raw_config'] = raw
             except VyOSAPIError:
                 pass
-        if RAW_CONFIG is not None:
-            CONFIG = load_config(RAW_CONFIG)
-        if not (RAW_PEER_CONFIG is not None and apply_ops_in_memory(RAW_PEER_CONFIG, ops)):
+        if sess.get('raw_config') is not None:
+            sess['config'] = load_config(sess['raw_config'])
+        if not (sess.get('raw_peer_config') is not None and apply_ops_in_memory(sess['raw_peer_config'], ops)):
             try:
-                raw_peer = PEER_API.get_config()
-                RAW_PEER_CONFIG = raw_peer
+                raw_peer = peer_api.get_config()
+                sess['raw_peer_config'] = raw_peer
             except VyOSAPIError:
                 pass
-        if RAW_PEER_CONFIG is not None:
-            PEER_CONFIG = load_config(RAW_PEER_CONFIG)
+        if sess.get('raw_peer_config') is not None:
+            sess['peer_config'] = load_config(sess['raw_peer_config'])
         return {'applied_to': ['primary', 'peer'], 'nodes': 2}
 
-    # Caso 4: ambos fallaron → refrescar las dos caches y devolver error.
-    # No tiene sentido rollback (no hay ningún lado consistente al que volver).
+    # Caso 4: ambos fallaron → refrescar caches; sin rollback.
     if primary_err is not None and peer_err is not None:
         try:
-            raw = ACTIVE_API.get_config()
-            RAW_CONFIG = raw
-            CONFIG = load_config(raw)
+            raw = active_api.get_config()
+            sess['raw_config'] = raw
+            sess['config'] = load_config(raw)
         except VyOSAPIError:
             pass
         try:
-            raw_peer = PEER_API.get_config()
-            RAW_PEER_CONFIG = raw_peer
-            PEER_CONFIG = load_config(raw_peer)
+            raw_peer = peer_api.get_config()
+            sess['raw_peer_config'] = raw_peer
+            sess['peer_config'] = load_config(raw_peer)
         except VyOSAPIError:
             pass
         raise DualApplyError(500, {
@@ -1003,25 +1239,23 @@ def apply_ops_dual(ops, to_peer_requested=None, require_sync=True):
                     'lo verás al render.'
         })
 
-    # Casos 2/3: un lado OK, el otro KO → rollback del lado que triunfó para
-    # restaurar consistencia. Refrescamos también el lado que falló por si
-    # aplicó silenciosamente tras timeout.
+    # Casos 2/3: un lado OK, el otro KO → rollback del lado que triunfó.
     if primary_err is None:  # peer falló
         try:
-            raw_peer = PEER_API.get_config()
-            RAW_PEER_CONFIG = raw_peer
-            PEER_CONFIG = load_config(raw_peer)
+            raw_peer = peer_api.get_config()
+            sess['raw_peer_config'] = raw_peer
+            sess['peer_config'] = load_config(raw_peer)
         except VyOSAPIError:
             pass
         rollback_ops = _reverse_ops(ops)
         rollback_status = 'skipped'
         if rollback_ops:
             try:
-                ACTIVE_API.configure(rollback_ops)
+                active_api.configure(rollback_ops)
                 try:
-                    raw = ACTIVE_API.get_config()
-                    RAW_CONFIG = raw
-                    CONFIG = load_config(raw)
+                    raw = active_api.get_config()
+                    sess['raw_config'] = raw
+                    sess['config'] = load_config(raw)
                 except VyOSAPIError:
                     pass
                 rollback_status = 'ok'
@@ -1036,20 +1270,20 @@ def apply_ops_dual(ops, to_peer_requested=None, require_sync=True):
 
     # primary falló, peer OK → rollback peer.
     try:
-        raw = ACTIVE_API.get_config()
-        RAW_CONFIG = raw
-        CONFIG = load_config(raw)
+        raw = active_api.get_config()
+        sess['raw_config'] = raw
+        sess['config'] = load_config(raw)
     except VyOSAPIError:
         pass
     rollback_ops = _reverse_ops(ops)
     rollback_status = 'skipped'
     if rollback_ops:
         try:
-            PEER_API.configure(rollback_ops)
+            peer_api.configure(rollback_ops)
             try:
-                raw_peer = PEER_API.get_config()
-                RAW_PEER_CONFIG = raw_peer
-                PEER_CONFIG = load_config(raw_peer)
+                raw_peer = peer_api.get_config()
+                sess['raw_peer_config'] = raw_peer
+                sess['peer_config'] = load_config(raw_peer)
             except VyOSAPIError:
                 pass
             rollback_status = 'ok'
@@ -1071,7 +1305,8 @@ def apply_ops_dual(ops, to_peer_requested=None, require_sync=True):
 @write_lock_required
 def manage_firewall_rule():
     """Crear, modificar o eliminar regla de firewall."""
-    if not ACTIVE_API:
+    sess = _get_session()
+    if not sess or not sess.get('active_api'):
         return jsonify({'error': 'No active connection. Connect to router first.'}), 400
 
     data = request.get_json() or {}
@@ -1100,7 +1335,11 @@ def manage_firewall_rule():
     if not ops:
         return jsonify({'status': 'ok', 'message': 'No operations to apply'})
 
-    result = apply_ops_dual(ops, to_peer_requested=to_peer)
+    result = apply_ops_dual(sess, ops, to_peer_requested=to_peer)
+    action_name = 'firewall.delete' if request.method == 'DELETE' else 'firewall.update'
+    _set_audit(action_name, target=f'{ruleset}/rule/{rule_id}',
+               nodes=result.get('applied_to'),
+               commands=[{'cmd': ' '.join([op.get('op', '')] + list(op.get('path', [])))} for op in ops])
     return jsonify({'status': 'ok', 'message': 'Rule updated successfully', **result})
 
 
@@ -1112,7 +1351,8 @@ def manage_firewall_rule():
 @write_lock_required
 def manage_nat_rule():
     """Crear, modificar o eliminar regla NAT."""
-    if not ACTIVE_API:
+    sess = _get_session()
+    if not sess or not sess.get('active_api'):
         return jsonify({'error': 'No active connection. Connect to router first.'}), 400
 
     data = request.get_json() or {}
@@ -1143,7 +1383,11 @@ def manage_nat_rule():
     if not ops:
         return jsonify({'status': 'ok', 'message': 'No operations to apply'})
 
-    result = apply_ops_dual(ops, to_peer_requested=to_peer)
+    result = apply_ops_dual(sess, ops, to_peer_requested=to_peer)
+    action_name = 'nat.delete' if request.method == 'DELETE' else 'nat.update'
+    _set_audit(action_name, target=f'{nat_type}/rule/{rule_id}',
+               nodes=result.get('applied_to'),
+               commands=[{'cmd': ' '.join([op.get('op', '')] + list(op.get('path', [])))} for op in ops])
     return jsonify({'status': 'ok', 'message': 'NAT rule updated successfully', **result})
 
 
@@ -1155,7 +1399,8 @@ def manage_nat_rule():
 @write_lock_required
 def manage_firewall_group():
     """Crear, modificar o eliminar grupo de firewall."""
-    if not ACTIVE_API:
+    sess = _get_session()
+    if not sess or not sess.get('active_api'):
         return jsonify({'error': 'No active connection. Connect to router first.'}), 400
 
     data = request.get_json() or {}
@@ -1186,7 +1431,11 @@ def manage_firewall_group():
     if not ops:
         return jsonify({'status': 'ok', 'message': 'No operations to apply'})
 
-    result = apply_ops_dual(ops, to_peer_requested=to_peer)
+    result = apply_ops_dual(sess, ops, to_peer_requested=to_peer)
+    action_name = 'group.delete' if request.method == 'DELETE' else 'group.update'
+    _set_audit(action_name, target=f'{group_type}-group/{group_name}',
+               nodes=result.get('applied_to'),
+               commands=[{'cmd': ' '.join([op.get('op', '')] + list(op.get('path', [])))} for op in ops])
     return jsonify({'status': 'ok', 'message': 'Group updated successfully', **result})
 
 
@@ -1210,7 +1459,8 @@ def batch_configure():
         "apply_to_peer": true|false|null  # null = default del cluster
       }
     """
-    if not ACTIVE_API:
+    sess = _get_session()
+    if not sess or not sess.get('active_api'):
         return jsonify({'error': 'No active connection. Connect to router first.'}), 400
 
     data = request.get_json() or {}
@@ -1227,7 +1477,15 @@ def batch_configure():
     if not vyos_ops:
         return jsonify({'error': 'No valid operations to execute'}), 400
 
-    result = apply_ops_dual(vyos_ops, to_peer_requested=to_peer)
+    result = apply_ops_dual(sess, vyos_ops, to_peer_requested=to_peer)
+    summary = ', '.join(f"{op.get('type')}.{op.get('action')}" for op in operations[:5])
+    if len(operations) > 5:
+        summary += f' (+{len(operations) - 5} more)'
+    _set_audit('batch.apply',
+               target=f'{len(operations)} operations',
+               nodes=result.get('applied_to'),
+               commands=[{'cmd': ' '.join([op.get('op', '')] + list(op.get('path', [])))} for op in vyos_ops])
+    g.audit_details = summary
     return jsonify({
         'success': True,
         'applied': len(operations),
@@ -1402,24 +1660,28 @@ def build_diff_operations(base_path, diff):
 @write_lock_required
 def save_config_to_router():
     """Guarda configuración en el router. En cluster, guarda también en el peer por defecto."""
-    if not ACTIVE_API:
+    sess = _get_session()
+    if not sess or not sess.get('active_api'):
         return jsonify({'error': 'No active connection. Connect to router first.'}), 400
 
     data = request.get_json(silent=True) or {}
     to_peer = data.get('apply_to_peer')
-    do_peer = _want_peer(to_peer)
+    do_peer = _want_peer(sess, to_peer)
 
     try:
-        ACTIVE_API.save_config()
+        sess['active_api'].save_config()
     except VyOSAPIError as e:
         return jsonify({'error': f'Primary save failed: {str(e)}'}), 500
 
     if not do_peer:
+        _set_audit('config.save', target='primary', nodes=['primary'])
         return jsonify({'status': 'ok', 'message': 'Configuration saved', 'nodes': ['primary']})
 
     try:
-        PEER_API.save_config()
+        sess['peer_api'].save_config()
     except VyOSAPIError as e:
+        _set_audit('config.save', target='primary+peer', nodes=['primary'])
+        g.audit_details = f'peer save failed: {str(e)}'
         return jsonify({
             'status': 'partial',
             'message': 'Primary saved, peer save failed',
@@ -1427,6 +1689,7 @@ def save_config_to_router():
             'peer_error': str(e)
         }), 500
 
+    _set_audit('config.save', target='primary+peer', nodes=['primary', 'peer'])
     return jsonify({'status': 'ok', 'message': 'Configuration saved on both nodes',
                     'nodes': ['primary', 'peer']})
 
@@ -1437,12 +1700,13 @@ def save_config_to_router():
 @app.route('/api/connection-status')
 @login_required
 def connection_status():
-    """Devuelve el estado de la conexión."""
+    """Devuelve el estado de la conexión del usuario actual."""
+    sess = _get_session()
     return jsonify({
-        'connected': ACTIVE_API is not None,
-        'config_loaded': CONFIG is not None,
-        'cluster_info': CLUSTER_INFO,
-        'peer_connected': PEER_API is not None
+        'connected': bool(sess and sess.get('active_api')),
+        'config_loaded': bool(sess and sess.get('config') is not None),
+        'cluster_info': sess.get('cluster_info') if sess else None,
+        'peer_connected': bool(sess and sess.get('peer_api')),
     })
 
 
@@ -1453,36 +1717,38 @@ def connection_status():
 @login_required
 def dashboard_stats():
     """Devuelve estadísticas para el dashboard."""
-    if not CONFIG:
+    sess = _get_session()
+    cfg = sess.get('config') if sess else None
+    if not cfg:
         return jsonify({})
 
-    def count_interfaces(cfg):
+    def count_interfaces(c):
         total = 0
-        for itype in cfg.get('interfaces', {}).values():
+        for itype in c.get('interfaces', {}).values():
             if isinstance(itype, dict):
                 total += len(itype)
         return total
 
     # Count firewall rulesets and rules
-    fw_name = CONFIG.get('firewall', {}).get('name', {})
+    fw_name = cfg.get('firewall', {}).get('name', {})
     firewall_rulesets = len(fw_name)
     firewall_rules = sum(len(rs.get('rule', {})) for rs in fw_name.values())
 
     # Count NAT rules
-    nat_dest = len(CONFIG.get('nat', {}).get('destination', {}).get('rule', {}))
-    nat_source = len(CONFIG.get('nat', {}).get('source', {}).get('rule', {}))
+    nat_dest = len(cfg.get('nat', {}).get('destination', {}).get('rule', {}))
+    nat_source = len(cfg.get('nat', {}).get('source', {}).get('rule', {}))
 
     # Count groups
-    groups = CONFIG.get('firewall', {}).get('group', {})
+    groups = cfg.get('firewall', {}).get('group', {})
     address_groups = len(groups.get('address-group', {}))
     network_groups = len(groups.get('network-group', {}))
     port_groups = len(groups.get('port-group', {}))
 
     # Count static routes
-    static_routes = len(CONFIG.get('protocols', {}).get('static', {}).get('route', {}))
+    static_routes = len(cfg.get('protocols', {}).get('static', {}).get('route', {}))
 
     # Count BGP neighbors
-    bgp = CONFIG.get('protocols', {}).get('bgp', {})
+    bgp = cfg.get('protocols', {}).get('bgp', {})
     bgp_neighbors = len(bgp.get('neighbor', {}))
     bgp_networks = len(bgp.get('address-family', {}).get('ipv4-unicast', {}).get('network', {}))
 
@@ -1502,14 +1768,14 @@ def dashboard_stats():
             'port': port_groups,
             'total': address_groups + network_groups + port_groups
         },
-        'interfaces': count_interfaces(CONFIG),
+        'interfaces': count_interfaces(cfg),
         'routing': {
             'static_routes': static_routes,
             'bgp_neighbors': bgp_neighbors,
             'bgp_networks': bgp_networks
         },
         'system': {
-            'hostname': CONFIG.get('system', {}).get('host-name', 'Unknown')
+            'hostname': cfg.get('system', {}).get('host-name', 'Unknown')
         }
     }
     return jsonify(stats)
@@ -1522,9 +1788,11 @@ def dashboard_stats():
 @login_required
 def interfaces():
     """Devuelve configuración de interfaces."""
-    if not CONFIG:
+    sess = _get_session()
+    cfg = sess.get('config') if sess else None
+    if not cfg:
         return jsonify({})
-    return jsonify(CONFIG.get('interfaces', {}))
+    return jsonify(cfg.get('interfaces', {}))
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1534,9 +1802,11 @@ def interfaces():
 @login_required
 def list_vrfs():
     """Devuelve lista de VRFs configurados."""
-    if not CONFIG:
+    sess = _get_session()
+    cfg = sess.get('config') if sess else None
+    if not cfg:
         return jsonify([])
-    vrfs = CONFIG.get('vrf', {}).get('name', {})
+    vrfs = cfg.get('vrf', {}).get('name', {})
     return jsonify(list(vrfs.keys()))
 
 
@@ -1547,15 +1817,17 @@ def list_vrfs():
 @login_required
 def static_routes():
     """Devuelve rutas estáticas de todos los VRFs."""
-    if not CONFIG:
+    sess = _get_session()
+    cfg = sess.get('config') if sess else None
+    if not cfg:
         return jsonify({'default': {}, 'vrfs': {}})
 
     # Rutas del VRF default (protocols.static.route)
-    default_routes = CONFIG.get('protocols', {}).get('static', {}).get('route', {})
+    default_routes = cfg.get('protocols', {}).get('static', {}).get('route', {})
 
     # Rutas de VRFs específicos (vrf.name.<vrf>.protocols.static.route)
     vrf_routes = {}
-    vrfs = CONFIG.get('vrf', {}).get('name', {})
+    vrfs = cfg.get('vrf', {}).get('name', {})
     for vrf_name, vrf_data in vrfs.items():
         routes = vrf_data.get('protocols', {}).get('static', {}).get('route', {})
         if routes:
@@ -1572,7 +1844,8 @@ def static_routes():
 @write_lock_required
 def manage_static_route():
     """Crear o eliminar ruta estática (default VRF o VRF específico)."""
-    if not ACTIVE_API:
+    sess = _get_session()
+    if not sess or not sess.get('active_api'):
         return jsonify({'error': 'No active connection. Connect to router first.'}), 400
 
     data = request.get_json() or {}
@@ -1618,7 +1891,12 @@ def manage_static_route():
         else:
             return jsonify({'error': 'Invalid route type. Use: next-hop, blackhole, or interface'}), 400
 
-    result = apply_ops_dual(ops, to_peer_requested=to_peer)
+    result = apply_ops_dual(sess, ops, to_peer_requested=to_peer)
+    action_name = 'route.delete' if request.method == 'DELETE' else 'route.create'
+    target_str = f'{vrf or "default"}/{network}'
+    _set_audit(action_name, target=target_str,
+               nodes=result.get('applied_to'),
+               commands=[{'cmd': ' '.join([op.get('op', '')] + list(op.get('path', [])))} for op in ops])
     return jsonify({'status': 'ok', 'message': 'Static route updated successfully', **result})
 
 
@@ -1629,9 +1907,11 @@ def manage_static_route():
 @login_required
 def bgp_config():
     """Devuelve configuración BGP."""
-    if not CONFIG:
+    sess = _get_session()
+    cfg = sess.get('config') if sess else None
+    if not cfg:
         return jsonify({})
-    return jsonify(CONFIG.get('protocols', {}).get('bgp', {}))
+    return jsonify(cfg.get('protocols', {}).get('bgp', {}))
 
 
 @app.route('/api/bgp/neighbor', methods=['POST', 'DELETE'])
@@ -1639,11 +1919,11 @@ def bgp_config():
 @write_lock_required
 def manage_bgp_neighbor():
     """Crear o eliminar neighbor BGP."""
-    global CONFIG
-
-    if not ACTIVE_API:
+    sess = _get_session()
+    if not sess or not sess.get('active_api'):
         return jsonify({'error': 'No active connection. Connect to router first.'}), 400
 
+    active_api = sess['active_api']
     data = request.get_json() or {}
     neighbor_ip = data.get('neighbor')
 
@@ -1652,7 +1932,7 @@ def manage_bgp_neighbor():
 
     try:
         if request.method == 'DELETE':
-            ACTIVE_API.delete_path(['protocols', 'bgp', 'neighbor', neighbor_ip])
+            active_api.delete_path(['protocols', 'bgp', 'neighbor', neighbor_ip])
         else:
             remote_as = data.get('remote_as')
             if not remote_as:
@@ -1681,12 +1961,15 @@ def manage_bgp_neighbor():
                 if data.get('route_map_export'):
                     ops.append({'op': 'set', 'path': af_path + ['route-map', 'export', data['route_map_export']]})
 
-            ACTIVE_API.configure(ops)
+            active_api.configure(ops)
 
         # Reload config
-        raw = ACTIVE_API.get_config()
-        CONFIG = load_config(raw)
+        raw = active_api.get_config()
+        sess['raw_config'] = raw
+        sess['config'] = load_config(raw)
 
+        action_name = 'bgp.neighbor.delete' if request.method == 'DELETE' else 'bgp.neighbor.update'
+        _set_audit(action_name, target=neighbor_ip)
         return jsonify({'status': 'ok', 'message': 'BGP neighbor updated successfully'})
 
     except VyOSAPIError as e:
@@ -1698,11 +1981,11 @@ def manage_bgp_neighbor():
 @write_lock_required
 def manage_bgp_network():
     """Añadir o eliminar network BGP."""
-    global CONFIG
-
-    if not ACTIVE_API:
+    sess = _get_session()
+    if not sess or not sess.get('active_api'):
         return jsonify({'error': 'No active connection. Connect to router first.'}), 400
 
+    active_api = sess['active_api']
     data = request.get_json() or {}
     network = data.get('network')
 
@@ -1713,14 +1996,17 @@ def manage_bgp_network():
         path = ['protocols', 'bgp', 'address-family', 'ipv4-unicast', 'network', network]
 
         if request.method == 'DELETE':
-            ACTIVE_API.delete_path(path)
+            active_api.delete_path(path)
         else:
-            ACTIVE_API.configure([{'op': 'set', 'path': path}])
+            active_api.configure([{'op': 'set', 'path': path}])
 
         # Reload config
-        raw = ACTIVE_API.get_config()
-        CONFIG = load_config(raw)
+        raw = active_api.get_config()
+        sess['raw_config'] = raw
+        sess['config'] = load_config(raw)
 
+        action_name = 'bgp.network.delete' if request.method == 'DELETE' else 'bgp.network.create'
+        _set_audit(action_name, target=network)
         return jsonify({'status': 'ok', 'message': 'BGP network updated successfully'})
 
     except VyOSAPIError as e:
@@ -1732,11 +2018,11 @@ def manage_bgp_network():
 @write_lock_required
 def set_bgp_system_as():
     """Configurar ASN local para BGP."""
-    global CONFIG
-
-    if not ACTIVE_API:
+    sess = _get_session()
+    if not sess or not sess.get('active_api'):
         return jsonify({'error': 'No active connection. Connect to router first.'}), 400
 
+    active_api = sess['active_api']
     data = request.get_json() or {}
     system_as = data.get('system_as')
 
@@ -1744,12 +2030,14 @@ def set_bgp_system_as():
         return jsonify({'error': 'system_as is required'}), 400
 
     try:
-        ACTIVE_API.configure([{'op': 'set', 'path': ['protocols', 'bgp', 'system-as', str(system_as)]}])
+        active_api.configure([{'op': 'set', 'path': ['protocols', 'bgp', 'system-as', str(system_as)]}])
 
         # Reload config
-        raw = ACTIVE_API.get_config()
-        CONFIG = load_config(raw)
+        raw = active_api.get_config()
+        sess['raw_config'] = raw
+        sess['config'] = load_config(raw)
 
+        _set_audit('bgp.system-as.update', target=str(system_as))
         return jsonify({'status': 'ok', 'message': 'BGP system AS configured successfully'})
 
     except VyOSAPIError as e:

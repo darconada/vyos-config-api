@@ -26,3 +26,6 @@ vyos-config-viewer-api/
 
 # Secrets
 config/infra.yaml
+
+# Runtime data
+logs/
