@@ -30,6 +30,10 @@ app.config.update(
 
 # Variable global para almacenar la configuración
 CONFIG = None
+# Raw del primary tal y como lo devuelve la API (sin pasar por adapt_14).
+# Lo guardamos para poder actualizarlo in-memory a partir de las ops sin
+# tener que volver a llamar a get_config tras cada apply.
+RAW_CONFIG = None
 # Conexión API activa (para operaciones de escritura)
 ACTIVE_API = None
 
@@ -40,6 +44,8 @@ ACTIVE_API = None
 PEER_API = None
 # Configuración cacheada del peer (se refresca en sync-check / peer connect)
 PEER_CONFIG = None
+# Raw del peer (mismo motivo que RAW_CONFIG).
+RAW_PEER_CONFIG = None
 # Info del cluster: { detected, primary_name, peer_name, peer_connected }
 CLUSTER_INFO = None
 
@@ -319,7 +325,7 @@ def firewall_group_usage(gtype, gname):
 @login_required
 def fetch_config():
     """Obtiene configuración via API REST de VyOS."""
-    global CONFIG, ACTIVE_API, PEER_API, PEER_CONFIG, CLUSTER_INFO
+    global CONFIG, RAW_CONFIG, ACTIVE_API, PEER_API, PEER_CONFIG, RAW_PEER_CONFIG, CLUSTER_INFO
 
     data = request.get_json() or {}
     host = data.get('host', '').strip()
@@ -338,6 +344,7 @@ def fetch_config():
         api.port = port
 
         raw = api.get_config()  # Obtiene config completa
+        RAW_CONFIG = raw  # Cacheamos el raw para updates in-memory
         CONFIG = load_config(raw)  # Aplica adaptador 1.3/1.4
 
         # Guardar conexión activa para operaciones de escritura
@@ -346,6 +353,7 @@ def fetch_config():
         # Nueva conexión → reseteamos cualquier peer previo
         PEER_API = None
         PEER_CONFIG = None
+        RAW_PEER_CONFIG = None
 
         # Detectar si forma parte de un cluster HA
         cluster = detect_cluster(CONFIG)
@@ -373,7 +381,7 @@ def fetch_peer():
     El frontend puede pasar un `api_key` y/o `port` para sobreescribirlos
     (se usa el fallback manual cuando el auto-connect falla).
     """
-    global PEER_API, PEER_CONFIG, CLUSTER_INFO
+    global PEER_API, PEER_CONFIG, RAW_PEER_CONFIG, CLUSTER_INFO
 
     if not ACTIVE_API:
         return jsonify({'error': 'No primary connection. Connect to a router first.'}), 400
@@ -405,6 +413,7 @@ def fetch_peer():
 
         PEER_API = peer
         PEER_CONFIG = peer_cfg
+        RAW_PEER_CONFIG = raw
         CLUSTER_INFO = {**CLUSTER_INFO, 'peer_connected': True,
                         'peer_host': peer_host, 'peer_port': peer_port,
                         'peer_hostname_reported': peer_hostname}
@@ -437,9 +446,10 @@ def cluster_status():
 @login_required
 def disconnect_peer():
     """Desconecta del peer (vuelve a modo single-node)."""
-    global PEER_API, PEER_CONFIG, CLUSTER_INFO
+    global PEER_API, PEER_CONFIG, RAW_PEER_CONFIG, CLUSTER_INFO
     PEER_API = None
     PEER_CONFIG = None
+    RAW_PEER_CONFIG = None
     if CLUSTER_INFO:
         CLUSTER_INFO = {**CLUSTER_INFO, 'peer_connected': False}
     return jsonify({'status': 'ok'})
@@ -554,16 +564,25 @@ def compute_sync_diffs(primary_cfg, peer_cfg):
 @login_required
 def cluster_sync_check():
     """Compara primary y peer. Si no hay peer, devuelve synchronized=true trivial."""
-    global PEER_CONFIG
+    global CONFIG, PEER_CONFIG, RAW_CONFIG, RAW_PEER_CONFIG
     if not ACTIVE_API:
         return jsonify({'error': 'No active connection'}), 400
     if not (CLUSTER_INFO and CLUSTER_INFO.get('detected') and PEER_API):
         return jsonify({'synchronized': True, 'cluster': False, 'differences': []})
 
+    # Refrescar AMBAS caches para evitar falsos "synchronized=true" tras
+    # un timeout en el que VyOS aplicó silenciosamente y nuestro cache quedó stale.
     try:
-        # Refrescar PEER_CONFIG para evitar comparar contra una copia antigua
-        raw = PEER_API.get_config()
-        PEER_CONFIG = load_config(raw)
+        raw_primary = ACTIVE_API.get_config()
+        RAW_CONFIG = raw_primary
+        CONFIG = load_config(raw_primary)
+    except VyOSAPIError as e:
+        return jsonify({'error': f'Primary unreachable: {str(e)}'}), 502
+
+    try:
+        raw_peer = PEER_API.get_config()
+        RAW_PEER_CONFIG = raw_peer
+        PEER_CONFIG = load_config(raw_peer)
     except VyOSAPIError as e:
         return jsonify({'error': f'Peer unreachable: {str(e)}'}), 502
 
@@ -575,6 +594,138 @@ def cluster_sync_check():
         'primary_name': CLUSTER_INFO.get('primary_name'),
         'peer_name': CLUSTER_INFO.get('peer_name')
     })
+
+
+# ──────────────────────────────────────────────────────────────
+#  In-memory ops applier (evita refetch tras cada apply)
+# ──────────────────────────────────────────────────────────────
+def _is_group_entry_path(path):
+    """
+    Path de set sobre una entrada de address/network/port-group:
+      ['firewall', 'group', '<X>-group', NAME, '<address|network|port>', VALUE]
+    """
+    return (
+        len(path) == 6
+        and path[0] == 'firewall'
+        and path[1] == 'group'
+        and path[2] in ('address-group', 'network-group', 'port-group')
+        and path[4] in ('address', 'network', 'port')
+    )
+
+
+# Flags booleanos VyOS que no llevan valor: el último segmento del path
+# es el flag en sí, no un valor. Cubrimos los que generan los helpers de este
+# codebase; otros (disable, log…) caerán al fallback de fetch — es seguro.
+_VYOS_BOOLEAN_FLAGS = {'exclude'}
+
+
+def _set_op(raw, path):
+    """Aplica un 'set' sobre raw. Devuelve True si OK, False si situación rara."""
+    if len(path) < 2:
+        return False
+
+    # Boolean flag: ['nat', 'source', 'rule', '10', 'exclude'] → rule['exclude'] = {}
+    if path[-1] in _VYOS_BOOLEAN_FLAGS:
+        *parents, flag = path
+        node = raw
+        for k in parents:
+            if not isinstance(node, dict):
+                return False
+            node = node.setdefault(k, {})
+        if not isinstance(node, dict):
+            return False
+        # VyOS REST representa flags vacíos como dict vacío; idempotente si ya está.
+        if not isinstance(node.get(flag), dict):
+            node[flag] = {}
+        return True
+
+    if _is_group_entry_path(path):
+        *parents, leaf_key, value = path
+        node = raw
+        for k in parents:
+            if not isinstance(node, dict):
+                return False
+            node = node.setdefault(k, {})
+        if not isinstance(node, dict):
+            return False
+        existing = node.get(leaf_key)
+        if existing is None:
+            node[leaf_key] = [value]
+        elif isinstance(existing, list):
+            if value not in existing:
+                existing.append(value)
+        elif isinstance(existing, str):
+            if existing != value:
+                node[leaf_key] = [existing, value]
+        else:
+            return False
+        return True
+
+    *parents, leaf_key, value = path
+    node = raw
+    for k in parents:
+        if not isinstance(node, dict):
+            return False
+        node = node.setdefault(k, {})
+    if not isinstance(node, dict):
+        return False
+    if isinstance(node.get(leaf_key), dict):
+        # Sería sobreescribir un nodo intermedio con un valor escalar.
+        # No nos arriesgamos: que el caller refresque desde el router.
+        return False
+    node[leaf_key] = value
+    return True
+
+
+def _delete_op(raw, path):
+    """Elimina la entrada en raw siguiendo path. Best-effort."""
+    if not path:
+        return True
+    node = raw
+    for k in path[:-1]:
+        if isinstance(node, dict):
+            if k not in node:
+                return True  # ya no existe
+            node = node[k]
+        else:
+            return False
+    last = path[-1]
+    if isinstance(node, dict):
+        node.pop(last, None)
+        return True
+    if isinstance(node, list):
+        if last in node:
+            node.remove(last)
+        return True
+    return False
+
+
+def apply_ops_in_memory(raw, ops):
+    """
+    Aplica ops VyOS a un dict raw cacheado (in-place).
+    Devuelve True si todo se pudo aplicar; False si encuentra algo inesperado
+    (en cuyo caso el caller debe hacer fallback a get_config).
+    """
+    if raw is None:
+        return False
+    # Solo soportamos 1.4: si no hay firewall.ipv4 y las ops lo usan,
+    # mejor fall-back para no corromper el cache.
+    is_14 = bool(raw.get('firewall', {}).get('ipv4'))
+    for entry in ops:
+        op = entry.get('op')
+        path = list(entry.get('path') or [])
+        if not is_14 and len(path) >= 3 and path[0] == 'firewall' and path[1] == 'ipv4':
+            return False
+        if op == 'set':
+            if not _set_op(raw, path):
+                return False
+        elif op == 'delete':
+            if not _delete_op(raw, path):
+                return False
+        else:
+            # comment u otra op no soportada
+            return False
+    return True
 
 
 # ──────────────────────────────────────────────────────────────
@@ -626,7 +777,7 @@ def apply_ops_dual(ops, to_peer_requested=None, require_sync=True):
       - 502: peer inaccesible
       - 500: fallo de apply (primary o peer)
     """
-    global CONFIG, PEER_CONFIG
+    global CONFIG, PEER_CONFIG, RAW_CONFIG, RAW_PEER_CONFIG
 
     if not ops:
         return {'applied': 0, 'nodes': []}
@@ -636,7 +787,9 @@ def apply_ops_dual(ops, to_peer_requested=None, require_sync=True):
     # Pre-flight sync check (solo si se va a aplicar al peer)
     if do_peer and require_sync:
         try:
-            PEER_CONFIG = load_config(PEER_API.get_config())
+            raw_peer = PEER_API.get_config()
+            RAW_PEER_CONFIG = raw_peer
+            PEER_CONFIG = load_config(raw_peer)
         except VyOSAPIError as e:
             raise DualApplyError(502, {'error': f'Peer inaccesible: {str(e)}'})
         diffs = compute_sync_diffs(CONFIG, PEER_CONFIG)
@@ -650,16 +803,37 @@ def apply_ops_dual(ops, to_peer_requested=None, require_sync=True):
             })
 
     # Apply al primary
+    primary_err = None
     try:
         ACTIVE_API.configure(ops)
     except VyOSAPIError as e:
-        raise DualApplyError(500, {'error': f'Primary apply failed: {str(e)}'})
+        primary_err = str(e)
 
-    # Refresco de CONFIG (best-effort)
-    try:
-        CONFIG = load_config(ACTIVE_API.get_config())
-    except VyOSAPIError:
-        pass
+    if primary_err is not None:
+        # Crítico: aunque la API haya cortado por timeout, VyOS puede haber
+        # aplicado igualmente. Refrescamos CONFIG SIEMPRE para que la UI no
+        # quede mintiendo con un estado obsoleto.
+        try:
+            raw = ACTIVE_API.get_config()
+            RAW_CONFIG = raw
+            CONFIG = load_config(raw)
+        except VyOSAPIError:
+            pass
+        raise DualApplyError(500, {
+            'error': f'Primary apply failed: {primary_err}',
+            'hint': 'CONFIG ha sido refrescado: si la operación finalmente se aplicó '
+                    'en primary la UI lo verá en el próximo render. El peer no se ha tocado.'
+        })
+
+    # Update in-memory de CONFIG (sin refetch) si se puede; si no, fallback a refetch.
+    if not (RAW_CONFIG is not None and apply_ops_in_memory(RAW_CONFIG, ops)):
+        try:
+            raw = ACTIVE_API.get_config()
+            RAW_CONFIG = raw
+        except VyOSAPIError:
+            pass
+    if RAW_CONFIG is not None:
+        CONFIG = load_config(RAW_CONFIG)
 
     if not do_peer:
         return {'applied_to': ['primary'], 'nodes': 1}
@@ -667,21 +841,36 @@ def apply_ops_dual(ops, to_peer_requested=None, require_sync=True):
     # Apply al peer
     try:
         PEER_API.configure(ops)
-        try:
-            PEER_CONFIG = load_config(PEER_API.get_config())
-        except VyOSAPIError:
-            pass
+        # Update in-memory de PEER_CONFIG; fallback a refetch si la heurística falla.
+        if not (RAW_PEER_CONFIG is not None and apply_ops_in_memory(RAW_PEER_CONFIG, ops)):
+            try:
+                raw_peer = PEER_API.get_config()
+                RAW_PEER_CONFIG = raw_peer
+            except VyOSAPIError:
+                pass
+        if RAW_PEER_CONFIG is not None:
+            PEER_CONFIG = load_config(RAW_PEER_CONFIG)
         return {'applied_to': ['primary', 'peer'], 'nodes': 2}
     except VyOSAPIError as e:
         peer_err = str(e)
+        # Refrescamos PEER_CONFIG por si VyOS aplicó silenciosamente tras un timeout.
+        try:
+            raw_peer = PEER_API.get_config()
+            RAW_PEER_CONFIG = raw_peer
+            PEER_CONFIG = load_config(raw_peer)
+        except VyOSAPIError:
+            pass
         # Rollback best-effort en primary
         rollback_ops = _reverse_ops(ops)
         rollback_status = 'skipped'
         if rollback_ops:
             try:
                 ACTIVE_API.configure(rollback_ops)
+                # Tras rollback, mejor refetch real del primary (estamos en ruta de error).
                 try:
-                    CONFIG = load_config(ACTIVE_API.get_config())
+                    raw = ACTIVE_API.get_config()
+                    RAW_CONFIG = raw
+                    CONFIG = load_config(raw)
                 except VyOSAPIError:
                     pass
                 rollback_status = 'ok'

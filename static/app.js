@@ -71,7 +71,7 @@ let activityLog = [];
 // Estado de conexión activa (para operaciones de escritura)
 let isConnected = false;
 let hasUnsavedChanges = false;
-let verboseMode = false;
+let verboseMode = true;
 let pendingCommandExecution = null; // Stores pending command data for verbose mode
 
 // Cluster HA state (null if not in cluster)
@@ -84,7 +84,7 @@ let lastClusterDiffs = [];
 let dualApplyEnabled = true;
 
 // Staged mode state
-let stagedMode = false;
+let stagedMode = true;
 let pendingOperations = []; // Array of { type, action, data, display }
 // Track which rules have pending changes for visual marking
 // Keys: "firewall:RULESET:RULEID" or "nat:TYPE:RULEID"
@@ -3097,6 +3097,8 @@ async function doFetchConfig() {
     document.getElementById('verboseToggle')?.classList.remove('hidden');
     document.getElementById('stagedToggle')?.classList.remove('hidden');
     document.getElementById('verboseDivider')?.classList.remove('hidden');
+    // Aplicar visual de staged-active si por defecto está activo (es lo habitual ahora).
+    if (stagedMode) document.getElementById('stagedToggle')?.classList.add('staged-active');
     drawMenu();
     renderDashboard();
     showToast('success', 'Connected', `Successfully fetched config from ${host}`);
@@ -6255,9 +6257,11 @@ async function clusterApplyFetch(url, method, bodyObj) {
     throw new Error(data?.error || `HTTP ${res.status}`);
   }
 
-  // Refresh the HA badge after any write when we're in a cluster (even if we
-  // only hit the primary — the sync state probably drifted).
-  if (inCluster) setTimeout(() => runSyncCheck(false), 0);
+  // Tras un dual-apply correcto los nodos están sincronizados por construcción.
+  // Actualizamos el badge sin un fetch extra al peer.
+  if (inCluster && Array.isArray(data?.applied_to) && data.applied_to.includes('peer')) {
+    updateClusterBadge('sync');
+  }
 
   return data;
 }

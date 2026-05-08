@@ -20,7 +20,7 @@ class VyOSAPIError(Exception):
 class VyOSAPI:
     """Cliente para API REST de VyOS 1.4+"""
 
-    def __init__(self, host, api_key, port=443, verify_ssl=False, timeout=60, configure_timeout=120):
+    def __init__(self, host, api_key, port=443, verify_ssl=False, timeout=60, configure_timeout=300):
         """
         Inicializa el cliente API.
 
@@ -30,7 +30,9 @@ class VyOSAPI:
             port: Puerto HTTPS (default: 443)
             verify_ssl: Verificar certificado SSL (default: False para self-signed)
             timeout: Timeout para requests en segundos (default: 60)
-            configure_timeout: Timeout para operaciones de configuración (default: 120)
+            configure_timeout: Timeout para operaciones de configuración (default: 300).
+                               Debe ser inferior al --timeout de gunicorn para que la
+                               excepción limpia llegue al cliente antes del corte de worker.
         """
         self.host = host
         self.port = port
@@ -81,7 +83,10 @@ class VyOSAPI:
             return result.get('data')
 
         except requests.exceptions.Timeout:
-            raise VyOSAPIError(f'Connection timeout after {timeout}s - the operation may still be in progress on VyOS')
+            raise VyOSAPIError(
+                f'Connection timeout after {timeout}s - the operation may still be in progress on VyOS. '
+                'Reload the configuration to see the actual state.'
+            )
         except requests.exceptions.ConnectionError as e:
             raise VyOSAPIError(f'Connection failed: {str(e)}')
         except requests.exceptions.HTTPError as e:
