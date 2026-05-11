@@ -293,6 +293,10 @@ class VyOSAPI:
         if rule_data.get('description'):
             ops.append({'op': 'set', 'path': base_path + ['description', rule_data['description']]})
 
+        # Disable flag (keeps rule in config but inactive)
+        if rule_data.get('disable'):
+            ops.append({'op': 'set', 'path': base_path + ['disable']})
+
         # Source
         src = rule_data.get('source', {})
         if src.get('address'):
@@ -370,6 +374,10 @@ class VyOSAPI:
         # Exclude flag (no translation needed when this is set)
         if rule_data.get('exclude'):
             ops.append({'op': 'set', 'path': base_path + ['exclude']})
+
+        # Disable flag (keeps rule in config but inactive)
+        if rule_data.get('disable'):
+            ops.append({'op': 'set', 'path': base_path + ['disable']})
 
         if rule_data.get('protocol'):
             ops.append({'op': 'set', 'path': base_path + ['protocol', rule_data['protocol']]})

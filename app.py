@@ -960,8 +960,8 @@ def _is_group_entry_path(path):
 
 # Flags booleanos VyOS que no llevan valor: el último segmento del path
 # es el flag en sí, no un valor. Cubrimos los que generan los helpers de este
-# codebase; otros (disable, log…) caerán al fallback de fetch — es seguro.
-_VYOS_BOOLEAN_FLAGS = {'exclude'}
+# codebase; otros (log…) caerán al fallback de fetch — es seguro.
+_VYOS_BOOLEAN_FLAGS = {'exclude', 'disable'}
 
 
 def _set_op(raw, path):
@@ -1528,6 +1528,8 @@ def build_vyos_operations(operation):
                 ops.append({'op': 'set', 'path': base_path + ['protocol', rule['protocol']]})
             if rule.get('description'):
                 ops.append({'op': 'set', 'path': base_path + ['description', rule['description']]})
+            if rule.get('disable'):
+                ops.append({'op': 'set', 'path': base_path + ['disable']})
 
             # Source
             src = rule.get('source', {})
@@ -1566,6 +1568,8 @@ def build_vyos_operations(operation):
                 ops.append({'op': 'set', 'path': base_path + ['description', rule['description']]})
             if rule.get('exclude'):
                 ops.append({'op': 'set', 'path': base_path + ['exclude']})
+            if rule.get('disable'):
+                ops.append({'op': 'set', 'path': base_path + ['disable']})
             if rule.get('protocol'):
                 ops.append({'op': 'set', 'path': base_path + ['protocol', rule['protocol']]})
 
