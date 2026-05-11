@@ -488,8 +488,13 @@ function renderNatTable(title, natType, rules, cols) {
       const pendingClass = pendingStatus === 'delete' ? 'pending-delete' : (pendingStatus ? 'pending-change' : '');
       const pendingBadge = pendingStatus ? `<span class="pending-badge">${pendingStatus === 'delete' ? 'DEL' : 'MOD'}</span>` : '';
 
-      html += `<tr class="${pendingClass}">
-        <td><span class="badge">${id}</span>${pendingBadge}</td>
+      const isDisabled = r.disable !== undefined;
+      const disabledClass = isDisabled ? 'rule-disabled' : '';
+      const disabledBadge = isDisabled ? `<span class="disabled-badge" title="Rule is disabled">OFF</span>` : '';
+      const rowClass = [pendingClass, disabledClass].filter(Boolean).join(' ');
+
+      html += `<tr class="${rowClass}">
+        <td><span class="badge">${id}</span>${disabledBadge}${pendingBadge}</td>
         ${cols.map(c => `<td><div class="cell-wrap wide">${escapeHtml(get(r, c.key))}</div></td>`).join('')}
         ${isConnected ? `<td class="actions-col">
           <button class="btn-icon" onclick="openNatRuleModal('edit', '${natType}', '${id}')" title="Edit">
@@ -2597,8 +2602,13 @@ function renderRuleset() {
       const pendingClass = pendingStatus === 'delete' ? 'pending-delete' : (pendingStatus ? 'pending-change' : '');
       const pendingBadge = pendingStatus ? `<span class="pending-badge">${pendingStatus === 'delete' ? 'DEL' : 'MOD'}</span>` : '';
 
-      html += `<tr id="row-${id}" class="${pendingClass}">
-        <td><span class="badge">${row.rule_id}</span>${pendingBadge}</td>
+      const isDisabled = r.disable !== undefined;
+      const disabledClass = isDisabled ? 'rule-disabled' : '';
+      const disabledBadge = isDisabled ? `<span class="disabled-badge" title="Rule is disabled">OFF</span>` : '';
+      const rowClass = [pendingClass, disabledClass].filter(Boolean).join(' ');
+
+      html += `<tr id="row-${id}" class="${rowClass}">
+        <td><span class="badge">${row.rule_id}</span>${disabledBadge}${pendingBadge}</td>
         <td><div class="cell-wrap wide">${cellHTML(r.source, 'address', 'network')}</div></td>
         <td class="font-mono text-sm"><div class="cell-wrap">${cellHTML(r.source, 'port')}</div></td>
         <td><div class="cell-wrap wide">${cellHTML(r.destination, 'address', 'network')}</div></td>
