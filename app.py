@@ -924,21 +924,42 @@ def cluster_sync_check():
     if not (cluster_info and cluster_info.get('detected') and sess.get('peer_api')):
         return jsonify({'synchronized': True, 'cluster': False, 'differences': []})
 
-    # Refrescar AMBAS caches para evitar falsos "synchronized=true" tras
-    # un timeout en el que VyOS aplicó silenciosamente y nuestro cache quedó stale.
-    try:
-        raw_primary = sess['active_api'].get_config()
-        sess['raw_config'] = raw_primary
-        sess['config'] = load_config(raw_primary)
-    except VyOSAPIError as e:
-        return jsonify({'error': f'Primary unreachable: {str(e)}'}), 502
+    # Refrescar AMBAS caches en paralelo para evitar falsos "synchronized=true"
+    # tras un timeout en el que VyOS aplicó silenciosamente y nuestro cache
+    # quedó stale. En routers grandes, get_config() puede tardar ~1 min cada
+    # uno — paralelizarlos baja el tiempo de pared de t1+t2 a max(t1, t2).
+    primary_api = sess['active_api']
+    peer_api = sess['peer_api']
+    primary_err = None
+    peer_err = None
+    raw_primary = None
+    raw_peer = None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2,
+                                               thread_name_prefix='sync-check') as ex:
+        f_primary = ex.submit(primary_api.get_config)
+        f_peer = ex.submit(peer_api.get_config)
+        try:
+            raw_primary = f_primary.result()
+        except VyOSAPIError as e:
+            primary_err = str(e)
+        except Exception as e:
+            primary_err = f'unexpected: {str(e)}'
+        try:
+            raw_peer = f_peer.result()
+        except VyOSAPIError as e:
+            peer_err = str(e)
+        except Exception as e:
+            peer_err = f'unexpected: {str(e)}'
 
-    try:
-        raw_peer = sess['peer_api'].get_config()
-        sess['raw_peer_config'] = raw_peer
-        sess['peer_config'] = load_config(raw_peer)
-    except VyOSAPIError as e:
-        return jsonify({'error': f'Peer unreachable: {str(e)}'}), 502
+    if primary_err:
+        return jsonify({'error': f'Primary unreachable: {primary_err}'}), 502
+    if peer_err:
+        return jsonify({'error': f'Peer unreachable: {peer_err}'}), 502
+
+    sess['raw_config'] = raw_primary
+    sess['config'] = load_config(raw_primary)
+    sess['raw_peer_config'] = raw_peer
+    sess['peer_config'] = load_config(raw_peer)
 
     differences = compute_sync_diffs(sess['config'], sess['peer_config'])
     return jsonify({
