@@ -4109,7 +4109,7 @@ async function toggleFirewallRuleDisabled(rulesetName, ruleId) {
   const newRuleData = deepClone(currentRule);
   let diff;
   if (newDisabled) {
-    newRuleData.disable = {};
+    newRuleData.disable = true;
     diff = { sets: [{ path: ['disable'], value: true }], deletes: [] };
   } else {
     delete newRuleData.disable;
@@ -4479,7 +4479,7 @@ async function toggleNatRuleDisabled(natType, ruleId) {
   const newRuleData = deepClone(currentRule);
   let diff;
   if (newDisabled) {
-    newRuleData.disable = {};
+    newRuleData.disable = true;
     diff = { sets: [{ path: ['disable'], value: true }], deletes: [] };
   } else {
     delete newRuleData.disable;
