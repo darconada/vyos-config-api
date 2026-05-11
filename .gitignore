@@ -21,8 +21,16 @@ Thumbs.db
 # Claude Code
 .claude/
 
+# Claude-mem auto-generated per-directory context files
+# (keep the root CLAUDE.md tracked, drop the nested per-folder ones)
+/*/CLAUDE.md
+/*/**/CLAUDE.md
+
 # Old nested directory
 vyos-config-viewer-api/
+
+# Stray src/ tree (claude-mem context only)
+/src/
 
 # Secrets
 config/infra.yaml

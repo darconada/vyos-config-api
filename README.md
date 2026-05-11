@@ -23,13 +23,14 @@ HA cluster operations from a single place.
 ### Managing
 - **Full CRUD** on firewall rules, NAT rules, firewall groups, static routes, BGP neighbors and networks.
 - **All VyOS 1.4 firewall actions**: accept, drop, reject, return, continue, jump, queue (including `jump-target`).
+- **Enable / disable rules**: per-row toggle button on firewall and NAT rule tables, plus a checkbox in the edit modal. A disabled rule stays in the config (`set ... rule N disable`) so traffic stops matching it without losing the definition. The UI dims and strikes through the row and shows an `OFF` badge.
 - **Differential updates**: when editing, only changed fields are sent to VyOS.
 - **Save to router**: runs `save` on VyOS so changes persist after reboot.
 
 ### HA Cluster (VyOS pairs)
 - **Automatic cluster detection** at connect time using the naming convention `*-01` / `*-02` plus the presence of VRRP groups.
-- **Automatic peer connection** reusing the primary's API key; a fallback modal prompts for host / port / api-key if auto-connect fails.
-- **Sync-check**: normalised deep comparison of firewall rules, firewall groups, NAT rules, and static routes (default + VRFs) between the two nodes.
+- **Fast peer connection** reusing the primary's API key; the connect call only requests `['system','host-name']` to validate the peer (instant even on large routers, where a full `get_config()` can take ~1 min). A fallback modal prompts for host / port / api-key if auto-connect fails.
+- **Sync-check (parallel fetches)**: normalised deep comparison of firewall rules, firewall groups, NAT rules, and static routes (default + VRFs) between the two nodes. Both `get_config()` calls run concurrently via a `ThreadPoolExecutor`, so wall time is `max(t_primary, t_peer)` instead of the sum (≈ halves the time on large configs).
 - **Dual-apply (parallel)**: writes go to primary and peer concurrently via a `ThreadPoolExecutor`, roughly halving wall time on large configs (1-2 min commits). Pre-flight sync-check still runs first. Four outcomes handled: both ok / primary only / peer only / both fail; partial successes trigger a rollback of the side that succeeded.
 - **In-memory cache update**: after a successful apply the cached primary/peer config is patched in place from the ops list instead of refetching the full config (1-3 s saved per write on big configs). Falls back to a real fetch when the heuristic cannot apply the op safely.
 - **Divergence modal** with per-section diffs, opened automatically when a dual-apply is blocked.

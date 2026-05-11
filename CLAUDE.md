@@ -343,24 +343,35 @@ The `adapt_14()` function now copies the following sections from VyOS 1.4 config
 
 ---
 
+**Rule Enable / Disable (Firewall + NAT):**
+- Per-rule toggle button (power icon) between Edit and Delete in the firewall and NAT tables.
+- "Disable rule" checkbox in the create/edit modals.
+- Backend: `disable` is treated as a VyOS boolean flag (added to `_VYOS_BOOLEAN_FLAGS` in `app.py`).
+- Re-enabling sends a `delete .../disable` op in a diff-style POST (no whole-rule rewrite).
+- Disabled rows are dimmed, line-through, with an `OFF` badge near the rule ID.
+- Respects staged mode and verbose mode, like the other write actions.
+
+**Cluster latency reduction (May 2026):**
+- `fetch-peer` requests only `['system','host-name']` to validate the peer; it no longer downloads the full peer config. Drops the connect-peer step from ~1 min to ~1 s on big routers like `es-por-ded2-cgw01-01`. `sess['peer_config']` is populated by the first `runSyncCheck()` that the frontend auto-fires after a successful connect (cluster_sync_check refetches both nodes anyway).
+- `cluster_sync_check` runs the two `get_config()` calls in parallel via `ThreadPoolExecutor`. Wall time = `max(t_primary, t_peer)` instead of the sum.
+- Combined: on the largest in-use router (`es-por-ded2-cgw01-01`), the connect + first-sync-check chain dropped from ~3 min to ~45 s, and per the user this is now acceptable. No further optimisation planned — the remaining cost is VyOS-side JSON rendering of the config tree.
+
 ## Known improvements / future work
 
-### HA cluster sync-check — reduce redundant peer fetches
+### HA cluster sync-check — further reductions (deferred)
 
-The current dual-apply flow fetches the peer's full config up to **3 times per write**:
+The dual-apply write path still fetches the peer config a couple of times per write:
 
 1. Pre-flight `PEER_API.get_config()` inside `apply_ops_dual` (before applying).
-2. `PEER_API.get_config()` after applying to peer (refreshes `PEER_CONFIG` cache).
-3. Frontend `runSyncCheck(false)` via `setTimeout` after `clusterApplyFetch` — fires one more `PEER_API.get_config()`.
-
-Pure comparison (`compute_sync_diffs`) is fast — O(n) Python dict deep-equal, microseconds for hundreds of rules. The cost is the HTTP roundtrip + JSON parse of large configs on the VyOS peer (~1-3s each for big configs).
+2. Refresh after applying (best-effort, partly avoided by `apply_ops_in_memory` when the patch can be applied locally).
+3. Frontend `runSyncCheck(false)` after `clusterApplyFetch` — one more `PEER_API.get_config()` × 2 (paralelised since May 2026).
 
 **Potential optimizations (not implemented — deferred by user):**
 - Short TTL cache (~15-30s) on `PEER_CONFIG` so consecutive writes reuse the fetch.
 - Drop the post-write `runSyncCheck` — a successful dual-apply implies sync.
 - Reuse the pre-flight snapshot as "post state" until the next operation starts.
 
-**Why deferred**: optimizations reduce coverage against a concurrent operator editing the peer mid-session. Current behavior trades extra HTTP calls for guaranteed freshness. The user prefers to revisit only if they observe real slowness.
+**Why deferred**: optimizations reduce coverage against a concurrent operator editing the peer mid-session. Current behavior trades extra HTTP calls for guaranteed freshness. The largest router in use (`es-por-ded2-cgw01-01`) is already inside acceptable timings after the May 2026 latency work, so further tuning is on hold.
 
 **Escape hatches that already exist** (don't require code changes):
 - Cluster Sync toggle OFF → no pre-flight, writes go only to primary.
