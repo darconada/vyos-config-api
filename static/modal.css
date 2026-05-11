@@ -1039,6 +1039,20 @@ tr.pending-delete .pending-badge {
   background-color: rgba(248, 113, 113, 0.2);
 }
 
+/* Inline toggle-off (rule currently disabled) — keeps button visible but muted */
+.btn-icon.btn-toggle-off {
+  color: var(--warning-color, #d97706);
+  opacity: 1;
+}
+
+.btn-icon.btn-toggle-off:hover {
+  background-color: rgba(217, 119, 6, 0.12);
+}
+
+[data-theme="dark"] .btn-icon.btn-toggle-off {
+  color: #fbbf24;
+}
+
 /* Disabled rule - dimmed row */
 tr.rule-disabled {
   opacity: 0.55;
@@ -1053,7 +1067,12 @@ tr.rule-disabled td {
 tr.rule-disabled td .action-badge,
 tr.rule-disabled td .badge,
 tr.rule-disabled td .disabled-badge,
-tr.rule-disabled td .pending-badge {
+tr.rule-disabled td .pending-badge,
+tr.rule-disabled td .btn-icon {
+  text-decoration: none;
+}
+
+tr.rule-disabled td.actions-col {
   text-decoration: none;
 }
 

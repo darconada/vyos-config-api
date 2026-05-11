@@ -503,6 +503,11 @@ function renderNatTable(title, natType, rules, cols) {
               <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
             </svg>
           </button>
+          <button class="btn-icon ${isDisabled ? 'btn-toggle-off' : ''}" onclick="toggleNatRuleDisabled('${natType}', '${id}')" title="${isDisabled ? 'Enable rule' : 'Disable rule'}">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/>
+            </svg>
+          </button>
           <button class="btn-icon btn-danger" onclick="deleteNatRule('${natType}', '${id}')" title="Delete">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
@@ -2623,6 +2628,11 @@ function renderRuleset() {
               <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
             </svg>
           </button>
+          <button class="btn-icon ${isDisabled ? 'btn-toggle-off' : ''}" onclick="toggleFirewallRuleDisabled('${currentRulesetName}', '${id}')" title="${isDisabled ? 'Enable rule' : 'Disable rule'}">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/>
+            </svg>
+          </button>
           <button class="btn-icon btn-danger" onclick="deleteFirewallRule('${currentRulesetName}', '${id}')" title="Delete">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
@@ -4079,6 +4089,76 @@ async function deleteFirewallRule(rulesetName, ruleId) {
   }
 }
 
+async function toggleFirewallRuleDisabled(rulesetName, ruleId) {
+  if (!isConnected) {
+    showToast('warning', 'Not Connected', 'Connect to the router first');
+    return;
+  }
+  const currentRule = CONFIG?.firewall?.name?.[rulesetName]?.rule?.[ruleId];
+  if (!currentRule) {
+    showToast('error', 'Not Found', `Rule ${ruleId} not found`);
+    return;
+  }
+
+  const isDisabled = currentRule.disable !== undefined;
+  const newDisabled = !isDisabled;
+  const verb = newDisabled ? 'disable' : 'enable';
+
+  if (!await ensureWriteLock(`${verb} rule ${ruleId}`)) return;
+
+  const newRuleData = deepClone(currentRule);
+  let diff;
+  if (newDisabled) {
+    newRuleData.disable = {};
+    diff = { sets: [{ path: ['disable'], value: true }], deletes: [] };
+  } else {
+    delete newRuleData.disable;
+    diff = { sets: [], deletes: [['disable']] };
+  }
+
+  const basePath = `firewall ipv4 name ${rulesetName} rule ${ruleId}`;
+  const commands = buildDiffCommands(basePath, diff);
+  const target = `Rule ${ruleId} in ${rulesetName}`;
+  const displayVerb = newDisabled ? 'Disable' : 'Enable';
+
+  if (stagedMode) {
+    addPendingOperation({
+      type: 'firewall',
+      action: 'update',
+      data: { ruleset: rulesetName, rule_id: ruleId, rule: newRuleData, diff },
+      display: `${displayVerb} firewall rule ${ruleId} in ${rulesetName}`
+    });
+    return;
+  }
+
+  const doApply = async () => {
+    try {
+      showLoading(`${displayVerb.slice(0, -1)}ing rule...`);
+      const data = await clusterApplyFetch('/api/firewall/rule', 'POST', {
+        ruleset: rulesetName, rule_id: ruleId, rule: newRuleData, diff
+      });
+      showToast('success', `Rule ${displayVerb}d`,
+                `Rule ${ruleId} ${newDisabled ? 'disabled' : 'enabled'} successfully`);
+      logActivity('firewall', 'update', target, 'success',
+                  `Firewall rule ${ruleId} ${newDisabled ? 'disabled' : 'enabled'}${clusterNodesSuffix(data)}`, commands);
+      hasUnsavedChanges = true;
+      updateSaveIndicator();
+      await reloadConfig();
+      viewRuleset(rulesetName);
+    } catch (e) {
+      if (!e.isDivergence && !e.isLocked) showToast('error', 'Error', e.message);
+      logActivity('firewall', 'update', target, 'error', `Failed to ${verb} firewall rule: ${e.message}`, commands);
+      viewRuleset(rulesetName);
+    }
+  };
+
+  if (verboseMode) {
+    showCommandPreview(commands, doApply);
+  } else {
+    await doApply();
+  }
+}
+
 // =========================================
 // NAT CRUD
 // =========================================
@@ -4376,6 +4456,80 @@ async function deleteNatRule(natType, ruleId) {
     showCommandPreview(commands, doDelete);
   } else {
     await doDelete();
+  }
+}
+
+async function toggleNatRuleDisabled(natType, ruleId) {
+  if (!isConnected) {
+    showToast('warning', 'Not Connected', 'Connect to the router first');
+    return;
+  }
+  const currentRule = CONFIG?.nat?.[natType]?.rule?.[ruleId];
+  if (!currentRule) {
+    showToast('error', 'Not Found', `NAT rule ${ruleId} not found`);
+    return;
+  }
+
+  const isDisabled = currentRule.disable !== undefined;
+  const newDisabled = !isDisabled;
+  const verb = newDisabled ? 'disable' : 'enable';
+
+  if (!await ensureWriteLock(`${verb} NAT rule ${ruleId}`)) return;
+
+  const newRuleData = deepClone(currentRule);
+  let diff;
+  if (newDisabled) {
+    newRuleData.disable = {};
+    diff = { sets: [{ path: ['disable'], value: true }], deletes: [] };
+  } else {
+    delete newRuleData.disable;
+    diff = { sets: [], deletes: [['disable']] };
+  }
+
+  const basePath = `nat ${natType} rule ${ruleId}`;
+  const commands = buildDiffCommands(basePath, diff);
+  const target = `${natType} NAT rule ${ruleId}`;
+  const displayVerb = newDisabled ? 'Disable' : 'Enable';
+
+  if (stagedMode) {
+    addPendingOperation({
+      type: 'nat',
+      action: 'update',
+      data: { nat_type: natType, rule_id: ruleId, rule: newRuleData, diff },
+      display: `${displayVerb} ${natType} NAT rule ${ruleId}`
+    });
+    return;
+  }
+
+  const doApply = async () => {
+    try {
+      showLoading(`${displayVerb.slice(0, -1)}ing NAT rule...`);
+      const data = await clusterApplyFetch('/api/nat/rule', 'POST', {
+        nat_type: natType, rule_id: ruleId, rule: newRuleData, diff
+      });
+      showToast('success', `NAT Rule ${displayVerb}d`,
+                `NAT rule ${ruleId} ${newDisabled ? 'disabled' : 'enabled'} successfully`);
+      logActivity('nat', 'update', target, 'success',
+                  `NAT rule ${ruleId} ${newDisabled ? 'disabled' : 'enabled'}${clusterNodesSuffix(data)}`, commands);
+      hasUnsavedChanges = true;
+      updateSaveIndicator();
+      const natRes = await fetch('/api/NAT');
+      if (natRes.ok) {
+        natData = await natRes.json();
+        if (CONFIG) CONFIG.nat = natData;
+      }
+      loadNat();
+    } catch (e) {
+      if (!e.isDivergence && !e.isLocked) showToast('error', 'Error', e.message);
+      logActivity('nat', 'update', target, 'error', `Failed to ${verb} NAT rule: ${e.message}`, commands);
+      loadNat();
+    }
+  };
+
+  if (verboseMode) {
+    showCommandPreview(commands, doApply);
+  } else {
+    await doApply();
   }
 }
 
