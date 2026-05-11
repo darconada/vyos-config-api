@@ -3830,6 +3830,7 @@ async function openFirewallRuleModal(mode = 'create', rulesetName = null, ruleId
     document.getElementById('fwRuleAction').value = rule.action || 'accept';
     document.getElementById('fwRuleProtocol').value = rule.protocol || '';
     document.getElementById('fwRuleDescription').value = rule.description || '';
+    document.getElementById('fwRuleDisable').checked = rule.disable !== undefined;
     document.getElementById('fwRuleSrcAddress').value = rule.source?.address || '';
     document.getElementById('fwRuleSrcPort').value = rule.source?.port || '';
     document.getElementById('fwRuleDstAddress').value = rule.destination?.address || '';
@@ -3876,6 +3877,10 @@ async function saveFirewallRule() {
   // Add jump-target if action is jump
   if (action === 'jump' && jumpTarget) {
     ruleData['jump-target'] = jumpTarget;
+  }
+
+  if (document.getElementById('fwRuleDisable').checked) {
+    ruleData.disable = true;
   }
 
   // Source
@@ -4132,11 +4137,13 @@ async function openNatRuleModal(mode = 'create', natType = 'destination', ruleId
       document.getElementById('natRuleTransPort').value = rule.translation?.port || '';
       // Exclude flag (VyOS stores it as an empty object or string when set)
       document.getElementById('natRuleExclude').checked = rule.exclude !== undefined;
+      document.getElementById('natRuleDisable').checked = rule.disable !== undefined;
     }
   } else {
     document.getElementById('natRuleTitle').textContent = 'New NAT Rule';
     document.getElementById('natRuleId').value = '';
     document.getElementById('natRuleExclude').checked = false;
+    document.getElementById('natRuleDisable').checked = false;
   }
   toggleNatExclude();
   openModal('natRuleModal');
@@ -4171,6 +4178,10 @@ async function saveNatRule() {
     ruleData.translation = { address: transAddr };
     const transPort = document.getElementById('natRuleTransPort').value.trim();
     if (transPort) ruleData.translation.port = transPort;
+  }
+
+  if (document.getElementById('natRuleDisable').checked) {
+    ruleData.disable = true;
   }
 
   const iface = document.getElementById('natRuleInterface').value.trim();
@@ -4857,6 +4868,9 @@ function buildFirewallCommands(ruleset, ruleId, ruleData) {
   if (ruleData.description) {
     commands.push({ op: 'set', cmd: `set ${basePath} description '${ruleData.description}'` });
   }
+  if (ruleData.disable) {
+    commands.push({ op: 'set', cmd: `set ${basePath} disable` });
+  }
 
   // Source
   if (ruleData.source) {
@@ -4906,6 +4920,11 @@ function buildNatCommands(natType, ruleId, ruleData) {
   // Exclude flag
   if (ruleData.exclude) {
     commands.push({ op: 'set', cmd: `set ${basePath} exclude` });
+  }
+
+  // Disable flag
+  if (ruleData.disable) {
+    commands.push({ op: 'set', cmd: `set ${basePath} disable` });
   }
 
   // Source
