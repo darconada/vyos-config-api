@@ -743,16 +743,25 @@ def fetch_peer():
         peer = VyOSAPI(peer_host, peer_key, peer_port)
         peer.host = peer_host
         peer.port = peer_port
-        raw = peer.get_config()
-        peer_cfg = load_config(raw)
-
-        peer_hostname = peer_cfg.get('system', {}).get('host-name')
+        # Connect-peer sólo necesita validar que el peer responde y comprobar el
+        # hostname. Pedimos únicamente el path mínimo para que VyOS no tenga que
+        # serializar la config completa (costoso en routers grandes). El primer
+        # runSyncCheck posterior se encargará de descargar el config completo en
+        # paralelo con el del primary, y populará sess['peer_config'] entonces.
+        raw_hostname = peer.get_config(['system', 'host-name'])
+        if isinstance(raw_hostname, str):
+            peer_hostname = raw_hostname
+        elif isinstance(raw_hostname, dict):
+            peer_hostname = (raw_hostname.get('host-name')
+                             or next(iter(raw_hostname.values()), None))
+        else:
+            peer_hostname = None
         expected_peer = cluster_info.get('peer_name')
         hostname_mismatch = (peer_hostname != expected_peer)
 
         sess['peer_api'] = peer
-        sess['peer_config'] = peer_cfg
-        sess['raw_peer_config'] = raw
+        sess['peer_config'] = None
+        sess['raw_peer_config'] = None
         sess['cluster_info'] = {**cluster_info, 'peer_connected': True,
                                 'peer_host': peer_host, 'peer_port': peer_port,
                                 'peer_hostname_reported': peer_hostname}
