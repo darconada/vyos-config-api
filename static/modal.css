@@ -816,6 +816,12 @@
   z-index: 150;
 }
 
+/* Confirm modal must sit above any other modal so prompts opened from inside
+   a form modal (e.g. the rule renumber confirm) are not obscured. */
+#confirmModal {
+  z-index: 200;
+}
+
 #commandPreviewModal .modal-backdrop {
   background-color: rgba(0, 0, 0, 0.3);
 }

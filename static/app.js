@@ -111,6 +111,12 @@ let originalServerStates = new Map();
 let originalFirewallRule = null;
 let originalNatRule = null;
 
+// Store original rule identity (ruleset + rule_id) when editing,
+// so we can detect renumber/move and translate it to delete+create.
+let originalFirewallRuleset = null;
+let originalFirewallRuleId = null;
+let originalNatRuleId = null;
+
 // =========================================
 // THEME MANAGEMENT
 // =========================================
@@ -3082,6 +3088,7 @@ async function showGroup(type, name) {
             </ul>
           </div>
           <div class="modal-footer">
+            <button class="btn btn-primary" onclick="editGroupFromView('${type}', '${escapeHtml(realName)}')">Edit Group</button>
             <button class="btn btn-secondary" onclick="closeModal('groupModal')">Close</button>
           </div>
         </div>
@@ -3090,6 +3097,25 @@ async function showGroup(type, name) {
   } catch (e) {
     showToast('error', 'Error', 'Failed to load group details');
   }
+}
+
+// Jump from the read-only group preview (opened from a firewall rules view)
+// straight into the full group editor. The editor reads from `groupsData`,
+// which is only populated when the user has visited the Groups section, so
+// we ensure it's loaded before opening.
+async function editGroupFromView(type, name) {
+  closeModal('groupModal');
+  try {
+    if (!groupsData) {
+      const res = await fetch('/api/firewall/groups');
+      if (res.ok) groupsData = await res.json();
+    }
+  } catch (e) {
+    showToast('error', 'Error', 'Failed to load groups');
+    return;
+  }
+  // Give the close animation a tick so the editor opens on a clean stack.
+  setTimeout(() => openGroupModal('edit', type, name), 50);
 }
 
 // =========================================
@@ -3699,14 +3725,22 @@ function openConfirmModal(title, message) {
     document.getElementById('confirmMessage').textContent = message;
     const okBtn = document.getElementById('confirmOk');
     const cancelBtn = document.getElementById('confirmCancel');
+    const modal = document.getElementById('confirmModal');
+    // Force above any other open modal (rule/NAT modals, command preview, etc.)
+    // so confirms opened from inside another modal are never obscured.
+    modal.style.zIndex = '1000';
     const cleanup = () => {
       okBtn.onclick = null;
       cancelBtn.onclick = null;
       closeModal('confirmModal');
+      // Reset so the modal returns to its CSS-defined stacking when reused.
+      modal.style.zIndex = '';
     };
     okBtn.onclick = () => { cleanup(); resolve(true); };
     cancelBtn.onclick = () => { cleanup(); resolve(false); };
     openModal('confirmModal');
+    // Pull keyboard focus off any underlying modal input.
+    setTimeout(() => okBtn.focus(), 0);
   });
 }
 
@@ -3813,6 +3847,8 @@ async function openFirewallRuleModal(mode = 'create', rulesetName = null, ruleId
   }
   document.getElementById('fwJumpTargetGroup').classList.add('hidden');
   originalFirewallRule = null;
+  originalFirewallRuleset = null;
+  originalFirewallRuleId = null;
 
   // Open the modal first so the user gets immediate visual feedback on click.
   // The selector population and field assignments are deferred to the next
@@ -3835,6 +3871,8 @@ async function openFirewallRuleModal(mode = 'create', rulesetName = null, ruleId
     } else {
       originalFirewallRule = deepClone(rule);
     }
+    originalFirewallRuleset = rulesetName;
+    originalFirewallRuleId = String(ruleId);
 
     document.getElementById('fwRuleId').value = ruleId;
     document.getElementById('fwRuleAction').value = rule.action || 'accept';
@@ -3932,6 +3970,38 @@ async function saveFirewallRule() {
   const isEdit = originalFirewallRule !== null;
   let diff = null;
 
+  // If the rule's identity (ruleset or rule_id) changed during edit, this is
+  // really a delete+create (VyOS rule IDs are the config-tree key and cannot
+  // be renamed in place). Handle that path separately.
+  const keyChanged = isEdit && (
+    String(originalFirewallRuleset) !== String(ruleset) ||
+    String(originalFirewallRuleId) !== String(ruleId)
+  );
+
+  if (keyChanged) {
+    // Reject if the destination key is already taken by another rule.
+    const existing = CONFIG?.firewall?.name?.[ruleset]?.rule?.[ruleId];
+    if (existing) {
+      showToast('error', 'ID Conflict',
+        `Rule ${ruleId} already exists in ${ruleset}. Pick a free ID.`);
+      return;
+    }
+    const movedRuleset = String(originalFirewallRuleset) !== String(ruleset);
+    const promptMsg = movedRuleset
+      ? `This will delete rule ${originalFirewallRuleId} from ${originalFirewallRuleset} and create rule ${ruleId} in ${ruleset}. Evaluation order will change and any per-rule group naming convention will need to be updated by hand. Continue?`
+      : `This will delete rule ${originalFirewallRuleId} and create rule ${ruleId} in ${ruleset}. Evaluation order will change and any per-rule group naming convention will need to be updated by hand. Continue?`;
+    const ok = await openConfirmModal('Renumber Rule?', promptMsg);
+    if (!ok) return;
+    await applyFirewallRuleRenumber({
+      oldRuleset: originalFirewallRuleset,
+      oldRuleId: originalFirewallRuleId,
+      newRuleset: ruleset,
+      newRuleId: ruleId,
+      ruleData
+    });
+    return;
+  }
+
   if (isEdit) {
     // Compute differential changes
     diff = getRuleDiff(originalFirewallRule, ruleData);
@@ -3950,12 +4020,16 @@ async function saveFirewallRule() {
         addPendingOperation(operationData);
         closeModal('firewallRuleModal');
         originalFirewallRule = null;
+        originalFirewallRuleset = null;
+        originalFirewallRuleId = null;
         return;
       }
       // No pending operation - just show "No Changes"
       showToast('info', 'No Changes', 'No changes detected');
       closeModal('firewallRuleModal');
       originalFirewallRule = null;
+      originalFirewallRuleset = null;
+      originalFirewallRuleId = null;
       return;
     }
   }
@@ -3976,6 +4050,8 @@ async function saveFirewallRule() {
     addPendingOperation(operationData);
     closeModal('firewallRuleModal');
     originalFirewallRule = null;
+    originalFirewallRuleset = null;
+    originalFirewallRuleId = null;
     return;
   }
 
@@ -4017,6 +4093,8 @@ async function saveFirewallRule() {
       viewRuleset(ruleset);
     } finally {
       originalFirewallRule = null;
+      originalFirewallRuleset = null;
+      originalFirewallRuleId = null;
     }
   };
 
@@ -4033,6 +4111,74 @@ async function saveFirewallRule() {
     showCommandPreview(commands, doSave);
   } else {
     await doSave();
+  }
+}
+
+// Apply a firewall rule renumber/move as delete(old) + create(new).
+// VyOS rule IDs are tree keys, so this is the only safe translation.
+async function applyFirewallRuleRenumber({oldRuleset, oldRuleId, newRuleset, newRuleId, ruleData}) {
+  const deleteOp = {
+    type: 'firewall',
+    action: 'delete',
+    data: { ruleset: oldRuleset, rule_id: oldRuleId },
+    display: `Delete firewall rule ${oldRuleId} from ${oldRuleset}`
+  };
+  const createOp = {
+    type: 'firewall',
+    action: 'create',
+    data: { ruleset: newRuleset, rule_id: newRuleId, rule: ruleData },
+    display: `Create firewall rule ${newRuleId} in ${newRuleset}`
+  };
+
+  // Staged mode: queue both operations and let the user review them.
+  if (stagedMode) {
+    addPendingOperation(deleteOp);
+    addPendingOperation(createOp);
+    closeModal('firewallRuleModal');
+    originalFirewallRule = null;
+    originalFirewallRuleset = null;
+    originalFirewallRuleId = null;
+    return;
+  }
+
+  // Immediate mode: send both ops in one batch so they apply atomically.
+  const operations = [deleteOp, createOp];
+  const commands = [
+    ...buildDeleteCommand('firewall', oldRuleset, oldRuleId),
+    ...buildFirewallCommands(newRuleset, newRuleId, ruleData)
+  ];
+  const target = (oldRuleset === newRuleset)
+    ? `Rule ${oldRuleId} → ${newRuleId} in ${newRuleset}`
+    : `Rule ${oldRuleId}@${oldRuleset} → ${newRuleId}@${newRuleset}`;
+
+  const doApply = async () => {
+    closeModal('firewallRuleModal');
+    try {
+      showLoading('Renumbering rule...');
+      const data = await clusterApplyFetch('/api/batch-configure', 'POST', { operations });
+      showToast('success', 'Rule Renumbered', target);
+      logActivity('firewall', 'renumber', target, 'success',
+                  `Renumbered firewall rule${clusterNodesSuffix(data)}`, commands);
+      hasUnsavedChanges = true;
+      updateSaveIndicator();
+      await reloadConfig();
+      viewRuleset(newRuleset);
+    } catch (e) {
+      if (!e.isDivergence && !e.isLocked) showToast('error', 'Error', e.message);
+      logActivity('firewall', 'renumber', target, 'error',
+                  `Failed to renumber rule: ${e.message}`, commands);
+      viewRuleset(oldRuleset);
+    } finally {
+      originalFirewallRule = null;
+      originalFirewallRuleset = null;
+      originalFirewallRuleId = null;
+    }
+  };
+
+  if (verboseMode) {
+    showCommandPreview(commands, doApply);
+  } else {
+    await doApply();
   }
 }
 
@@ -4190,6 +4336,7 @@ async function openNatRuleModal(mode = 'create', natType = 'destination', ruleId
 
   // Reset original rule state
   originalNatRule = null;
+  originalNatRuleId = null;
 
   if (mode === 'edit' && ruleId) {
     document.getElementById('natRuleTitle').textContent = `Edit NAT Rule ${ruleId}`;
@@ -4203,6 +4350,7 @@ async function openNatRuleModal(mode = 'create', natType = 'destination', ruleId
       } else {
         originalNatRule = deepClone(rule);
       }
+      originalNatRuleId = String(ruleId);
 
       document.getElementById('natRuleId').value = ruleId;
       document.getElementById('natRuleDescription').value = rule.description || '';
@@ -4292,6 +4440,29 @@ async function saveNatRule() {
   const isEdit = originalNatRule !== null;
   let diff = null;
 
+  // If the NAT rule's ID changed during edit, translate to delete+create.
+  // (nat_type is fixed by the modal so only the rule_id can move.)
+  const keyChanged = isEdit && String(originalNatRuleId) !== String(ruleId);
+
+  if (keyChanged) {
+    const existing = CONFIG?.nat?.[natType]?.rule?.[ruleId];
+    if (existing) {
+      showToast('error', 'ID Conflict',
+        `${natType} NAT rule ${ruleId} already exists. Pick a free ID.`);
+      return;
+    }
+    const ok = await openConfirmModal('Renumber NAT Rule?',
+      `This will delete ${natType} NAT rule ${originalNatRuleId} and create rule ${ruleId}. Evaluation order will change and any per-rule group naming convention will need to be updated by hand. Continue?`);
+    if (!ok) return;
+    await applyNatRuleRenumber({
+      natType,
+      oldRuleId: originalNatRuleId,
+      newRuleId: ruleId,
+      ruleData
+    });
+    return;
+  }
+
   if (isEdit) {
     // Compute differential changes
     diff = getRuleDiff(originalNatRule, ruleData);
@@ -4310,12 +4481,14 @@ async function saveNatRule() {
         addPendingOperation(operationData);
         closeModal('natRuleModal');
         originalNatRule = null;
+        originalNatRuleId = null;
         return;
       }
       // No pending operation - just show "No Changes"
       showToast('info', 'No Changes', 'No changes detected');
       closeModal('natRuleModal');
       originalNatRule = null;
+      originalNatRuleId = null;
       return;
     }
   }
@@ -4336,6 +4509,7 @@ async function saveNatRule() {
     addPendingOperation(operationData);
     closeModal('natRuleModal');
     originalNatRule = null;
+    originalNatRuleId = null;
     return;
   }
 
@@ -4381,6 +4555,7 @@ async function saveNatRule() {
       loadNat();
     } finally {
       originalNatRule = null;
+      originalNatRuleId = null;
     }
   };
 
@@ -4397,6 +4572,71 @@ async function saveNatRule() {
     showCommandPreview(commands, doSave);
   } else {
     await doSave();
+  }
+}
+
+// Apply a NAT rule renumber as delete(old) + create(new).
+async function applyNatRuleRenumber({natType, oldRuleId, newRuleId, ruleData}) {
+  const deleteOp = {
+    type: 'nat',
+    action: 'delete',
+    data: { nat_type: natType, rule_id: oldRuleId },
+    display: `Delete ${natType} NAT rule ${oldRuleId}`
+  };
+  const createOp = {
+    type: 'nat',
+    action: 'create',
+    data: { nat_type: natType, rule_id: newRuleId, rule: ruleData },
+    display: `Create ${natType} NAT rule ${newRuleId}`
+  };
+
+  if (stagedMode) {
+    addPendingOperation(deleteOp);
+    addPendingOperation(createOp);
+    closeModal('natRuleModal');
+    originalNatRule = null;
+    originalNatRuleId = null;
+    return;
+  }
+
+  const operations = [deleteOp, createOp];
+  const commands = [
+    ...buildDeleteCommand('nat', natType, oldRuleId),
+    ...buildNatCommands(natType, newRuleId, ruleData)
+  ];
+  const target = `${natType} NAT rule ${oldRuleId} → ${newRuleId}`;
+
+  const doApply = async () => {
+    closeModal('natRuleModal');
+    try {
+      showLoading('Renumbering NAT rule...');
+      const data = await clusterApplyFetch('/api/batch-configure', 'POST', { operations });
+      showToast('success', 'NAT Rule Renumbered', target);
+      logActivity('nat', 'renumber', target, 'success',
+                  `Renumbered ${natType} NAT rule${clusterNodesSuffix(data)}`, commands);
+      hasUnsavedChanges = true;
+      updateSaveIndicator();
+      const natRes = await fetch('/api/NAT');
+      if (natRes.ok) {
+        natData = await natRes.json();
+        if (CONFIG) CONFIG.nat = natData;
+      }
+      loadNat();
+    } catch (e) {
+      if (!e.isDivergence && !e.isLocked) showToast('error', 'Error', e.message);
+      logActivity('nat', 'renumber', target, 'error',
+                  `Failed to renumber NAT rule: ${e.message}`, commands);
+      loadNat();
+    } finally {
+      originalNatRule = null;
+      originalNatRuleId = null;
+    }
+  };
+
+  if (verboseMode) {
+    showCommandPreview(commands, doApply);
+  } else {
+    await doApply();
   }
 }
 
