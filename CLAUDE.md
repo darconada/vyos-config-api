@@ -356,6 +356,16 @@ The `adapt_14()` function now copies the following sections from VyOS 1.4 config
 - `cluster_sync_check` runs the two `get_config()` calls in parallel via `ThreadPoolExecutor`. Wall time = `max(t_primary, t_peer)` instead of the sum.
 - Combined: on the largest in-use router (`es-por-ded2-cgw01-01`), the connect + first-sync-check chain dropped from ~3 min to ~45 s, and per the user this is now acceptable. No further optimisation planned — the remaining cost is VyOS-side JSON rendering of the config tree.
 
+**Manual / forced cluster peer naming (Jun 2026):**
+Some HA clusters don't follow the `-01/-02` hostname convention (e.g. `vyos-cb-lgr-dr-07` ↔ `-08`), so `detect_cluster` (regex `^(.+)-(01|02)$`) doesn't auto-detect them. Three ways to declare the peer now:
+- **Connect dialog**: checkbox "Especificar peer del cluster manualmente" → sends `force_cluster` + `peer_name_override` to `/fetch-config`. Builds `cluster_info` even when auto-detection fails (skips the regex and the VRRP requirement).
+- **Post-connect hint**: if no cluster is auto-detected but `high-availability.vrrp.group` exists, `/fetch-config` returns `cluster_hint:true`; the frontend shows a toast plus a persistent `HA? · SET PEER` badge in the header. Clicking it opens a modal that calls `POST /api/cluster/set-peer` to declare the peer and activate HA **without reconnecting**, then auto-connects the peer.
+- **Peer fallback modal**: accepts `expected_name` so you can connect to a peer by IP whose `host-name` differs, without the `hostname_mismatch` warning firing falsely.
+
+All manual paths set `peer_name_manual:true`. `_cluster_id_for` then derives the write-lock id from the sorted `{primary, peer}` pair (instead of the `-01/-02` base), so two operators entering the same cluster from opposite nodes still share one lock — provided both declare the peer manually.
+
+New endpoint: `POST /api/cluster/set-peer` (`{peer_name}`) — declares the cluster peer on an already-open connection.
+
 ## Known improvements / future work
 
 ### HA cluster sync-check — further reductions (deferred)

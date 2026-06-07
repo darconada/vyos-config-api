@@ -3167,6 +3167,18 @@ async function openFetchModal() {
               <input type="password" id="fw_api_key" placeholder="Your VyOS API key" value="${defaultApiKey.replace(/"/g, '&quot;')}" />
               <span class="modal-form-hint">Precargado desde la configuracion del servidor; sobreescribe si necesitas otra.</span>
             </div>
+            <div class="modal-form-group">
+              <label class="checkbox-label">
+                <input type="checkbox" id="fw_cluster_manual" onchange="document.getElementById('fw_peer_name_row').style.display = this.checked ? 'block' : 'none'" />
+                <span>Especificar peer del cluster manualmente</span>
+              </label>
+              <span class="modal-form-hint">Solo si el segundo nodo no se llama <code>…-02</code>, o si el cluster no se autodetecta.</span>
+            </div>
+            <div class="modal-form-group" id="fw_peer_name_row" style="display:none">
+              <label class="modal-form-label">Nombre (host-name) del peer</label>
+              <input type="text" id="fw_peer_name" placeholder="ej. es-por-lab-fw-backup" />
+              <span class="modal-form-hint">El host-name real del nodo peer. Si solo es accesible por IP, conéctalo y luego ajusta la IP en el diálogo del peer.</span>
+            </div>
           </div>
           <div id="fetchStatus"></div>
         </div>
@@ -3203,6 +3215,8 @@ async function doFetchConfig() {
   const host = document.getElementById('fw_host').value.trim();
   const port = parseInt(document.getElementById('fw_port').value, 10) || 8443;
   const apiKey = document.getElementById('fw_api_key').value;
+  const clusterManual = document.getElementById('fw_cluster_manual')?.checked;
+  const peerName = document.getElementById('fw_peer_name')?.value.trim() || '';
   const statusDiv = document.getElementById('fetchStatus');
   const btn = document.getElementById('doFetch');
 
@@ -3245,10 +3259,15 @@ async function doFetchConfig() {
     </div>`;
 
   try {
+    const fetchBody = { host, port, api_key: apiKey };
+    if (clusterManual) {
+      fetchBody.force_cluster = true;
+      if (peerName) fetchBody.peer_name_override = peerName;
+    }
     const res = await fetch('/fetch-config', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ host, port, api_key: apiKey })
+      body: JSON.stringify(fetchBody)
     });
     const j = await res.json();
 
@@ -3276,6 +3295,13 @@ async function doFetchConfig() {
     if (clusterInfo?.detected) {
       updateClusterBadge('detected', clusterInfo);
       autoConnectPeer();  // fire and forget (toasts on result)
+    } else if (j.cluster_hint) {
+      // Hay VRRP pero el nombre no sigue -01/-02: no se pudo autodetectar el cluster.
+      // Badge persistente "HA? · SET PEER" para declarar el peer sin reconectar.
+      updateClusterBadge('hint');
+      showToast('warning', 'Posible cluster HA',
+        'Este equipo tiene VRRP configurado pero su nombre no sigue -01/-02. Usa el indicador "HA?" del header para declarar el nodo peer y activar el modo HA.',
+        8000);
     } else {
       updateClusterBadge(null);
     }
@@ -6496,7 +6522,15 @@ function updateClusterBadge(state, info = null) {
   const soloSuffix = (!dualApplyEnabled && clusterInfo?.peer_connected) ? ' · SOLO' : '';
 
   clusterSyncState = state;
-  if (state === 'detected') {
+  if (state === 'hint') {
+    // VRRP presente pero el nombre no sigue -01/-02: no se autodetectó cluster.
+    // Badge persistente para declarar el peer sin reconectar.
+    badge.classList.add('state-detected');
+    label.textContent = 'HA?';
+    stateEl.textContent = 'SET PEER';
+    badge.title = 'VRRP detectado pero el nombre no sigue -01/-02. Click para indicar el nodo peer y activar el modo HA.';
+    badge.onclick = () => openSpecifyPeerModal();
+  } else if (state === 'detected') {
     badge.classList.add('state-detected');
     stateEl.textContent = 'PEER?';
     badge.title = `Cluster detectado. Click para conectar al peer ${clusterInfo?.peer_name || ''}`;
@@ -6559,6 +6593,79 @@ async function autoConnectPeer(forceRetry = false) {
   }
 }
 
+// Modal para declarar el peer manualmente sobre una conexión ya abierta
+// (clusters cuyo nombre no sigue -01/-02). Fija el cluster_info vía
+// /api/cluster/set-peer y dispara el connect del peer sin reconectar.
+function openSpecifyPeerModal() {
+  const existing = document.getElementById('specifyPeerModal');
+  if (existing) existing.remove();
+  const html = `
+    <div class="modal" id="specifyPeerModal">
+      <div class="modal-backdrop" onclick="closeModal('specifyPeerModal')"></div>
+      <div class="modal-content modal-md">
+        <div class="modal-header">
+          <h3>Indicar nodo peer del cluster</h3>
+          <button class="modal-close" onclick="closeModal('specifyPeerModal')">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+            </svg>
+          </button>
+        </div>
+        <div class="modal-body">
+          <div class="modal-alert info" style="margin-bottom:1rem;">
+            <div class="modal-alert-content">
+              <div class="modal-alert-message">Este equipo tiene VRRP pero su nombre no sigue -01/-02. Indica el host-name del nodo peer para activar el modo HA.</div>
+            </div>
+          </div>
+          <div class="modal-form-group">
+            <label class="modal-form-label">Nombre (host-name) del peer <span class="required">*</span></label>
+            <input type="text" id="specifyPeerName" placeholder="ej. vyos-cb-lgr-dr-08" />
+            <span class="modal-form-hint">Si solo es accesible por IP, se abrirá el diálogo de conexión del peer para ajustarla.</span>
+          </div>
+          <div id="specifyPeerStatus"></div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" onclick="closeModal('specifyPeerModal')">Cancelar</button>
+          <button class="btn btn-primary" id="specifyPeerSubmit">Activar HA</button>
+        </div>
+      </div>
+    </div>`;
+  document.body.insertAdjacentHTML('beforeend', html);
+  document.getElementById('specifyPeerSubmit').onclick = submitSpecifyPeer;
+  const input = document.getElementById('specifyPeerName');
+  input.focus();
+  input.addEventListener('keydown', e => { if (e.key === 'Enter') submitSpecifyPeer(); });
+}
+
+async function submitSpecifyPeer() {
+  const peerName = document.getElementById('specifyPeerName').value.trim();
+  const statusDiv = document.getElementById('specifyPeerStatus');
+  const btn = document.getElementById('specifyPeerSubmit');
+  if (!peerName) {
+    statusDiv.innerHTML = `<div class="modal-alert error"><div class="modal-alert-content"><div class="modal-alert-title">Nombre requerido</div></div></div>`;
+    return;
+  }
+  btn.disabled = true;
+  btn.innerHTML = '<div class="loading-spinner"></div> Activando…';
+  try {
+    const res = await fetch('/api/cluster/set-peer', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ peer_name: peerName })
+    });
+    const j = await res.json();
+    if (!res.ok) throw new Error(j.error || 'unknown');
+    clusterInfo = j.cluster_info;
+    closeModal('specifyPeerModal');
+    updateClusterBadge('detected', clusterInfo);
+    logActivity('cluster', 'set-peer', peerName, 'success', `Peer declarado manualmente: ${peerName}`);
+    autoConnectPeer(true);  // intenta conectar; si falla por IP, abre el fallback
+  } catch (e) {
+    statusDiv.innerHTML = `<div class="modal-alert error"><div class="modal-alert-content"><div class="modal-alert-title">Error</div><div class="modal-alert-message">${escapeHtml(e.message)}</div></div></div>`;
+    btn.disabled = false;
+    btn.textContent = 'Reintentar';
+  }
+}
+
 function openPeerFallbackModal(initialError = '') {
   const existing = document.getElementById('peerFallbackModal');
   if (existing) existing.remove();
@@ -6592,6 +6699,12 @@ function openPeerFallbackModal(initialError = '') {
             <input type="text" id="peerFallbackHost" placeholder="10.0.0.2 o ${escapeHtml(clusterInfo?.peer_name || '')}"
                    value="${escapeHtml(clusterInfo?.peer_name || '')}" />
           </div>
+          <div class="modal-form-group">
+            <label class="modal-form-label">Nombre (host-name) esperado del peer</label>
+            <input type="text" id="peerFallbackExpected" placeholder="${escapeHtml(clusterInfo?.peer_name || '')}"
+                   value="${escapeHtml(clusterInfo?.peer_name || '')}" />
+            <span class="modal-form-hint">Si conectas por IP, pon aquí el host-name real para que no salte el aviso de discrepancia.</span>
+          </div>
           <div class="modal-form-row">
             <div class="modal-form-group">
               <label class="modal-form-label">HTTPS Port</label>
@@ -6618,6 +6731,7 @@ async function submitPeerFallback() {
   const host = document.getElementById('peerFallbackHost').value.trim();
   const port = document.getElementById('peerFallbackPort').value.trim();
   const key = document.getElementById('peerFallbackKey').value;
+  const expected = document.getElementById('peerFallbackExpected')?.value.trim() || '';
   const statusDiv = document.getElementById('peerFallbackStatus');
   const btn = document.getElementById('peerFallbackSubmit');
 
@@ -6632,6 +6746,7 @@ async function submitPeerFallback() {
   const body = { host };
   if (port) body.port = parseInt(port, 10);
   if (key) body.api_key = key;
+  if (expected) body.expected_name = expected;
 
   try {
     const res = await fetch('/fetch-peer', {

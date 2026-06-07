@@ -91,6 +91,14 @@ def _cluster_id_for(sess):
     info = sess.get('cluster_info')
     if info and info.get('detected'):
         pn = info.get('primary_name', '') or ''
+        # Cluster con nombres manuales (el peer no sigue la convención -01/-02,
+        # o ningún nodo la sigue): el id se deriva del par {primary, peer} sin
+        # orden, para que dos usuarios que entren por nodos distintos del mismo
+        # cluster compartan el mismo lock. Requiere que ambos hayan declarado el
+        # peer manualmente; si uno no lo hace, sus ids no coincidirán.
+        if info.get('peer_name_manual') and info.get('peer_name'):
+            pair = sorted([pn, info['peer_name']])
+            return '||'.join(pair)
         m = _CLUSTER_NAME_RE.match(pn)
         if m:
             return m.group(1)
@@ -661,6 +669,8 @@ def fetch_config():
     host = data.get('host', '').strip()
     api_key = data.get('api_key', '').strip()
     port = int(data.get('port', 443))
+    peer_name_override = (data.get('peer_name_override') or '').strip()
+    force_cluster = bool(data.get('force_cluster'))
 
     if not host:
         return jsonify({'error': 'Host is required'}), 400
@@ -676,6 +686,24 @@ def fetch_config():
         cfg = load_config(raw)
 
         cluster = detect_cluster(cfg)
+
+        # Peer manual / cluster forzado: cuando el segundo nodo no sigue la
+        # convención -01/-02 (o ningún nodo la sigue), el usuario puede declarar
+        # el nombre del peer y/o forzar el modo cluster. Esto sobreescribe la
+        # derivación automática y, si detect_cluster no disparó, construye el
+        # cluster_info a mano (saltándose el regex y el requisito de VRRP).
+        if peer_name_override or force_cluster:
+            primary_name = cfg.get('system', {}).get('host-name') or host
+            if cluster is None:
+                cluster = {'detected': True, 'primary_name': primary_name,
+                           'peer_name': None}
+            if peer_name_override:
+                cluster = {**cluster, 'peer_name': peer_name_override,
+                           'peer_name_manual': True}
+            if not cluster.get('peer_name'):
+                return jsonify({'error': 'Cluster forzado sin nombre de peer: '
+                                'indica el nombre del nodo peer (no se puede '
+                                'derivar porque el primary no sigue -01/-02).'}), 400
 
         sess = _get_session(create=True)
         # Si el usuario estaba conectado a OTRO cluster y tenía su lock,
@@ -704,6 +732,14 @@ def fetch_config():
         response = {'status': 'ok', 'data': cfg}
         if cluster:
             response['cluster_info'] = {**cluster, 'peer_connected': False}
+        else:
+            # No autodetectado, pero si hay VRRP probablemente sea un cluster cuyo
+            # nombre no sigue -01/-02. Avisamos para que el usuario reconecte
+            # marcando "Especificar peer del cluster".
+            vrrp_groups = (cfg.get('high-availability', {})
+                              .get('vrrp', {}).get('group', {}))
+            if vrrp_groups:
+                response['cluster_hint'] = True
 
         _set_audit('connect', target=f'{host}:{port}', nodes=['primary'])
         return jsonify(response)
@@ -738,6 +774,16 @@ def fetch_peer():
 
     peer_key = (data.get('api_key') or '').strip() or active_api.api_key
     peer_port = int(data.get('port') or getattr(active_api, 'port', 443))
+
+    # El fallback permite conectar por IP a un peer cuyo system host-name no
+    # sigue la convención. En ese caso el host (IP) y el nombre esperado difieren,
+    # así que aceptamos expected_name para fijar el peer_name real y que el
+    # control de hostname_mismatch no salte en falso.
+    expected_name = (data.get('expected_name') or '').strip()
+    if expected_name and expected_name != cluster_info.get('peer_name'):
+        cluster_info = {**cluster_info, 'peer_name': expected_name,
+                        'peer_name_manual': True}
+        sess['cluster_info'] = cluster_info
 
     try:
         peer = VyOSAPI(peer_host, peer_key, peer_port)
@@ -791,6 +837,34 @@ def cluster_status():
         'cluster_info': cluster_info,
         'peer_connected': peer_connected,
     })
+
+
+@app.route('/api/cluster/set-peer', methods=['POST'])
+@login_required
+def set_peer_manual():
+    """Declara manualmente el peer del cluster sobre una conexión ya abierta.
+
+    Para clusters cuyo nombre no sigue -01/-02 y por tanto no se autodetectan:
+    permite activar el modo HA sin reconectar, indicando el host-name del peer.
+    """
+    sess = _get_session()
+    if not sess or not sess.get('active_api'):
+        return jsonify({'error': 'No primary connection. Connect to a router first.'}), 400
+    data = request.get_json() or {}
+    peer_name = (data.get('peer_name') or '').strip()
+    if not peer_name:
+        return jsonify({'error': 'peer_name is required'}), 400
+    primary_name = sess.get('config', {}).get('system', {}).get('host-name') \
+        or getattr(sess['active_api'], 'host', None)
+    cluster_info = {'detected': True, 'primary_name': primary_name,
+                    'peer_name': peer_name, 'peer_name_manual': True,
+                    'peer_connected': False}
+    sess['cluster_info'] = cluster_info
+    # Reset de cualquier peer previo: el nombre cambió, el peer hay que reconectarlo.
+    sess['peer_api'] = None
+    sess['peer_config'] = None
+    sess['raw_peer_config'] = None
+    return jsonify({'status': 'ok', 'cluster_info': cluster_info})
 
 
 @app.route('/api/cluster/disconnect-peer', methods=['POST'])
