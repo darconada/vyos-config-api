@@ -29,6 +29,13 @@ Escaneo de atributos por regla vía API (`/retrieve` de `firewall`) sobre
 | icmp / time / recent / dscp / mark / fragment / ipsec | 0 | 0 | 0 |
 | firewall ipv6 | no | no | no |
 
+Segunda tanda (mismo escáner): `lpnfw500-02` (298 reglas), `lp2fsfw01-02`
+(455 reglas, 122 rulesets, hooks grandes: 181 jump-target, 121
+inbound-interface) y `lp2fifw01-02` (189 reglas). Resultado idéntico:
+política movida casi al 100% con grupos, `state-policy` global, y CERO uso de
+state/log/tcp-flags/icmp/limit por regla. Los hooks forward/input son el
+esqueleto de despliegue (interface-match + jump) y no se editan desde la web.
+
 Conclusiones:
 - El estado se lleva en `global-options state-policy` (los dos stateful lo
   tienen); **state por regla queda DESCARTADO del modal**.
