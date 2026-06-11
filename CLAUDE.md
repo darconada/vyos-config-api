@@ -402,11 +402,21 @@ New endpoint: `POST /api/cluster/set-peer` (`{peer_name}`) — declares the clus
 ### Deferred feature designs (see docs/)
 - `docs/drag-and-drop-reorder.md` — drag & drop rule reordering (Checkpoint-style):
   translation to delete+set transactions, gap/cascade strategies, what to build.
-- `docs/renumber-subtree-serializer.md` — wire `_subtree_to_set_ops` into the rule ID
-  change flow so renumber rebuilds from the raw config tree instead of the modal form
-  (currently loses CLI-only fields like `state`).
+  Can build directly on `_build_renumber_ops`.
 - `docs/firewall-field-gaps.md` — VyOS firewall matchers not yet in the modal
-  (state, log, interfaces, negation, 1.4 hooks, IPv6...), prioritized.
+  (state, log, interfaces, negation, 1.4 hooks, IPv6...), prioritized. New modal
+  fields MUST be added to `FW_FORM_FIELDS`/`NAT_FORM_FIELDS` in app.js.
+
+### Renumber without field loss (Jun 2026 — implemented)
+- Rule ID changes are recreated SERVER-SIDE from the raw config tree
+  (`_build_renumber_ops` + `_subtree_to_set_ops`), preserving CLI-only fields
+  (state, log...). Endpoints: `POST /api/firewall/rule/renumber`,
+  `POST /api/nat/rule/renumber`; staged mode queues a composite `renumber` op
+  resolved at Apply All time. Edits made in the same save travel as `diff`.
+- Edit diffs are whitelisted to form-managed fields (`getFormRuleDiff`):
+  previously a normal edit DELETED any CLI-only field of the rule because the
+  diff compared the full config subtree against the form payload.
+  See `docs/renumber-subtree-serializer.md`.
 
 ### HA cluster sync-check — further reductions (deferred)
 

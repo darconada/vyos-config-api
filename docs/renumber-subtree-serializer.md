@@ -1,52 +1,55 @@
-# Renumber de reglas sin pérdida de campos (serializador de subárbol) — diseño
+# Renumber de reglas sin pérdida de campos (serializador de subárbol)
 
-> Estado: **anotado, no implementado** (junio 2026). El helper base YA existe;
-> falta cablearlo en el flujo de cambio de rule ID.
+> Estado: **IMPLEMENTADO** (junio 2026).
 
-## El problema
+## El problema que resolvía
 
-El cambio de rule ID (delete viejo + create nuevo) reconstruye la regla nueva
-**desde el formulario del modal**. La UI solo modela un subconjunto de campos
-(action, jump-target, protocol, description, disable, source/destination con
-address/port/grupos), así que cualquier campo configurado por CLI que el modal
-no conoce (`state established`, `log`, `tcp flags`, `inbound-interface`,
-`recent`, `limit`…) se **pierde silenciosamente** al renumerar la regla.
+El cambio de rule ID (delete viejo + create nuevo) reconstruía la regla nueva
+**desde el formulario del modal**. La UI solo modela un subconjunto de campos,
+así que cualquier campo configurado por CLI que el modal no conoce
+(`state established`, `log`, `tcp flags`, `inbound-interface`…) se perdía
+silenciosamente al renumerar. Peor aún: el flujo de edición normal (diff)
+generaba `delete` de esos campos desconocidos, porque el diff comparaba el
+subárbol completo del config contra el payload del form.
 
-Es el mismo riesgo que tendría el drag & drop (ver
-[drag-and-drop-reorder.md](drag-and-drop-reorder.md)): cualquier operación que
-recree una regla debe partir del árbol crudo del router, nunca del form.
+## Cómo quedó implementado
 
-## Lo que ya existe (junio 2026)
+### Backend
+- `_build_renumber_ops(raw_config, old_path, new_path, diff)` en `app.py`:
+  serializa la regla desde el **árbol crudo cacheado** con
+  `_subtree_to_set_ops` (el mismo helper del rollback), aplica el `diff`
+  opcional (ediciones hechas en el mismo guardado) sobre el path nuevo, y
+  borra el path viejo. Todo en una transacción `/configure`. Valida contra el
+  cache que la regla exista y el destino esté libre (`ValueError` → 400).
+- `build_vyos_operations(operation, raw_config=None)` soporta la acción
+  `renumber` para `firewall` y `nat`; `batch_configure` le pasa el
+  `raw_config` de la sesión, así los renumber **staged** se resuelven en el
+  momento del Apply All (no al encolar).
+- Endpoints: `POST /api/firewall/rule/renumber`
+  (`{ruleset, rule_id, new_ruleset?, new_rule_id, diff?, apply_to_peer?}`) y
+  `POST /api/nat/rule/renumber` (`{nat_type, rule_id, new_rule_id, diff?}`).
+  Pasan por `apply_ops_dual` → heredan dual-apply, pre-flight, write-lock,
+  audit (`firewall.renumber` / `nat.renumber`) y rollback real.
 
-`app.py` tiene `_subtree_to_set_ops(path, node)`, añadido para el rollback real
-de dual-apply. Recorre un subárbol del JSON de VyOS y emite un `set` por hoja,
-manejando:
-- valor único renderizado como string vs múltiples valores como lista;
-- flags sin valor (`disable`, `log`…) renderizados como dict vacío.
+### Frontend
+- `applyFirewallRuleRenumber` / `applyNatRuleRenumber` llaman a los endpoints
+  nuevos; en staged encolan una operación compuesta `action: 'renumber'`
+  (badge MOD en la fila del ID viejo; el subárbol se resuelve server-side al
+  aplicar).
+- Preview verbose con `buildSubtreeCommands`: aplana el subárbol completo de
+  `CONFIG` (incluidos campos no modelados) a comandos `set`.
+- **Whitelist de campos del form** (`FW_FORM_FIELDS` / `NAT_FORM_FIELDS` +
+  `getFormRuleDiff`): los diffs de edición solo pueden emitir `delete` de
+  paths que el formulario modela. Esto corrige el bug del flujo de edición
+  normal que borraba campos CLI-only. Al añadir campos nuevos al modal
+  (ver [firewall-field-gaps.md](firewall-field-gaps.md)), **hay que añadirlos
+  a la whitelist** o el form no podrá borrarlos.
 
-Está probado indirectamente por la suite del rollback (recreación de reglas y
-grupos borrados).
-
-## Lo que falta
-
-1. **Endpoint de renumber** (`POST /api/firewall/rule/renumber`, y equivalente
-   NAT): `{ruleset, old_id, new_id}`. El backend:
-   - lee la regla `old_id` del `sess['raw_config']` (árbol crudo, NO el form);
-   - valida que `new_id` no exista;
-   - construye `_subtree_to_set_ops(base_path_nuevo, rule_subtree)` +
-     `delete` del viejo, en UNA transacción `/configure`;
-   - lo pasa por `apply_ops_dual` (hereda dual-apply, pre-flight, write-lock,
-     audit y rollback).
-2. **Frontend**: cuando el usuario cambia el rule ID en el modal de edición,
-   llamar al endpoint de renumber en vez de generar delete+create desde el
-   form (manteniendo la confirmación explícita actual). Si además editó campos,
-   encadenar: renumber primero, luego el diff de campos sobre el ID nuevo (o
-   componer ambos en la misma transacción).
-3. **Modo staged**: la operación `renumber` como tipo propio en
-   `pendingOperations`, con badge MOV; `build_vyos_operations` resolviendo el
-   subárbol en el momento del Apply All (no al encolar, para no quedarse stale).
-
-## Estimación
-
-Medio día a un día: el serializador y toda la infraestructura de apply ya
-existen; es principalmente el endpoint + tocar el flujo del modal.
+## Pendiente / notas
+- La validación de colisión usa el cache de la sesión; el pre-flight de
+  `apply_ops_dual` refresca ambos nodos justo después, pero el `set` de VyOS
+  sobre un ID ocupado haría merge en vez de fallar. Riesgo residual mínimo
+  (requiere otro operador creando justo ese ID entre el render y el apply,
+  con el write-lock compartido).
+- El drag & drop ([drag-and-drop-reorder.md](drag-and-drop-reorder.md)) puede
+  apoyarse directamente en `_build_renumber_ops` para los movimientos.

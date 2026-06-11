@@ -3268,6 +3268,42 @@ function normFlagValue(v) {
   return v;
 }
 
+// Campos que los formularios de los modales modelan. Los diffs solo pueden
+// emitir DELETES de estos paths: borrar lo que el form no muestra destruiria
+// config puesta por CLI (state, log, tcp flags...).
+const FW_FORM_FIELDS = {
+  'action': true, 'jump-target': true, 'protocol': true, 'description': true, 'disable': true,
+  'source': { 'address': true, 'port': true, 'group': true },
+  'destination': { 'address': true, 'port': true, 'group': true }
+};
+const NAT_FORM_FIELDS = {
+  'description': true, 'protocol': true, 'exclude': true, 'disable': true,
+  'source': { 'address': true, 'port': true },
+  'destination': { 'address': true, 'port': true },
+  'translation': { 'address': true, 'port': true },
+  'inbound-interface': true, 'outbound-interface': true
+};
+
+function isFormManagedPath(fields, path) {
+  let node = fields;
+  for (const seg of path) {
+    if (node === true) return true; // subarbol gestionado por el form
+    if (!node || !(seg in node)) return false;
+    node = node[seg];
+  }
+  return true;
+}
+
+// Diff restringido a lo que el formulario modela. Los sets solo pueden venir
+// del form por construccion; los deletes se filtran contra la whitelist para
+// no borrar campos que el form ni siquiera muestra.
+function getFormRuleDiff(type, original, modified) {
+  const diff = getRuleDiff(original, modified);
+  const fields = type === 'nat' ? NAT_FORM_FIELDS : FW_FORM_FIELDS;
+  diff.deletes = diff.deletes.filter(p => isFormManagedPath(fields, p));
+  return diff;
+}
+
 function getRuleDiff(original, modified, basePath = []) {
   const result = { sets: [], deletes: [] };
 
@@ -3638,19 +3674,21 @@ async function saveFirewallRule() {
       : `This will delete rule ${originalFirewallRuleId} and create rule ${ruleId} in ${ruleset}. Evaluation order will change and any per-rule group naming convention will need to be updated by hand. Continue?`;
     const ok = await openConfirmModal('Renumber Rule?', promptMsg);
     if (!ok) return;
+    const editsDiff = getFormRuleDiff('firewall', originalFirewallRule, ruleData);
+    const hasEdits = editsDiff.sets.length > 0 || editsDiff.deletes.length > 0;
     await applyFirewallRuleRenumber({
       oldRuleset: originalFirewallRuleset,
       oldRuleId: originalFirewallRuleId,
       newRuleset: ruleset,
       newRuleId: ruleId,
-      ruleData
+      diff: hasEdits ? editsDiff : null
     });
     return;
   }
 
   if (isEdit) {
     // Compute differential changes
-    diff = getRuleDiff(originalFirewallRule, ruleData);
+    diff = getFormRuleDiff('firewall', originalFirewallRule, ruleData);
 
     // If no changes from original
     if (diff.sets.length === 0 && diff.deletes.length === 0) {
@@ -3760,48 +3798,64 @@ async function saveFirewallRule() {
   }
 }
 
-// Apply a firewall rule renumber/move as delete(old) + create(new).
-// VyOS rule IDs are tree keys, so this is the only safe translation.
-async function applyFirewallRuleRenumber({oldRuleset, oldRuleId, newRuleset, newRuleId, ruleData}) {
-  const deleteOp = {
-    type: 'firewall',
-    action: 'delete',
-    data: { ruleset: oldRuleset, rule_id: oldRuleId },
-    display: `Delete firewall rule ${oldRuleId} from ${oldRuleset}`
-  };
-  const createOp = {
-    type: 'firewall',
-    action: 'create',
-    data: { ruleset: newRuleset, rule_id: newRuleId, rule: ruleData },
-    display: `Create firewall rule ${newRuleId} in ${newRuleset}`
-  };
-
-  // Staged mode: queue both operations and let the user review them.
-  if (stagedMode) {
-    addPendingOperation(deleteOp);
-    addPendingOperation(createOp);
+// Apply a firewall rule renumber/move. VyOS rule IDs are tree keys, so this
+// is delete(old)+create(new) under the hood, but the recreation is resolved
+// SERVER-SIDE from the raw config tree (/api/firewall/rule/renumber): fields
+// the modal does not model (state, log, tcp flags...) are preserved.
+// Optional `diff` carries edits made in the same save, applied on the new id
+// within the same transaction.
+async function applyFirewallRuleRenumber({oldRuleset, oldRuleId, newRuleset, newRuleId, diff = null}) {
+  const closeAndReset = () => {
     closeModal('firewallRuleModal');
     originalFirewallRule = null;
     originalFirewallRuleset = null;
     originalFirewallRuleId = null;
+  };
+  const target = (oldRuleset === newRuleset)
+    ? `Rule ${oldRuleId} -> ${newRuleId} in ${newRuleset}`
+    : `Rule ${oldRuleId}@${oldRuleset} -> ${newRuleId}@${newRuleset}`;
+
+  // Commands for preview/log: CONFIG holds the full rule subtree (adapted
+  // from raw), so the preview also reflects fields the modal does not model.
+  const subtree = CONFIG?.firewall?.name?.[oldRuleset]?.rule?.[oldRuleId] || {};
+  const newBase = `firewall ipv4 name ${newRuleset} rule ${newRuleId}`;
+  const commands = [
+    ...buildSubtreeCommands(newBase, subtree),
+    ...(diff ? buildDiffCommands(newBase, diff) : []),
+    { op: 'delete', cmd: `delete firewall ipv4 name ${oldRuleset} rule ${oldRuleId}` }
+  ];
+
+  if (stagedMode) {
+    const renumberOp = {
+      type: 'firewall',
+      action: 'renumber',
+      data: { ruleset: oldRuleset, rule_id: oldRuleId,
+              new_ruleset: newRuleset, new_rule_id: newRuleId,
+              ...(diff ? { diff } : {}) },
+      display: `Renumber firewall rule: ${target}`
+    };
+    const marker = buildRuleMarker(renumberOp);
+    const existingIdx = pendingOperations.findIndex(o => buildRuleMarker(o) === marker);
+    if (existingIdx >= 0) pendingOperations.splice(existingIdx, 1);
+    pendingOperations.push(renumberOp);
+    pendingRuleMarkers.add(marker);
+    updatePendingIndicator();
+    showToast('info', 'Staged', renumberOp.display);
+    logActivity('firewall', 'staged', target, 'staged', `Staged: ${renumberOp.display}`, commands);
+    closeAndReset();
+    refreshCurrentViewSoft();
     return;
   }
 
-  // Immediate mode: send both ops in one batch so they apply atomically.
-  const operations = [deleteOp, createOp];
-  const commands = [
-    ...buildDeleteCommand('firewall', oldRuleset, oldRuleId),
-    ...buildFirewallCommands(newRuleset, newRuleId, ruleData)
-  ];
-  const target = (oldRuleset === newRuleset)
-    ? `Rule ${oldRuleId} → ${newRuleId} in ${newRuleset}`
-    : `Rule ${oldRuleId}@${oldRuleset} → ${newRuleId}@${newRuleset}`;
-
   const doApply = async () => {
-    closeModal('firewallRuleModal');
+    closeAndReset();
     try {
       showLoading('Renumbering rule...');
-      const data = await clusterApplyFetch('/api/batch-configure', 'POST', { operations });
+      const data = await clusterApplyFetch('/api/firewall/rule/renumber', 'POST', {
+        ruleset: oldRuleset, rule_id: oldRuleId,
+        new_ruleset: newRuleset, new_rule_id: newRuleId,
+        ...(diff ? { diff } : {})
+      });
       showToast('success', 'Rule Renumbered', target);
       logActivity('firewall', 'renumber', target, 'success',
                   `Renumbered firewall rule${clusterNodesSuffix(data)}`, commands);
@@ -3814,10 +3868,6 @@ async function applyFirewallRuleRenumber({oldRuleset, oldRuleId, newRuleset, new
       logActivity('firewall', 'renumber', target, 'error',
                   `Failed to renumber rule: ${e.message}`, commands);
       viewRuleset(oldRuleset);
-    } finally {
-      originalFirewallRule = null;
-      originalFirewallRuleset = null;
-      originalFirewallRuleId = null;
     }
   };
 
@@ -4100,18 +4150,20 @@ async function saveNatRule() {
     const ok = await openConfirmModal('Renumber NAT Rule?',
       `This will delete ${natType} NAT rule ${originalNatRuleId} and create rule ${ruleId}. Evaluation order will change and any per-rule group naming convention will need to be updated by hand. Continue?`);
     if (!ok) return;
+    const editsDiff = getFormRuleDiff('nat', originalNatRule, ruleData);
+    const hasEdits = editsDiff.sets.length > 0 || editsDiff.deletes.length > 0;
     await applyNatRuleRenumber({
       natType,
       oldRuleId: originalNatRuleId,
       newRuleId: ruleId,
-      ruleData
+      diff: hasEdits ? editsDiff : null
     });
     return;
   }
 
   if (isEdit) {
     // Compute differential changes
-    diff = getRuleDiff(originalNatRule, ruleData);
+    diff = getFormRuleDiff('nat', originalNatRule, ruleData);
 
     // If no changes from original
     if (diff.sets.length === 0 && diff.deletes.length === 0) {
@@ -4221,42 +4273,53 @@ async function saveNatRule() {
   }
 }
 
-// Apply a NAT rule renumber as delete(old) + create(new).
-async function applyNatRuleRenumber({natType, oldRuleId, newRuleId, ruleData}) {
-  const deleteOp = {
-    type: 'nat',
-    action: 'delete',
-    data: { nat_type: natType, rule_id: oldRuleId },
-    display: `Delete ${natType} NAT rule ${oldRuleId}`
-  };
-  const createOp = {
-    type: 'nat',
-    action: 'create',
-    data: { nat_type: natType, rule_id: newRuleId, rule: ruleData },
-    display: `Create ${natType} NAT rule ${newRuleId}`
-  };
-
-  if (stagedMode) {
-    addPendingOperation(deleteOp);
-    addPendingOperation(createOp);
+// Apply a NAT rule renumber. Recreation is resolved server-side from the raw
+// config tree (/api/nat/rule/renumber) so unmodeled fields are preserved.
+async function applyNatRuleRenumber({natType, oldRuleId, newRuleId, diff = null}) {
+  const closeAndReset = () => {
     closeModal('natRuleModal');
     originalNatRule = null;
     originalNatRuleId = null;
+  };
+  const target = `${natType} NAT rule ${oldRuleId} -> ${newRuleId}`;
+  const subtree = CONFIG?.nat?.[natType]?.rule?.[oldRuleId]
+    || natData?.[natType]?.rule?.[oldRuleId] || {};
+  const newBase = `nat ${natType} rule ${newRuleId}`;
+  const commands = [
+    ...buildSubtreeCommands(newBase, subtree),
+    ...(diff ? buildDiffCommands(newBase, diff) : []),
+    { op: 'delete', cmd: `delete nat ${natType} rule ${oldRuleId}` }
+  ];
+
+  if (stagedMode) {
+    const renumberOp = {
+      type: 'nat',
+      action: 'renumber',
+      data: { nat_type: natType, rule_id: oldRuleId, new_rule_id: newRuleId,
+              ...(diff ? { diff } : {}) },
+      display: `Renumber NAT rule: ${target}`
+    };
+    const marker = buildRuleMarker(renumberOp);
+    const existingIdx = pendingOperations.findIndex(o => buildRuleMarker(o) === marker);
+    if (existingIdx >= 0) pendingOperations.splice(existingIdx, 1);
+    pendingOperations.push(renumberOp);
+    pendingRuleMarkers.add(marker);
+    updatePendingIndicator();
+    showToast('info', 'Staged', renumberOp.display);
+    logActivity('nat', 'staged', target, 'staged', `Staged: ${renumberOp.display}`, commands);
+    closeAndReset();
+    refreshCurrentViewSoft();
     return;
   }
 
-  const operations = [deleteOp, createOp];
-  const commands = [
-    ...buildDeleteCommand('nat', natType, oldRuleId),
-    ...buildNatCommands(natType, newRuleId, ruleData)
-  ];
-  const target = `${natType} NAT rule ${oldRuleId} → ${newRuleId}`;
-
   const doApply = async () => {
-    closeModal('natRuleModal');
+    closeAndReset();
     try {
       showLoading('Renumbering NAT rule...');
-      const data = await clusterApplyFetch('/api/batch-configure', 'POST', { operations });
+      const data = await clusterApplyFetch('/api/nat/rule/renumber', 'POST', {
+        nat_type: natType, rule_id: oldRuleId, new_rule_id: newRuleId,
+        ...(diff ? { diff } : {})
+      });
       showToast('success', 'NAT Rule Renumbered', target);
       logActivity('nat', 'renumber', target, 'success',
                   `Renumbered ${natType} NAT rule${clusterNodesSuffix(data)}`, commands);
@@ -4273,9 +4336,6 @@ async function applyNatRuleRenumber({natType, oldRuleId, newRuleId, ruleData}) {
       logActivity('nat', 'renumber', target, 'error',
                   `Failed to renumber NAT rule: ${e.message}`, commands);
       loadNat();
-    } finally {
-      originalNatRule = null;
-      originalNatRuleId = null;
     }
   };
 
@@ -4574,7 +4634,7 @@ function addPendingOperation(operation) {
     const origState = originalServerStates.get(marker);
     if (origState !== undefined && origState !== null) {
       // Compare new rule with original server state
-      const diff = getRuleDiff(origState, operation.data.rule);
+      const diff = getFormRuleDiff(operation.type, origState, operation.data.rule);
       if (diff.sets.length === 0 && diff.deletes.length === 0) {
         // No changes from original - remove the pending operation entirely
         pendingRuleMarkers.delete(marker);
@@ -4863,10 +4923,35 @@ async function discardAllChangesQuiet() {
 }
 
 // Build VyOS commands for a single operation (for verbose mode preview)
+// Aplana un subarbol de config (formato JSON de VyOS) a comandos `set` para
+// previews/logs: string = valor unico, lista = multivalor, {} = flag.
+function buildSubtreeCommands(basePath, node) {
+  if (node === null || node === undefined) return [];
+  if (typeof node !== 'object') {
+    return [{ op: 'set', cmd: `set ${basePath} '${node}'` }];
+  }
+  if (Array.isArray(node)) {
+    return node.map(v => ({ op: 'set', cmd: `set ${basePath} '${v}'` }));
+  }
+  const keys = Object.keys(node);
+  if (keys.length === 0) return [{ op: 'set', cmd: `set ${basePath}` }];
+  const out = [];
+  for (const k of keys) out.push(...buildSubtreeCommands(`${basePath} ${k}`, node[k]));
+  return out;
+}
+
 function buildCommandsForOperation(op) {
   if (op.type === 'firewall') {
     if (op.action === 'delete') {
       return buildDeleteCommand('firewall', op.data.ruleset, op.data.rule_id);
+    } else if (op.action === 'renumber') {
+      const subtree = CONFIG?.firewall?.name?.[op.data.ruleset]?.rule?.[op.data.rule_id] || {};
+      const newBase = `firewall ipv4 name ${op.data.new_ruleset || op.data.ruleset} rule ${op.data.new_rule_id}`;
+      return [
+        ...buildSubtreeCommands(newBase, subtree),
+        ...(op.data.diff ? buildDiffCommands(newBase, op.data.diff) : []),
+        { op: 'delete', cmd: `delete firewall ipv4 name ${op.data.ruleset} rule ${op.data.rule_id}` }
+      ];
     } else if (op.data.diff && op.action === 'update') {
       // Use diff commands for updates
       const basePath = `firewall ipv4 name ${op.data.ruleset} rule ${op.data.rule_id}`;
@@ -4877,6 +4962,14 @@ function buildCommandsForOperation(op) {
   } else if (op.type === 'nat') {
     if (op.action === 'delete') {
       return buildDeleteCommand('nat', op.data.nat_type, op.data.rule_id);
+    } else if (op.action === 'renumber') {
+      const subtree = CONFIG?.nat?.[op.data.nat_type]?.rule?.[op.data.rule_id] || {};
+      const newBase = `nat ${op.data.nat_type} rule ${op.data.new_rule_id}`;
+      return [
+        ...buildSubtreeCommands(newBase, subtree),
+        ...(op.data.diff ? buildDiffCommands(newBase, op.data.diff) : []),
+        { op: 'delete', cmd: `delete nat ${op.data.nat_type} rule ${op.data.rule_id}` }
+      ];
     } else if (op.data.diff && op.action === 'update') {
       // Use diff commands for updates
       const basePath = `nat ${op.data.nat_type} rule ${op.data.rule_id}`;

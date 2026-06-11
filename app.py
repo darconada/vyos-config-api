@@ -1753,6 +1753,90 @@ def manage_nat_rule():
 
 
 # ──────────────────────────────────────────────────────────────
+#  Renumber (cambio de rule ID sin pérdida de campos)
+# ──────────────────────────────────────────────────────────────
+@app.route('/api/firewall/rule/renumber', methods=['POST'])
+@login_required
+@write_lock_required
+def renumber_firewall_rule():
+    """
+    Cambia el ID (y/o ruleset) de una regla de firewall recreándola desde el
+    árbol crudo del router: preserva campos que la UI no modela (state, log…).
+    Body: {ruleset, rule_id, new_ruleset?, new_rule_id, diff?, apply_to_peer?}
+    """
+    sess = _get_session()
+    if not sess or not sess.get('active_api'):
+        return jsonify({'error': 'No active connection. Connect to router first.'}), 400
+
+    data = request.get_json() or {}
+    ruleset = data.get('ruleset')
+    rule_id = data.get('rule_id')
+    new_ruleset = data.get('new_ruleset') or ruleset
+    new_rule_id = data.get('new_rule_id')
+    to_peer = data.get('apply_to_peer')
+
+    if not ruleset or not rule_id or not new_rule_id:
+        return jsonify({'error': 'ruleset, rule_id and new_rule_id are required'}), 400
+
+    try:
+        ops = build_vyos_operations(
+            {'type': 'firewall', 'action': 'renumber',
+             'data': {'ruleset': ruleset, 'rule_id': rule_id,
+                      'new_ruleset': new_ruleset, 'new_rule_id': new_rule_id,
+                      'diff': data.get('diff')}},
+            raw_config=sess.get('raw_config'))
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+    _set_audit('firewall.renumber',
+               target=f'{ruleset}/rule/{rule_id} -> {new_ruleset}/rule/{new_rule_id}',
+               commands=[{'cmd': ' '.join([op.get('op', '')] + list(op.get('path', [])))} for op in ops])
+    result = apply_ops_dual(sess, ops, to_peer_requested=to_peer)
+    g.audit_nodes = result.get('applied_to')
+    return jsonify({'status': 'ok', 'message': 'Rule renumbered successfully', **result})
+
+
+@app.route('/api/nat/rule/renumber', methods=['POST'])
+@login_required
+@write_lock_required
+def renumber_nat_rule():
+    """
+    Cambia el ID de una regla NAT recreándola desde el árbol crudo del router.
+    Body: {nat_type, rule_id, new_rule_id, diff?, apply_to_peer?}
+    """
+    sess = _get_session()
+    if not sess or not sess.get('active_api'):
+        return jsonify({'error': 'No active connection. Connect to router first.'}), 400
+
+    data = request.get_json() or {}
+    nat_type = data.get('nat_type')
+    rule_id = data.get('rule_id')
+    new_rule_id = data.get('new_rule_id')
+    to_peer = data.get('apply_to_peer')
+
+    if not nat_type or not rule_id or not new_rule_id:
+        return jsonify({'error': 'nat_type, rule_id and new_rule_id are required'}), 400
+    if nat_type not in ['source', 'destination']:
+        return jsonify({'error': 'nat_type must be "source" or "destination"'}), 400
+
+    try:
+        ops = build_vyos_operations(
+            {'type': 'nat', 'action': 'renumber',
+             'data': {'nat_type': nat_type, 'rule_id': rule_id,
+                      'new_rule_id': new_rule_id, 'diff': data.get('diff')}},
+            raw_config=sess.get('raw_config'))
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+    _set_audit('nat.renumber',
+               target=f'{nat_type}/rule/{rule_id} -> {nat_type}/rule/{new_rule_id}',
+               commands=[{'cmd': ' '.join([op.get('op', '')] + list(op.get('path', [])))} for op in ops])
+    result = apply_ops_dual(sess, ops, to_peer_requested=to_peer)
+    g.audit_nodes = result.get('applied_to')
+    return jsonify({'status': 'ok', 'message': 'NAT rule renumbered successfully', **result})
+
+
+# ──────────────────────────────────────────────────────────────
 #  API de escritura (Firewall Groups)
 # ──────────────────────────────────────────────────────────────
 @app.route('/api/firewall/group', methods=['POST', 'PUT', 'DELETE'])
@@ -1832,8 +1916,13 @@ def batch_configure():
         return jsonify({'error': 'No operations provided'}), 400
 
     vyos_ops = []
-    for op in operations:
-        vyos_ops.extend(build_vyos_operations(op))
+    try:
+        for op in operations:
+            # raw_config permite resolver renumbers staged contra el árbol
+            # crudo en el momento del Apply All (no al encolar).
+            vyos_ops.extend(build_vyos_operations(op, raw_config=sess.get('raw_config')))
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
 
     if not vyos_ops:
         return jsonify({'error': 'No valid operations to execute'}), 400
@@ -1855,10 +1944,52 @@ def batch_configure():
     })
 
 
-def build_vyos_operations(operation):
+def _tree_lookup(tree, path):
+    """Devuelve el nodo en `path` dentro de `tree`, o None si no existe."""
+    node = tree
+    for k in path:
+        if not isinstance(node, dict) or k not in node:
+            return None
+        node = node[k]
+    return node
+
+
+def _build_renumber_ops(raw_config, old_path, new_path, diff=None):
+    """
+    Renumber = recrear la regla bajo la clave nueva y borrar la vieja, en UNA
+    transacción. El subárbol se serializa desde el ÁRBOL CRUDO cacheado del
+    router, NO desde el formulario: la UI solo modela un subconjunto de campos
+    y reconstruir desde el form perdería silenciosamente lo puesto por CLI
+    (state, log, tcp flags...). `diff` opcional aplica las ediciones hechas en
+    el mismo guardado, expresadas relativas al path nuevo.
+
+    Lanza ValueError si la regla no existe en el cache o el destino está
+    ocupado (validación contra el cache; el pre-flight de apply_ops_dual
+    refresca ambos nodos justo después, antes de tocar el router).
+    """
+    if raw_config is None:
+        raise ValueError('No cached config available to resolve the rule subtree')
+    if list(old_path) == list(new_path):
+        raise ValueError('Renumber requires a different target id')
+    subtree = _tree_lookup(raw_config, old_path)
+    if subtree is None:
+        raise ValueError(f'Rule not found: {" ".join(old_path)}')
+    if _tree_lookup(raw_config, new_path) is not None:
+        raise ValueError(f'Target already exists: {" ".join(new_path)}')
+    ops = _subtree_to_set_ops(list(new_path), subtree)
+    if not ops:
+        ops = [{'op': 'set', 'path': list(new_path)}]
+    if diff:
+        ops.extend(build_diff_operations(list(new_path), diff))
+    ops.append({'op': 'delete', 'path': list(old_path)})
+    return ops
+
+
+def build_vyos_operations(operation, raw_config=None):
     """
     Convierte una operación del frontend a operaciones VyOS (lista de dicts con 'op' y 'path').
-    Soporta actualizaciones diferenciales cuando se incluye 'diff' en los datos.
+    Soporta actualizaciones diferenciales cuando se incluye 'diff' en los datos,
+    y la acción 'renumber' (requiere raw_config para resolver el subárbol).
     """
     ops = []
     op_type = operation.get('type')
@@ -1875,6 +2006,14 @@ def build_vyos_operations(operation):
 
         if action == 'delete':
             ops.append({'op': 'delete', 'path': base_path})
+        elif action == 'renumber':
+            new_ruleset = data.get('new_ruleset') or ruleset
+            new_rule_id = str(data.get('new_rule_id'))
+            ops.extend(_build_renumber_ops(
+                raw_config,
+                old_path=base_path,
+                new_path=['firewall', 'ipv4', 'name', new_ruleset, 'rule', new_rule_id],
+                diff=diff))
         elif diff and action == 'update':
             # Differential update - only change what's different
             ops.extend(build_diff_operations(base_path, diff))
@@ -1919,6 +2058,13 @@ def build_vyos_operations(operation):
 
         if action == 'delete':
             ops.append({'op': 'delete', 'path': base_path})
+        elif action == 'renumber':
+            new_rule_id = str(data.get('new_rule_id'))
+            ops.extend(_build_renumber_ops(
+                raw_config,
+                old_path=base_path,
+                new_path=['nat', nat_type, 'rule', new_rule_id],
+                diff=diff))
         elif diff and action == 'update':
             # Differential update - only change what's different
             ops.extend(build_diff_operations(base_path, diff))
