@@ -3449,8 +3449,14 @@ function normFlagValue(v) {
 const FW_FORM_FIELDS = {
   'action': true, 'jump-target': true, 'protocol': true, 'description': true, 'disable': true, 'log': true,
   'source': { 'address': true, 'port': true, 'group': true },
-  'destination': { 'address': true, 'port': true, 'group': true }
+  'destination': { 'address': true, 'port': true, 'group': true },
+  'tcp': { 'flags': true },
+  'limit': { 'rate': true, 'burst': true },
+  'packet-length': true
 };
+
+const FW_TCP_FLAGS = ['syn', 'ack', 'fin', 'rst', 'urg', 'psh'];
+const fwFlagInputId = (flag, not) => `fwTcpFlag${not ? 'Not' : ''}${flag[0].toUpperCase()}${flag.slice(1)}`;
 const NAT_FORM_FIELDS = {
   'description': true, 'protocol': true, 'exclude': true, 'disable': true,
   'source': { 'address': true, 'port': true },
@@ -3529,6 +3535,18 @@ function getRuleDiff(original, modified, basePath = []) {
     const origVal = normFlagValue(original[key]);
     const modVal = normFlagValue(modified[key]);
     const currentPath = [...basePath, key];
+
+    // Multivalor VyOS (listas: packet-length, entradas de grupo...): comparar
+    // como conjuntos y emitir un set por valor nuevo y un delete por valor
+    // retirado (delete con path = campo + valor). Sin esto, un array entraba
+    // por flattenToSets y generaba paths rotos con indices numericos.
+    if (Array.isArray(origVal) || Array.isArray(modVal)) {
+      const o = origVal === undefined ? [] : (Array.isArray(origVal) ? origVal.map(String) : [String(origVal)]);
+      const m = modVal === undefined ? [] : (Array.isArray(modVal) ? modVal.map(String) : [String(modVal)]);
+      for (const v of m) if (!o.includes(v)) result.sets.push({ path: currentPath, value: v });
+      for (const v of o) if (!m.includes(v)) result.deletes.push([...currentPath, v]);
+      continue;
+    }
 
     // Field removed
     if (modVal === undefined && origVal !== undefined) {
@@ -3763,6 +3781,16 @@ async function openFirewallRuleModal(mode = 'create', rulesetName = null, ruleId
     document.getElementById('fwRuleDescription').value = rule.description || '';
     document.getElementById('fwRuleDisable').checked = rule.disable !== undefined;
     document.getElementById('fwRuleLog').checked = rule.log !== undefined;
+    const flags = rule.tcp?.flags || {};
+    for (const f of FW_TCP_FLAGS) {
+      document.getElementById(fwFlagInputId(f, false)).checked = flags[f] !== undefined;
+      document.getElementById(fwFlagInputId(f, true)).checked = flags.not?.[f] !== undefined;
+    }
+    const pl = rule['packet-length'];
+    document.getElementById('fwPacketLength').value =
+      pl === undefined ? '' : (Array.isArray(pl) ? pl.join(', ') : String(pl));
+    document.getElementById('fwLimitRate').value = rule.limit?.rate || '';
+    document.getElementById('fwLimitBurst').value = rule.limit?.burst || '';
     document.getElementById('fwRuleSrcAddress').value = rule.source?.address || '';
     document.getElementById('fwRuleSrcPort').value = rule.source?.port || '';
     document.getElementById('fwRuleDstAddress').value = rule.destination?.address || '';
@@ -3816,6 +3844,43 @@ async function saveFirewallRule() {
   }
   if (document.getElementById('fwRuleLog').checked) {
     ruleData.log = true;
+  }
+
+  // Matchers avanzados (routers stateless)
+  const tcpFlags = {};
+  const notFlags = {};
+  for (const f of FW_TCP_FLAGS) {
+    if (document.getElementById(fwFlagInputId(f, false)).checked) tcpFlags[f] = true;
+    if (document.getElementById(fwFlagInputId(f, true)).checked) notFlags[f] = true;
+  }
+  if (Object.keys(notFlags).length) tcpFlags.not = notFlags;
+  if (Object.keys(tcpFlags).length) {
+    const proto = document.getElementById('fwRuleProtocol').value;
+    if (proto !== 'tcp' && proto !== 'tcp_udp') {
+      showToast('error', 'Validation Error', 'TCP flags require protocol tcp (or tcp_udp)');
+      return;
+    }
+    ruleData.tcp = { flags: tcpFlags };
+  }
+  const plRaw = document.getElementById('fwPacketLength').value.trim();
+  if (plRaw) {
+    const plValues = plRaw.split(',').map(s => s.trim()).filter(Boolean);
+    if (plValues.some(v => !/^\d+(-\d+)?$/.test(v))) {
+      showToast('error', 'Validation Error', 'Packet length must be a number or range (e.g. 64 or 64-128)');
+      return;
+    }
+    ruleData['packet-length'] = plValues;
+  }
+  const limitRate = document.getElementById('fwLimitRate').value.trim();
+  const limitBurst = document.getElementById('fwLimitBurst').value.trim();
+  if (limitRate && !/^\d+\/(second|minute|hour|day)$/.test(limitRate)) {
+    showToast('error', 'Validation Error', 'Limit rate must be N/second, N/minute, N/hour or N/day');
+    return;
+  }
+  if (limitRate || limitBurst) {
+    ruleData.limit = {};
+    if (limitRate) ruleData.limit.rate = limitRate;
+    if (limitBurst) ruleData.limit.burst = limitBurst;
   }
 
   // Source
@@ -5231,6 +5296,20 @@ function buildFirewallCommands(ruleset, ruleId, ruleData) {
   }
   if (ruleData.log) {
     commands.push({ op: 'set', cmd: `set ${basePath} log` });
+  }
+  const cmdFlags = ruleData.tcp?.flags || {};
+  for (const [f, v] of Object.entries(cmdFlags)) {
+    if (f === 'not') {
+      for (const nf of Object.keys(v || {})) commands.push({ op: 'set', cmd: `set ${basePath} tcp flags not ${nf}` });
+    } else if (v) {
+      commands.push({ op: 'set', cmd: `set ${basePath} tcp flags ${f}` });
+    }
+  }
+  if (ruleData.limit?.rate) commands.push({ op: 'set', cmd: `set ${basePath} limit rate '${ruleData.limit.rate}'` });
+  if (ruleData.limit?.burst) commands.push({ op: 'set', cmd: `set ${basePath} limit burst '${ruleData.limit.burst}'` });
+  if (ruleData['packet-length']) {
+    const vals = Array.isArray(ruleData['packet-length']) ? ruleData['packet-length'] : [ruleData['packet-length']];
+    for (const v of vals) commands.push({ op: 'set', cmd: `set ${basePath} packet-length '${v}'` });
   }
 
   // Source

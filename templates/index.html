@@ -495,6 +495,45 @@
               <select id="fwRuleDstPortGroup"><option value="">--</option></select>
             </div>
           </fieldset>
+          <fieldset class="form-fieldset">
+            <legend>Advanced matchers (stateless)</legend>
+            <div class="form-group">
+              <label>TCP flags set (requires protocol tcp)</label>
+              <div class="checkbox-row">
+                <label class="checkbox-label"><input type="checkbox" id="fwTcpFlagSyn"><span>syn</span></label>
+                <label class="checkbox-label"><input type="checkbox" id="fwTcpFlagAck"><span>ack</span></label>
+                <label class="checkbox-label"><input type="checkbox" id="fwTcpFlagFin"><span>fin</span></label>
+                <label class="checkbox-label"><input type="checkbox" id="fwTcpFlagRst"><span>rst</span></label>
+                <label class="checkbox-label"><input type="checkbox" id="fwTcpFlagUrg"><span>urg</span></label>
+                <label class="checkbox-label"><input type="checkbox" id="fwTcpFlagPsh"><span>psh</span></label>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>TCP flags NOT set</label>
+              <div class="checkbox-row">
+                <label class="checkbox-label"><input type="checkbox" id="fwTcpFlagNotSyn"><span>syn</span></label>
+                <label class="checkbox-label"><input type="checkbox" id="fwTcpFlagNotAck"><span>ack</span></label>
+                <label class="checkbox-label"><input type="checkbox" id="fwTcpFlagNotFin"><span>fin</span></label>
+                <label class="checkbox-label"><input type="checkbox" id="fwTcpFlagNotRst"><span>rst</span></label>
+                <label class="checkbox-label"><input type="checkbox" id="fwTcpFlagNotUrg"><span>urg</span></label>
+                <label class="checkbox-label"><input type="checkbox" id="fwTcpFlagNotPsh"><span>psh</span></label>
+              </div>
+            </div>
+            <div class="form-row">
+              <div class="form-group">
+                <label>Packet length</label>
+                <input type="text" id="fwPacketLength" placeholder="64 or 64-128, comma-separated">
+              </div>
+              <div class="form-group">
+                <label>Limit rate</label>
+                <input type="text" id="fwLimitRate" placeholder="10/second">
+              </div>
+              <div class="form-group">
+                <label>Limit burst</label>
+                <input type="number" id="fwLimitBurst" min="1" placeholder="5">
+              </div>
+            </div>
+          </fieldset>
         </form>
       </div>
       <div class="modal-footer">

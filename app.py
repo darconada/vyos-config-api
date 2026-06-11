@@ -1152,13 +1152,32 @@ def _is_group_entry_path(path):
 _VYOS_BOOLEAN_FLAGS = {'exclude', 'disable', 'log'}
 
 
+def _is_boolean_flag_path(path):
+    """
+    Path de set cuyo último segmento es un flag sin valor: o un flag conocido
+    (disable/exclude/log) o un flag de TCP bajo 'flags' / 'flags not'
+    (p. ej. ['...', 'tcp', 'flags', 'syn'] o ['...', 'tcp', 'flags', 'not', 'ack']).
+    """
+    if path[-1] in _VYOS_BOOLEAN_FLAGS:
+        return True
+    return len(path) >= 2 and path[-2] in ('flags', 'not')
+
+
+def _is_rule_multivalue_path(path):
+    """
+    Leaf multivalor DENTRO de una regla (set añade un valor, no reemplaza):
+    p. ej. ['firewall', 'ipv4', 'name', X, 'rule', N, 'packet-length', '64'].
+    """
+    return len(path) >= 3 and path[-2] in ('packet-length',) and 'rule' in path
+
+
 def _set_op(raw, path):
     """Aplica un 'set' sobre raw. Devuelve True si OK, False si situación rara."""
     if len(path) < 2:
         return False
 
     # Boolean flag: ['nat', 'source', 'rule', '10', 'exclude'] → rule['exclude'] = {}
-    if path[-1] in _VYOS_BOOLEAN_FLAGS:
+    if _is_boolean_flag_path(path):
         *parents, flag = path
         node = raw
         for k in parents:
@@ -1172,7 +1191,7 @@ def _set_op(raw, path):
             node[flag] = {}
         return True
 
-    if _is_group_entry_path(path):
+    if _is_group_entry_path(path) or _is_rule_multivalue_path(path):
         *parents, leaf_key, value = path
         node = raw
         for k in parents:
@@ -1367,7 +1386,7 @@ def _inverse_ops_for(tree, kind, path):
                 return None
             if path[i] == node:
                 return []  # mismo valor → no-op
-            if _is_group_entry_path(path):
+            if _is_group_entry_path(path) or _is_rule_multivalue_path(path):
                 # Nodo multivalor: el set añade un valor → inverso: borrarlo.
                 return [{'op': 'delete', 'path': list(path)}]
             # Nodo de valor único: el set REEMPLAZA → inverso: restaurar el antiguo.
@@ -2086,6 +2105,25 @@ def build_vyos_operations(operation, raw_config=None):
                 ops.append({'op': 'set', 'path': base_path + ['disable']})
             if rule.get('log'):
                 ops.append({'op': 'set', 'path': base_path + ['log']})
+
+            # Matchers avanzados (routers stateless): tcp flags, limit, packet-length
+            tcp_flags = (rule.get('tcp') or {}).get('flags') or {}
+            for flag, fval in tcp_flags.items():
+                if flag == 'not':
+                    for nflag in (fval or {}):
+                        ops.append({'op': 'set', 'path': base_path + ['tcp', 'flags', 'not', nflag]})
+                elif fval:
+                    ops.append({'op': 'set', 'path': base_path + ['tcp', 'flags', flag]})
+            limit = rule.get('limit') or {}
+            if limit.get('rate'):
+                ops.append({'op': 'set', 'path': base_path + ['limit', 'rate', str(limit['rate'])]})
+            if limit.get('burst'):
+                ops.append({'op': 'set', 'path': base_path + ['limit', 'burst', str(limit['burst'])]})
+            pkt_len = rule.get('packet-length')
+            if pkt_len:
+                values = pkt_len if isinstance(pkt_len, list) else [pkt_len]
+                for v in values:
+                    ops.append({'op': 'set', 'path': base_path + ['packet-length', str(v)]})
 
             # Source
             src = rule.get('source', {})

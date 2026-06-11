@@ -1,8 +1,11 @@
 # Campos de reglas de firewall VyOS no soportados por la UI — plan
 
-> Estado: **fase 1 IMPLEMENTADA** (junio 2026): `log` editable en el modal,
-> chip de "extra fields" en las tablas (firewall y NAT), `default-action` del
-> ruleset editable, y hooks forward/input/output visibles en solo-lectura.
+> Estado: **fases 1 y 2 IMPLEMENTADAS** (junio 2026).
+> Fase 1: `log` editable, chip de "extra fields" (firewall y NAT),
+> `default-action` del ruleset editable, hooks en solo-lectura.
+> Fase 2: matchers de los stateless editables en el modal: `tcp flags`
+> (set / not set), `limit rate/burst` y `packet-length` (multivalor, con
+> soporte de listas en el diff genérico).
 > El resto queda descartado o aplazado según el uso real medido abajo.
 > Acciones por regla: la flota solo usa return/jump/drop/accept, todas ya en
 > el modal (synproxy/offload sin uso).
