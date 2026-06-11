@@ -65,10 +65,20 @@ def _get_session(create=False):
     with _USER_SESSIONS_MUTEX:
         sess = USER_SESSIONS.get(user)
         if sess is None and create:
-            sess = USER_SESSIONS[user] = {}
+            sess = USER_SESSIONS[user] = {'_lock': threading.RLock()}
         if sess is not None:
             sess['last_seen'] = time.time()
         return sess
+
+
+def _session_lock(sess):
+    """
+    Lock por sesión de usuario. Serializa escrituras al router y swaps de
+    cachés: gunicorn corre con --threads 16 y sin esto dos requests del mismo
+    usuario pueden mutar `sess` concurrentemente (p. ej. el sync-check
+    automático del frontend mientras se aplica una regla).
+    """
+    return sess.setdefault('_lock', threading.RLock())
 
 
 def _purge_idle_sessions():
@@ -554,8 +564,9 @@ def upload():
     try:
         cfg = load_config(json.load(f))
         sess = _get_session(create=True)
-        sess['config'] = cfg
-        sess['raw_config'] = cfg  # con upload no tenemos raw distinto del adaptado
+        with _session_lock(sess):
+            sess['raw_config'] = cfg  # con upload no tenemos raw distinto del adaptado
+            sess['config'] = cfg
         return jsonify({'status': 'ok', 'data': cfg})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 400
@@ -712,13 +723,15 @@ def fetch_config():
         # pinchado bloquearía a otros usuarios hasta el TTL.
         prev_cluster_id = _cluster_id_for(sess)
         user = _current_user()
-        sess['active_api'] = api
-        sess['raw_config'] = raw
-        sess['config'] = cfg
-        sess['peer_api'] = None
-        sess['peer_config'] = None
-        sess['raw_peer_config'] = None
-        sess['cluster_info'] = cluster
+        with _session_lock(sess):
+            sess['active_api'] = api
+            sess['raw_config'] = raw
+            sess['peer_api'] = None
+            sess['peer_config'] = None
+            sess['raw_peer_config'] = None
+            sess['cluster_info'] = cluster
+            # 'config' al final: es la clave que consumen los lectores.
+            sess['config'] = cfg
         new_cluster_id = _cluster_id_for(sess)
         if prev_cluster_id and prev_cluster_id != new_cluster_id and user:
             with _WRITE_LOCK_MUTEX:
@@ -806,12 +819,13 @@ def fetch_peer():
         expected_peer = cluster_info.get('peer_name')
         hostname_mismatch = (peer_hostname != expected_peer)
 
-        sess['peer_api'] = peer
-        sess['peer_config'] = None
-        sess['raw_peer_config'] = None
-        sess['cluster_info'] = {**cluster_info, 'peer_connected': True,
-                                'peer_host': peer_host, 'peer_port': peer_port,
-                                'peer_hostname_reported': peer_hostname}
+        with _session_lock(sess):
+            sess['peer_api'] = peer
+            sess['peer_config'] = None
+            sess['raw_peer_config'] = None
+            sess['cluster_info'] = {**cluster_info, 'peer_connected': True,
+                                    'peer_host': peer_host, 'peer_port': peer_port,
+                                    'peer_hostname_reported': peer_hostname}
 
         return jsonify({
             'status': 'ok',
@@ -860,11 +874,12 @@ def set_peer_manual():
     cluster_info = {'detected': True, 'primary_name': primary_name,
                     'peer_name': peer_name, 'peer_name_manual': True,
                     'peer_connected': False}
-    sess['cluster_info'] = cluster_info
-    # Reset de cualquier peer previo: el nombre cambió, el peer hay que reconectarlo.
-    sess['peer_api'] = None
-    sess['peer_config'] = None
-    sess['raw_peer_config'] = None
+    with _session_lock(sess):
+        sess['cluster_info'] = cluster_info
+        # Reset de cualquier peer previo: el nombre cambió, el peer hay que reconectarlo.
+        sess['peer_api'] = None
+        sess['peer_config'] = None
+        sess['raw_peer_config'] = None
     return jsonify({'status': 'ok', 'cluster_info': cluster_info})
 
 
@@ -875,11 +890,12 @@ def disconnect_peer():
     sess = _get_session()
     if not sess:
         return jsonify({'status': 'ok'})
-    sess['peer_api'] = None
-    sess['peer_config'] = None
-    sess['raw_peer_config'] = None
-    if sess.get('cluster_info'):
-        sess['cluster_info'] = {**sess['cluster_info'], 'peer_connected': False}
+    with _session_lock(sess):
+        sess['peer_api'] = None
+        sess['peer_config'] = None
+        sess['raw_peer_config'] = None
+        if sess.get('cluster_info'):
+            sess['cluster_info'] = {**sess['cluster_info'], 'peer_connected': False}
     return jsonify({'status': 'ok'})
 
 
@@ -1031,10 +1047,11 @@ def cluster_sync_check():
     if peer_err:
         return jsonify({'error': f'Peer unreachable: {peer_err}'}), 502
 
-    sess['raw_config'] = raw_primary
-    sess['config'] = load_config(raw_primary)
-    sess['raw_peer_config'] = raw_peer
-    sess['peer_config'] = load_config(raw_peer)
+    with _session_lock(sess):
+        sess['raw_config'] = raw_primary
+        sess['config'] = load_config(raw_primary)
+        sess['raw_peer_config'] = raw_peer
+        sess['peer_config'] = load_config(raw_peer)
 
     differences = compute_sync_diffs(sess['config'], sess['peer_config'])
     return jsonify({
@@ -1162,6 +1179,30 @@ def _delete_op(raw, path):
             parent.pop(parent_key, None)
         return True
     return False
+
+
+def _patch_cache_cow(sess, key, ops, fallback_api):
+    """
+    Actualiza la caché `sess[key]` aplicando `ops` sobre una COPIA y haciendo
+    swap de la referencia al final (copy-on-write): los lectores concurrentes
+    (jsonify de endpoints de lectura) siempre ven un árbol completo, nunca uno
+    a medio mutar. Si el patch no es aplicable, fallback a refetch del router.
+    """
+    cfg_key = 'config' if key == 'raw_config' else 'peer_config'
+    raw = sess.get(key)
+    new_raw = None
+    if raw is not None:
+        candidate = copy.deepcopy(raw)
+        if apply_ops_in_memory(candidate, ops):
+            new_raw = candidate
+    if new_raw is None and fallback_api is not None:
+        try:
+            new_raw = fallback_api.get_config()
+        except VyOSAPIError:
+            new_raw = None
+    if new_raw is not None:
+        sess[key] = new_raw
+        sess[cfg_key] = load_config(new_raw)
 
 
 def apply_ops_in_memory(raw, ops):
@@ -1356,7 +1397,14 @@ def apply_ops_dual(sess, ops, to_peer_requested=None, require_sync=True):
         return {'applied': 0, 'nodes': []}
     if not sess or not sess.get('active_api'):
         raise DualApplyError(400, {'error': 'No active connection'})
+    # Serializamos todas las escrituras de esta sesión: dos applies del mismo
+    # usuario en paralelo (o un apply mientras un sync-check swapea cachés)
+    # corromperían el estado compartido.
+    with _session_lock(sess):
+        return _apply_ops_dual_locked(sess, ops, to_peer_requested, require_sync)
 
+
+def _apply_ops_dual_locked(sess, ops, to_peer_requested, require_sync):
     active_api = sess['active_api']
     do_peer = _want_peer(sess, to_peer_requested)
 
@@ -1396,14 +1444,7 @@ def apply_ops_dual(sess, ops, to_peer_requested=None, require_sync=True):
                 'hint': 'CONFIG refrescado: si la operación se aplicó silenciosamente '
                         'tras timeout, la UI lo verá en el próximo render.'
             })
-        if not (sess.get('raw_config') is not None and apply_ops_in_memory(sess['raw_config'], ops)):
-            try:
-                raw = active_api.get_config()
-                sess['raw_config'] = raw
-            except VyOSAPIError:
-                pass
-        if sess.get('raw_config') is not None:
-            sess['config'] = load_config(sess['raw_config'])
+        _patch_cache_cow(sess, 'raw_config', ops, active_api)
         return {'applied_to': ['primary'], 'nodes': 1}
 
     # Apply EN PARALELO a primary y peer.
@@ -1433,24 +1474,10 @@ def apply_ops_dual(sess, ops, to_peer_requested=None, require_sync=True):
         except Exception as e:
             peer_err = f'unexpected: {str(e)}'
 
-    # Caso 1: ambos OK → update in-memory de las dos caches.
+    # Caso 1: ambos OK → update copy-on-write de las dos caches.
     if primary_err is None and peer_err is None:
-        if not (sess.get('raw_config') is not None and apply_ops_in_memory(sess['raw_config'], ops)):
-            try:
-                raw = active_api.get_config()
-                sess['raw_config'] = raw
-            except VyOSAPIError:
-                pass
-        if sess.get('raw_config') is not None:
-            sess['config'] = load_config(sess['raw_config'])
-        if not (sess.get('raw_peer_config') is not None and apply_ops_in_memory(sess['raw_peer_config'], ops)):
-            try:
-                raw_peer = peer_api.get_config()
-                sess['raw_peer_config'] = raw_peer
-            except VyOSAPIError:
-                pass
-        if sess.get('raw_peer_config') is not None:
-            sess['peer_config'] = load_config(sess['raw_peer_config'])
+        _patch_cache_cow(sess, 'raw_config', ops, active_api)
+        _patch_cache_cow(sess, 'raw_peer_config', ops, peer_api)
         return {'applied_to': ['primary', 'peer'], 'nodes': 2}
 
     # Caso 4: ambos fallaron → refrescar caches; sin rollback.
