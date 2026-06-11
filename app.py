@@ -582,6 +582,27 @@ def api_defaults():
     }})
 
 
+def _release_cluster_lock_if_unused(user, sess, cluster_id, reason):
+    """
+    Suelta el write-lock de `cluster_id` si lo tiene `user` y ninguna OTRA
+    pestaña suya sigue conectada a ese cluster.
+    """
+    if not cluster_id or not user:
+        return
+    with _USER_SESSIONS_MUTEX:
+        for k, other in _user_session_items(user):
+            if other is sess:
+                continue
+            if _cluster_id_for(other) == cluster_id:
+                return  # otra pestaña lo sigue usando
+    with _WRITE_LOCK_MUTEX:
+        state = WRITE_LOCKS.get(cluster_id)
+        if state and state.get('user') == user:
+            WRITE_LOCKS.pop(cluster_id, None)
+            audit_log.emit(user=user, action='lock.release', target=cluster_id,
+                           cluster_id=cluster_id, details=reason)
+
+
 @app.route('/upload', methods=['POST'])
 @login_required
 def upload():
@@ -590,13 +611,27 @@ def upload():
         return jsonify({'status': 'error', 'message': 'No file uploaded'}), 400
     try:
         cfg = load_config(json.load(f))
-        sess = _get_session(create=True)
-        with _session_lock(sess):
-            sess['raw_config'] = cfg  # con upload no tenemos raw distinto del adaptado
-            sess['config'] = cfg
-        return jsonify({'status': 'ok', 'data': cfg})
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 400
+    sess = _get_session(create=True)
+    user = _current_user()
+    prev_cluster_id = _cluster_id_for(sess)
+    with _session_lock(sess):
+        # Upload = modo SOLO-VISTA: desconectamos del router activo. Antes la
+        # conexión previa quedaba viva y los endpoints de escritura seguían
+        # apuntando al router mientras la UI mostraba el fichero subido:
+        # podías aplicar al router vivo cambios calculados contra el fichero.
+        sess['active_api'] = None
+        sess['peer_api'] = None
+        sess['peer_config'] = None
+        sess['raw_peer_config'] = None
+        sess['cluster_info'] = None
+        sess['raw_config'] = cfg  # con upload no tenemos raw distinto del adaptado
+        sess['config'] = cfg
+    _release_cluster_lock_if_unused(user, sess, prev_cluster_id,
+                                    'auto-released on file upload (view-only)')
+    _set_audit('upload', target=f.filename or 'config.json')
+    return jsonify({'status': 'ok', 'data': cfg})
 
 
 # ──────────────────────────────────────────────────────────────
@@ -760,26 +795,11 @@ def fetch_config():
             # 'config' al final: es la clave que consumen los lectores.
             sess['config'] = cfg
         new_cluster_id = _cluster_id_for(sess)
-        if prev_cluster_id and prev_cluster_id != new_cluster_id and user:
+        if prev_cluster_id and prev_cluster_id != new_cluster_id:
             # Con sesiones por pestaña, solo auto-liberamos el lock del cluster
             # anterior si NINGUNA otra pestaña del usuario lo sigue usando.
-            still_used = False
-            with _USER_SESSIONS_MUTEX:
-                for k, other in _user_session_items(user):
-                    if other is sess:
-                        continue
-                    if _cluster_id_for(other) == prev_cluster_id:
-                        still_used = True
-                        break
-            if not still_used:
-                with _WRITE_LOCK_MUTEX:
-                    state = WRITE_LOCKS.get(prev_cluster_id)
-                    if state and state.get('user') == user:
-                        WRITE_LOCKS.pop(prev_cluster_id, None)
-                        audit_log.emit(user=user, action='lock.release',
-                                       target=prev_cluster_id,
-                                       cluster_id=prev_cluster_id,
-                                       details='auto-released on cluster switch')
+            _release_cluster_lock_if_unused(user, sess, prev_cluster_id,
+                                            'auto-released on cluster switch')
 
         response = {'status': 'ok', 'data': cfg}
         if cluster:

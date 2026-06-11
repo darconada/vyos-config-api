@@ -318,11 +318,13 @@ fileInput.onchange = async () => {
     }
 
     CONFIG = j.data;
-    // File uploads are static — no live peer, reset any cluster state
+    // File uploads are VIEW-ONLY: the backend drops the live connection, so
+    // the UI must not render write controls nor claim to be connected.
     clusterInfo = null;
     lastClusterDiffs = [];
     if (typeof updateClusterBadge === 'function') updateClusterBadge(null);
-    updateConnectionStatus(true, file.name);
+    updateConnectionStatus(false);
+    connectionStatus.querySelector('.status-text').textContent = `${file.name} (view only)`;
     drawMenu();
     renderDashboard();
     showToast('success', 'Configuration Loaded', `Successfully loaded ${file.name}`);
