@@ -190,8 +190,8 @@ function showToast(type, title, message, duration = 4000) {
   toast.innerHTML = `
     <div class="toast-icon">${icons[type]}</div>
     <div class="toast-content">
-      <div class="toast-title">${title}</div>
-      ${message ? `<div class="toast-message">${message}</div>` : ''}
+      <div class="toast-title">${escapeHtml(title)}</div>
+      ${message ? `<div class="toast-message">${escapeHtml(message)}</div>` : ''}
     </div>
     <button class="toast-close" onclick="this.parentElement.remove()">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -235,21 +235,33 @@ function showSkeletonTable(rows = 5, cols = 6) {
 // BREADCRUMB MANAGEMENT
 // =========================================
 function updateBreadcrumb(items) {
+  // DOM-based: labels come from router config (ruleset names…) and must not
+  // reach innerHTML; actions are real functions, never interpolated strings.
+  breadcrumb.textContent = '';
   if (!items || items.length === 0) {
-    breadcrumb.innerHTML = '<span class="breadcrumb-item">Home</span>';
+    const home = document.createElement('span');
+    home.className = 'breadcrumb-item';
+    home.textContent = 'Home';
+    breadcrumb.appendChild(home);
     return;
   }
 
-  let html = '<span class="breadcrumb-link" onclick="goHome()">Home</span>';
+  const home = document.createElement('span');
+  home.className = 'breadcrumb-link';
+  home.textContent = 'Home';
+  home.addEventListener('click', () => goHome());
+  breadcrumb.appendChild(home);
+
   items.forEach((item, i) => {
     const isLast = i === items.length - 1;
-    if (isLast) {
-      html += `<span class="breadcrumb-item active">${item.label}</span>`;
-    } else {
-      html += `<span class="breadcrumb-link" onclick="${item.action}">${item.label}</span>`;
+    const el = document.createElement('span');
+    el.className = isLast ? 'breadcrumb-item active' : 'breadcrumb-link';
+    el.textContent = item.label;
+    if (!isLast && typeof item.action === 'function') {
+      el.addEventListener('click', item.action);
     }
+    breadcrumb.appendChild(el);
   });
-  breadcrumb.innerHTML = html;
 }
 
 function goHome() {
@@ -357,31 +369,31 @@ async function loadSection(sec) {
     return renderDashboard();
   }
   if (sec === 'Firewall') {
-    updateBreadcrumb([{ label: 'Firewall', action: "loadSection('Firewall')" }]);
+    updateBreadcrumb([{ label: 'Firewall', action: () => loadSection('Firewall') }]);
     return loadFirewall();
   }
   if (sec === 'NAT') {
-    updateBreadcrumb([{ label: 'NAT', action: "loadSection('NAT')" }]);
+    updateBreadcrumb([{ label: 'NAT', action: () => loadSection('NAT') }]);
     return loadNat();
   }
   if (sec === 'Activity') {
-    updateBreadcrumb([{ label: 'Activity Log', action: "loadSection('Activity')" }]);
+    updateBreadcrumb([{ label: 'Activity Log', action: () => loadSection('Activity') }]);
     return renderActivityLog();
   }
   if (sec === 'Groups') {
-    updateBreadcrumb([{ label: 'Firewall Groups', action: "loadSection('Groups')" }]);
+    updateBreadcrumb([{ label: 'Firewall Groups', action: () => loadSection('Groups') }]);
     return loadGroups();
   }
   if (sec === 'Interfaces') {
-    updateBreadcrumb([{ label: 'Interfaces', action: "loadSection('Interfaces')" }]);
+    updateBreadcrumb([{ label: 'Interfaces', action: () => loadSection('Interfaces') }]);
     return loadInterfaces();
   }
   if (sec === 'Routes') {
-    updateBreadcrumb([{ label: 'Static Routes', action: "loadSection('Routes')" }]);
+    updateBreadcrumb([{ label: 'Static Routes', action: () => loadSection('Routes') }]);
     return loadRoutes();
   }
   if (sec === 'BGP') {
-    updateBreadcrumb([{ label: 'BGP Configuration', action: "loadSection('BGP')" }]);
+    updateBreadcrumb([{ label: 'BGP Configuration', action: () => loadSection('BGP') }]);
     return loadBGP();
   }
 
@@ -535,21 +547,21 @@ function renderNatTable(title, natType, rules, cols) {
       const rowClass = [pendingClass, disabledClass].filter(Boolean).join(' ');
 
       html += `<tr class="${rowClass}">
-        <td><span class="badge">${id}</span>${disabledBadge}${pendingBadge}</td>
+        <td><span class="badge">${escapeHtml(id)}</span>${disabledBadge}${pendingBadge}</td>
         ${cols.map(c => `<td><div class="cell-wrap wide">${escapeHtml(get(r, c.key))}</div></td>`).join('')}
         ${isConnected ? `<td class="actions-col">
-          <button class="btn-icon" onclick="openNatRuleModal('edit', '${natType}', '${id}')" title="Edit">
+          <button class="btn-icon" onclick="openNatRuleModal('edit', ${jsArg(natType)}, ${jsArg(id)})" title="Edit">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
               <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
             </svg>
           </button>
-          <button class="btn-icon ${isDisabled ? 'btn-toggle-off' : ''}" onclick="toggleNatRuleDisabled('${natType}', '${id}')" title="${isDisabled ? 'Enable rule' : 'Disable rule'}">
+          <button class="btn-icon ${isDisabled ? 'btn-toggle-off' : ''}" onclick="toggleNatRuleDisabled(${jsArg(natType)}, ${jsArg(id)})" title="${isDisabled ? 'Enable rule' : 'Disable rule'}">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/>
             </svg>
           </button>
-          <button class="btn-icon btn-danger" onclick="deleteNatRule('${natType}', '${id}')" title="Delete">
+          <button class="btn-icon btn-danger" onclick="deleteNatRule(${jsArg(natType)}, ${jsArg(id)})" title="Delete">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
             </svg>
@@ -1134,18 +1146,18 @@ function renderRoutes() {
     const vrfBadge = route.vrf === 'default'
       ? '<span class="badge badge-outline">default</span>'
       : `<span class="badge badge-primary">${escapeHtml(route.vrf)}</span>`;
-    const targetVrf = route.targetVrf ? ` <span class="text-muted">(via ${route.targetVrf})</span>` : '';
+    const targetVrf = route.targetVrf ? ` <span class="text-muted">(via ${escapeHtml(route.targetVrf)})</span>` : '';
 
     html += `
       <tr class="${pendingClass}">
         <td><code>${escapeHtml(route.network)}</code>${pendingBadge}</td>
         <td>${vrfBadge}</td>
-        <td><span class="badge badge-outline">${route.type}</span></td>
+        <td><span class="badge badge-outline">${escapeHtml(route.type)}</span></td>
         <td>${route.target ? `<code>${escapeHtml(route.target)}</code>${targetVrf}` : '<span class="text-muted">-</span>'}</td>
-        <td>${route.distance || '<span class="text-muted">default</span>'}</td>
+        <td>${route.distance ? escapeHtml(route.distance) : '<span class="text-muted">default</span>'}</td>
         ${isConnected ? `
           <td class="actions-col">
-            <button class="btn-icon btn-danger" onclick="deleteRoute('${escapeHtml(route.network)}', '${escapeHtml(route.target || '')}', '${escapeHtml(route.vrf)}')" title="Delete">
+            <button class="btn-icon btn-danger" onclick="deleteRoute(${jsArg(route.network)}, ${jsArg(route.target || '')}, ${jsArg(route.vrf)})" title="Delete">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
               </svg>
@@ -1968,12 +1980,12 @@ async function loadFirewall() {
         <div class="card-body">
           <div class="flex flex-wrap gap-2">
             ${sets.map(rs => `
-              <button class="btn btn-secondary" onclick="viewRuleset('${rs}')">
+              <button class="btn btn-secondary" onclick="viewRuleset(${jsArg(rs)})">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
                   <polyline points="14 2 14 8 20 8"/>
                 </svg>
-                ${rs}
+                ${escapeHtml(rs)}
               </button>
             `).join('')}
           </div>
@@ -2004,12 +2016,12 @@ async function mapWithLimit(items, limit, fn) {
 async function viewRuleset(rs) {
   content.innerHTML = showSkeletonTable(10, 8);
   updateBreadcrumb([
-    { label: 'Firewall', action: "loadSection('Firewall')" },
-    { label: rs, action: `viewRuleset('${rs}')` }
+    { label: 'Firewall', action: () => loadSection('Firewall') },
+    { label: rs, action: () => viewRuleset(rs) }
   ]);
 
   try {
-    const res = await fetch(`/api/firewall/ruleset/${rs}`);
+    const res = await fetch(`/api/firewall/ruleset/${encodeURIComponent(rs)}`);
     const js = await res.json();
 
     currentRulesetName = rs;
@@ -2041,7 +2053,7 @@ async function viewRuleset(rs) {
     await mapWithLimit([...refs], 8, async ref => {
       const [type, name] = ref.split('|');
       const key = `${type}-${name}`;
-      const r = await fetch(`/api/firewall/group/${type}/${name}`);
+      const r = await fetch(`/api/firewall/group/${encodeURIComponent(type)}/${encodeURIComponent(name)}`);
       const obj = await r.json();
       if (type === 'address') groupCache[key] = obj.address;
       if (type === 'network') groupCache[key] = obj.network;
@@ -2081,11 +2093,11 @@ function renderRuleset() {
             <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
             <polyline points="14 2 14 8 20 8"/>
           </svg>
-          ${currentRulesetName}
+          ${escapeHtml(currentRulesetName)}
           <span class="badge">${ruleCount} rules</span>
         </div>
         <div class="flex gap-2">
-          ${isConnected ? `<button class="btn btn-success btn-sm" onclick="openFirewallRuleModal('create', '${currentRulesetName}')">
+          ${isConnected ? `<button class="btn btn-success btn-sm" onclick="openFirewallRuleModal('create', ${jsArg(currentRulesetName)})">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
             </svg>
@@ -2188,27 +2200,27 @@ function renderRuleset() {
       const rowClass = [pendingClass, disabledClass].filter(Boolean).join(' ');
 
       html += `<tr id="row-${id}" class="${rowClass}">
-        <td><span class="badge">${row.rule_id}</span>${disabledBadge}${pendingBadge}</td>
+        <td><span class="badge">${escapeHtml(row.rule_id)}</span>${disabledBadge}${pendingBadge}</td>
         <td><div class="cell-wrap wide">${cellHTML(r.source, 'address', 'network')}</div></td>
         <td class="font-mono text-sm"><div class="cell-wrap">${cellHTML(r.source, 'port')}</div></td>
         <td><div class="cell-wrap wide">${cellHTML(r.destination, 'address', 'network')}</div></td>
         <td class="font-mono text-sm"><div class="cell-wrap">${cellHTML(r.destination, 'port')}</div></td>
-        <td><span class="badge">${row.protocol}</span></td>
-        <td><span class="action-badge ${actionClass}">${row.action}</span></td>
+        <td><span class="badge">${escapeHtml(row.protocol)}</span></td>
+        <td><span class="action-badge ${actionClass}">${escapeHtml(row.action)}</span></td>
         <td class="text-muted"><div class="cell-wrap wide">${escapeHtml(row.description)}</div></td>
         ${isConnected ? `<td class="actions-col">
-          <button class="btn-icon" onclick="openFirewallRuleModal('edit', '${currentRulesetName}', '${id}')" title="Edit">
+          <button class="btn-icon" onclick="openFirewallRuleModal('edit', ${jsArg(currentRulesetName)}, ${jsArg(id)})" title="Edit">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
               <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
             </svg>
           </button>
-          <button class="btn-icon ${isDisabled ? 'btn-toggle-off' : ''}" onclick="toggleFirewallRuleDisabled('${currentRulesetName}', '${id}')" title="${isDisabled ? 'Enable rule' : 'Disable rule'}">
+          <button class="btn-icon ${isDisabled ? 'btn-toggle-off' : ''}" onclick="toggleFirewallRuleDisabled(${jsArg(currentRulesetName)}, ${jsArg(id)})" title="${isDisabled ? 'Enable rule' : 'Disable rule'}">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/>
             </svg>
           </button>
-          <button class="btn-icon btn-danger" onclick="deleteFirewallRule('${currentRulesetName}', '${id}')" title="Delete">
+          <button class="btn-icon btn-danger" onclick="deleteFirewallRule(${jsArg(currentRulesetName)}, ${jsArg(id)})" title="Delete">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
             </svg>
@@ -2373,18 +2385,26 @@ function cellHTML(obj, aKey, nKey) {
       if (!name) return '-';
       return showResolved
         ? `<span class="font-mono text-sm">${escapeHtml(entityText(obj, aKey, nKey))}</span>`
-        : `<a href="#" class="font-mono text-sm" onclick="showGroup('${type}','${name}');return false;">${escapeHtml(name)}</a>`;
+        : `<a href="#" class="font-mono text-sm" onclick="showGroup(${jsArg(type)},${jsArg(name)});return false;">${escapeHtml(name)}</a>`;
     }
     return obj.address ? `<span class="font-mono text-sm">${escapeHtml(obj.address)}</span>` : '-';
   }
   if (obj.group && obj.group['port-group']) {
     const name = obj.group['port-group'];
     return showResolved
-      ? portText(obj)
-      : `<a href="#" onclick="showGroup('port','${name}');return false;">${escapeHtml(name)}</a>`;
+      ? escapeHtml(portText(obj))
+      : `<a href="#" onclick="showGroup('port',${jsArg(name)});return false;">${escapeHtml(name)}</a>`;
   }
-  if (obj.port) return portText(obj);
+  if (obj.port) return escapeHtml(portText(obj));
   return '-';
+}
+
+function jsArg(v) {
+  // Para argumentos dinamicos dentro de onclick="fn(...)": JSON.stringify
+  // genera un literal JS seguro (comillas, backslashes) y escapeHtml lo
+  // protege en el contexto del atributo HTML. escapeHtml a secas NO basta:
+  // el parser HTML des-escapa las entidades antes de que el JS se parsee.
+  return escapeHtml(JSON.stringify(String(v)));
 }
 
 function escapeHtml(str) {
@@ -2505,10 +2525,10 @@ function executeSearch() {
         </svg>
       </div>
       <div class="search-result-content">
-        <div class="search-result-title">Match: Rule ${matchId}</div>
-        <div class="search-result-subtitle">Action: ${rule.action} ${rule.description ? '- ' + rule.description : ''}</div>
+        <div class="search-result-title">Match: Rule ${escapeHtml(matchId)}</div>
+        <div class="search-result-subtitle">Action: ${escapeHtml(rule.action)} ${rule.description ? '- ' + escapeHtml(rule.description) : ''}</div>
       </div>
-      <button class="btn btn-primary btn-sm" onclick="gotoRule('${matchId}');closeModal('searchModal')">
+      <button class="btn btn-primary btn-sm" onclick="gotoRule(${jsArg(matchId)});closeModal('searchModal')">
         Go to Rule
       </button>
     </div>`;
@@ -2628,7 +2648,7 @@ async function showGroup(type, name) {
   const realName = name.startsWith('!') ? name.slice(1) : name;
 
   try {
-    const res = await fetch(`/api/firewall/group/${type}/${realName}`);
+    const res = await fetch(`/api/firewall/group/${encodeURIComponent(type)}/${encodeURIComponent(realName)}`);
     const grp = await res.json();
 
     let list;
@@ -2657,11 +2677,12 @@ async function showGroup(type, name) {
             </ul>
           </div>
           <div class="modal-footer">
-            <button class="btn btn-primary" onclick="editGroupFromView('${type}', '${escapeHtml(realName)}')">Edit Group</button>
+            <button class="btn btn-primary" onclick="editGroupFromView(${jsArg(type)}, ${jsArg(realName)})">Edit Group</button>
             <button class="btn btn-secondary" onclick="closeModal('groupModal')">Close</button>
           </div>
         </div>
       </div>`;
+    document.getElementById('groupModal')?.remove();
     document.body.insertAdjacentHTML('beforeend', html);
   } catch (e) {
     showToast('error', 'Error', 'Failed to load group details');
@@ -5241,20 +5262,20 @@ function renderGroups() {
             </div>
           </div>
           <div class="group-card-actions">
-            <button class="btn-icon" onclick="showGroupDetails('${gt.key.replace('-group', '')}', '${escapeHtml(groupName)}')" title="View entries">
+            <button class="btn-icon" onclick="showGroupDetails(${jsArg(gt.key.replace('-group', ''))}, ${jsArg(groupName)})" title="View entries">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
                 <circle cx="12" cy="12" r="3"/>
               </svg>
             </button>
             ${isConnected ? `
-              <button class="btn-icon" onclick="openGroupModal('edit', '${gt.key.replace('-group', '')}', '${escapeHtml(groupName)}')" title="Edit group">
+              <button class="btn-icon" onclick="openGroupModal('edit', ${jsArg(gt.key.replace('-group', ''))}, ${jsArg(groupName)})" title="Edit group">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
                   <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
                 </svg>
               </button>
-              <button class="btn-icon btn-danger" onclick="deleteGroup('${gt.key.replace('-group', '')}', '${escapeHtml(groupName)}')" title="Delete group">
+              <button class="btn-icon btn-danger" onclick="deleteGroup(${jsArg(gt.key.replace('-group', ''))}, ${jsArg(groupName)})" title="Delete group">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <polyline points="3 6 5 6 21 6"/>
                   <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
@@ -5407,7 +5428,7 @@ function updateGroupEntryHint() {
 // Load and display group usage
 async function loadGroupUsage(groupType, groupName) {
   try {
-    const res = await fetch(`/api/firewall/group-usage/${groupType}/${groupName}`);
+    const res = await fetch(`/api/firewall/group-usage/${encodeURIComponent(groupType)}/${encodeURIComponent(groupName)}`);
     const usage = await res.json();
     const usageInfo = document.getElementById('groupUsageInfo');
     const usageList = document.getElementById('groupUsageList');
@@ -5416,9 +5437,9 @@ async function loadGroupUsage(groupType, groupName) {
     if (refs.length > 0) {
       usageList.innerHTML = refs.map(ref => {
         if (ref.ruleset) {
-          return `<li>Firewall: ${ref.ruleset} rule ${ref.rule_id} (${ref.side})</li>`;
+          return `<li>Firewall: ${escapeHtml(ref.ruleset)} rule ${escapeHtml(ref.rule_id)} (${escapeHtml(ref.side)})</li>`;
         } else {
-          return `<li>NAT: ${ref.nat_type} rule ${ref.rule_id} (${ref.side})</li>`;
+          return `<li>NAT: ${escapeHtml(ref.nat_type)} rule ${escapeHtml(ref.rule_id)} (${escapeHtml(ref.side)})</li>`;
         }
       }).join('');
       usageInfo.classList.remove('hidden');
@@ -5614,7 +5635,7 @@ async function deleteGroup(groupType, groupName) {
   if (!await ensureWriteLock(`delete group ${groupName}`)) return;
   // Check usage first
   try {
-    const res = await fetch(`/api/firewall/group-usage/${groupType}/${groupName}`);
+    const res = await fetch(`/api/firewall/group-usage/${encodeURIComponent(groupType)}/${encodeURIComponent(groupName)}`);
     const usage = await res.json();
     const refs = [...(usage.firewall || []), ...(usage.nat || [])];
 
