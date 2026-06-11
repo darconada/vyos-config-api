@@ -6,6 +6,7 @@ Flask backend con conexión a VyOS via API REST oficial (1.4+)
 import os
 import re
 import sys
+import copy
 import time
 import threading
 import functools
@@ -1130,11 +1131,14 @@ def _delete_op(raw, path):
     """Elimina la entrada en raw siguiendo path. Best-effort."""
     if not path:
         return True
+    parent = None
+    parent_key = None
     node = raw
     for k in path[:-1]:
         if isinstance(node, dict):
             if k not in node:
                 return True  # ya no existe
+            parent, parent_key = node, k
             node = node[k]
         else:
             return False
@@ -1145,6 +1149,17 @@ def _delete_op(raw, path):
     if isinstance(node, list):
         if last in node:
             node.remove(last)
+            # VyOS renderiza un único valor como string, no como lista de 1:
+            # normalizamos para que el cache patcheado no difiera de un fetch
+            # fresco (evitaba falsos 409 de "cluster no sincronizado").
+            if len(node) == 1 and parent is not None:
+                parent[parent_key] = node[0]
+        return True
+    if isinstance(node, str):
+        # Borrado del único valor de un leaf (VyOS lo renderiza como string):
+        # equivale a eliminar el leaf completo.
+        if node == last and parent is not None:
+            parent.pop(parent_key, None)
         return True
     return False
 
@@ -1192,12 +1207,121 @@ def _handle_dual_apply_error(err):
     return jsonify(err.payload), err.status_code
 
 
-def _reverse_ops(ops):
-    """Genera operaciones inversas best-effort: 'set' ↦ 'delete'. Los 'delete' no se invierten (no tenemos el valor previo)."""
+def _subtree_to_set_ops(path, node):
+    """
+    Serializa un subárbol del JSON de VyOS a la lista de ops 'set' que lo
+    recrean tal cual. Maneja la asimetría del render de VyOS: valor único como
+    string, múltiples valores como lista, flags sin valor como dict vacío.
+    """
+    if node is None:
+        return []
+    if isinstance(node, dict):
+        if not node:
+            return [{'op': 'set', 'path': list(path)}]
+        ops = []
+        for k, v in node.items():
+            ops.extend(_subtree_to_set_ops(list(path) + [k], v))
+        return ops
+    if isinstance(node, list):
+        return [{'op': 'set', 'path': list(path) + [str(v)]} for v in node]
+    return [{'op': 'set', 'path': list(path) + [str(node)]}]
+
+
+def _inverse_ops_for(tree, kind, path):
+    """
+    Inverso real de una op contra `tree` (estado PREVIO al apply).
+    Devuelve lista de ops (puede ser vacía si la op era no-op) o None si no
+    se puede calcular un inverso seguro.
+    """
+    if not path:
+        return None
+    node = tree
+    i = 0
+    while i < len(path):
+        if isinstance(node, dict):
+            if path[i] not in node:
+                break
+            node = node[path[i]]
+            i += 1
+        else:
+            break
+    remaining = len(path) - i
+
+    if kind == 'set':
+        if remaining == 0:
+            # El path completo ya existía → set idempotente, nada que deshacer.
+            return []
+        if isinstance(node, dict):
+            # El set crea nodos a partir de path[i] → borrar el primer
+            # componente creado elimina exactamente lo que el set añadió.
+            return [{'op': 'delete', 'path': list(path[:i + 1])}]
+        if isinstance(node, str):
+            if remaining != 1:
+                return None
+            if path[i] == node:
+                return []  # mismo valor → no-op
+            if _is_group_entry_path(path):
+                # Nodo multivalor: el set añade un valor → inverso: borrarlo.
+                return [{'op': 'delete', 'path': list(path)}]
+            # Nodo de valor único: el set REEMPLAZA → inverso: restaurar el antiguo.
+            return [{'op': 'set', 'path': list(path[:i]) + [node]}]
+        if isinstance(node, list):
+            if remaining != 1:
+                return None
+            if path[i] in node:
+                return []
+            return [{'op': 'delete', 'path': list(path)}]
+        return None
+
+    if kind == 'delete':
+        if remaining == 0:
+            # Se borra el subárbol completo en `path` → inverso: recrearlo.
+            return _subtree_to_set_ops(list(path), node)
+        if isinstance(node, dict):
+            return []  # el path no existía → delete no-op
+        if isinstance(node, (str, list)):
+            if remaining != 1:
+                return []
+            values = node if isinstance(node, list) else [node]
+            if path[i] in values:
+                # Borrado de un valor concreto → inverso: volver a setearlo.
+                return [{'op': 'set', 'path': list(path)}]
+            return []
+        return []
+
+    return None  # comment u op desconocida: sin inverso seguro
+
+
+def build_rollback_ops(pre_state, ops):
+    """
+    Construye la lista de operaciones que revierte `ops` calculada contra
+    `pre_state` (raw config ANTES del apply). Simula cada op sobre una copia
+    para que el inverso de la op N se calcule contra el estado que esa op vio
+    realmente. Devuelve None si algún inverso no es seguro: en ese caso NO se
+    debe intentar rollback automático.
+    """
+    if pre_state is None:
+        return None
+    sim = copy.deepcopy(pre_state)
+    inverses = []
+    for entry in ops:
+        kind = entry.get('op')
+        path = list(entry.get('path') or [])
+        inv = _inverse_ops_for(sim, kind, path)
+        if inv is None:
+            return None
+        inverses.append(inv)
+        if kind == 'set':
+            if not _set_op(sim, path):
+                return None
+        elif kind == 'delete':
+            if not _delete_op(sim, path):
+                return None
+        else:
+            return None
     out = []
-    for op in reversed(ops):
-        if op.get('op') == 'set':
-            out.append({'op': 'delete', 'path': list(op['path'])})
+    for inv in reversed(inverses):
+        out.extend(inv)
     return out
 
 
@@ -1283,7 +1407,13 @@ def apply_ops_dual(sess, ops, to_peer_requested=None, require_sync=True):
         return {'applied_to': ['primary'], 'nodes': 1}
 
     # Apply EN PARALELO a primary y peer.
+    # Los inversos de rollback se calculan ANTES de aplicar, contra el estado
+    # previo cacheado de cada nodo. Si no se puede garantizar un inverso seguro
+    # (cache ausente o situación rara), el rollback queda como 'unavailable' y
+    # NO se ejecuta nada destructivo.
     peer_api = sess['peer_api']
+    rollback_primary_ops = build_rollback_ops(sess.get('raw_config'), ops)
+    rollback_peer_ops = build_rollback_ops(sess.get('raw_peer_config'), ops)
     primary_err = None
     peer_err = None
     with concurrent.futures.ThreadPoolExecutor(max_workers=2,
@@ -1351,53 +1481,61 @@ def apply_ops_dual(sess, ops, to_peer_requested=None, require_sync=True):
             sess['peer_config'] = load_config(raw_peer)
         except VyOSAPIError:
             pass
-        rollback_ops = _reverse_ops(ops)
-        rollback_status = 'skipped'
-        if rollback_ops:
+        if rollback_primary_ops is None:
+            rollback_status = ('unavailable: no se pudo calcular un inverso '
+                               'seguro. REVISA EL PRIMARY MANUALMENTE.')
+        elif not rollback_primary_ops:
+            rollback_status = 'not-needed'  # las ops eran no-op sobre el estado previo
+        else:
             try:
-                active_api.configure(rollback_ops)
-                try:
-                    raw = active_api.get_config()
-                    sess['raw_config'] = raw
-                    sess['config'] = load_config(raw)
-                except VyOSAPIError:
-                    pass
+                active_api.configure(rollback_primary_ops)
                 rollback_status = 'ok'
             except VyOSAPIError as ex:
                 rollback_status = f'failed: {str(ex)}'
+        try:
+            raw = active_api.get_config()
+            sess['raw_config'] = raw
+            sess['config'] = load_config(raw)
+        except VyOSAPIError:
+            pass
         raise DualApplyError(500, {
             'error': f'Peer apply failed: {peer_err}',
             'applied_to_primary': True,
             'rollback': rollback_status,
-            'hint': 'Si rollback=ok el primary fue revertido. Si failed revisa manualmente.'
+            'hint': 'Si rollback=ok el primary fue revertido al estado previo. '
+                    'En cualquier otro caso revisa el primary manualmente.'
         })
 
     # primary falló, peer OK → rollback peer.
+    if rollback_peer_ops is None:
+        rollback_status = ('unavailable: no se pudo calcular un inverso '
+                           'seguro. REVISA EL PEER MANUALMENTE.')
+    elif not rollback_peer_ops:
+        rollback_status = 'not-needed'
+    else:
+        try:
+            peer_api.configure(rollback_peer_ops)
+            rollback_status = 'ok'
+        except VyOSAPIError as ex:
+            rollback_status = f'failed: {str(ex)}'
     try:
         raw = active_api.get_config()
         sess['raw_config'] = raw
         sess['config'] = load_config(raw)
     except VyOSAPIError:
         pass
-    rollback_ops = _reverse_ops(ops)
-    rollback_status = 'skipped'
-    if rollback_ops:
-        try:
-            peer_api.configure(rollback_ops)
-            try:
-                raw_peer = peer_api.get_config()
-                sess['raw_peer_config'] = raw_peer
-                sess['peer_config'] = load_config(raw_peer)
-            except VyOSAPIError:
-                pass
-            rollback_status = 'ok'
-        except VyOSAPIError as ex:
-            rollback_status = f'failed: {str(ex)}'
+    try:
+        raw_peer = peer_api.get_config()
+        sess['raw_peer_config'] = raw_peer
+        sess['peer_config'] = load_config(raw_peer)
+    except VyOSAPIError:
+        pass
     raise DualApplyError(500, {
         'error': f'Primary apply failed: {primary_err}',
         'applied_to_peer': True,
         'rollback': rollback_status,
-        'hint': 'Si rollback=ok el peer fue revertido. Si failed revisa manualmente.'
+        'hint': 'Si rollback=ok el peer fue revertido al estado previo. '
+                'En cualquier otro caso revisa el peer manualmente.'
     })
 
 
@@ -1439,11 +1577,14 @@ def manage_firewall_rule():
     if not ops:
         return jsonify({'status': 'ok', 'message': 'No operations to apply'})
 
-    result = apply_ops_dual(sess, ops, to_peer_requested=to_peer)
+    # Audit ANTES del apply: si apply_ops_dual lanza DualApplyError (apply
+    # parcial, rollback fallido…) el evento queda igualmente registrado con
+    # status=error vía _audit_emit.
     action_name = 'firewall.delete' if request.method == 'DELETE' else 'firewall.update'
     _set_audit(action_name, target=f'{ruleset}/rule/{rule_id}',
-               nodes=result.get('applied_to'),
                commands=[{'cmd': ' '.join([op.get('op', '')] + list(op.get('path', [])))} for op in ops])
+    result = apply_ops_dual(sess, ops, to_peer_requested=to_peer)
+    g.audit_nodes = result.get('applied_to')
     return jsonify({'status': 'ok', 'message': 'Rule updated successfully', **result})
 
 
@@ -1487,11 +1628,11 @@ def manage_nat_rule():
     if not ops:
         return jsonify({'status': 'ok', 'message': 'No operations to apply'})
 
-    result = apply_ops_dual(sess, ops, to_peer_requested=to_peer)
     action_name = 'nat.delete' if request.method == 'DELETE' else 'nat.update'
     _set_audit(action_name, target=f'{nat_type}/rule/{rule_id}',
-               nodes=result.get('applied_to'),
                commands=[{'cmd': ' '.join([op.get('op', '')] + list(op.get('path', [])))} for op in ops])
+    result = apply_ops_dual(sess, ops, to_peer_requested=to_peer)
+    g.audit_nodes = result.get('applied_to')
     return jsonify({'status': 'ok', 'message': 'NAT rule updated successfully', **result})
 
 
@@ -1535,11 +1676,11 @@ def manage_firewall_group():
     if not ops:
         return jsonify({'status': 'ok', 'message': 'No operations to apply'})
 
-    result = apply_ops_dual(sess, ops, to_peer_requested=to_peer)
     action_name = 'group.delete' if request.method == 'DELETE' else 'group.update'
     _set_audit(action_name, target=f'{group_type}-group/{group_name}',
-               nodes=result.get('applied_to'),
                commands=[{'cmd': ' '.join([op.get('op', '')] + list(op.get('path', [])))} for op in ops])
+    result = apply_ops_dual(sess, ops, to_peer_requested=to_peer)
+    g.audit_nodes = result.get('applied_to')
     return jsonify({'status': 'ok', 'message': 'Group updated successfully', **result})
 
 
@@ -1581,15 +1722,15 @@ def batch_configure():
     if not vyos_ops:
         return jsonify({'error': 'No valid operations to execute'}), 400
 
-    result = apply_ops_dual(sess, vyos_ops, to_peer_requested=to_peer)
     summary = ', '.join(f"{op.get('type')}.{op.get('action')}" for op in operations[:5])
     if len(operations) > 5:
         summary += f' (+{len(operations) - 5} more)'
     _set_audit('batch.apply',
                target=f'{len(operations)} operations',
-               nodes=result.get('applied_to'),
                commands=[{'cmd': ' '.join([op.get('op', '')] + list(op.get('path', [])))} for op in vyos_ops])
     g.audit_details = summary
+    result = apply_ops_dual(sess, vyos_ops, to_peer_requested=to_peer)
+    g.audit_nodes = result.get('applied_to')
     return jsonify({
         'success': True,
         'applied': len(operations),
@@ -1776,19 +1917,21 @@ def save_config_to_router():
     to_peer = data.get('apply_to_peer')
     do_peer = _want_peer(sess, to_peer)
 
+    _set_audit('config.save', target='primary+peer' if do_peer else 'primary')
+
     try:
         sess['active_api'].save_config()
     except VyOSAPIError as e:
         return jsonify({'error': f'Primary save failed: {str(e)}'}), 500
 
     if not do_peer:
-        _set_audit('config.save', target='primary', nodes=['primary'])
+        g.audit_nodes = ['primary']
         return jsonify({'status': 'ok', 'message': 'Configuration saved', 'nodes': ['primary']})
 
     try:
         sess['peer_api'].save_config()
     except VyOSAPIError as e:
-        _set_audit('config.save', target='primary+peer', nodes=['primary'])
+        g.audit_nodes = ['primary']
         g.audit_details = f'peer save failed: {str(e)}'
         return jsonify({
             'status': 'partial',
@@ -1797,7 +1940,7 @@ def save_config_to_router():
             'peer_error': str(e)
         }), 500
 
-    _set_audit('config.save', target='primary+peer', nodes=['primary', 'peer'])
+    g.audit_nodes = ['primary', 'peer']
     return jsonify({'status': 'ok', 'message': 'Configuration saved on both nodes',
                     'nodes': ['primary', 'peer']})
 
@@ -1999,12 +2142,12 @@ def manage_static_route():
         else:
             return jsonify({'error': 'Invalid route type. Use: next-hop, blackhole, or interface'}), 400
 
-    result = apply_ops_dual(sess, ops, to_peer_requested=to_peer)
     action_name = 'route.delete' if request.method == 'DELETE' else 'route.create'
     target_str = f'{vrf or "default"}/{network}'
     _set_audit(action_name, target=target_str,
-               nodes=result.get('applied_to'),
                commands=[{'cmd': ' '.join([op.get('op', '')] + list(op.get('path', [])))} for op in ops])
+    result = apply_ops_dual(sess, ops, to_peer_requested=to_peer)
+    g.audit_nodes = result.get('applied_to')
     return jsonify({'status': 'ok', 'message': 'Static route updated successfully', **result})
 
 
