@@ -1140,7 +1140,7 @@ function renderRoutes() {
   `;
 
   for (const route of allRoutes) {
-    const pendingStatus = getRoutePendingStatus(route.network, route.target);
+    const pendingStatus = getRoutePendingStatus(route.network, route.target, route.vrf);
     const pendingClass = pendingStatus === 'delete' ? 'pending-delete' : (pendingStatus ? 'pending-change' : '');
     const pendingBadge = pendingStatus ? `<span class="pending-badge">${pendingStatus === 'delete' ? 'DEL' : 'MOD'}</span>` : '';
     const vrfBadge = route.vrf === 'default'
@@ -1211,11 +1211,13 @@ function parseRouteData(routeData) {
   return routes.length > 0 ? routes : [{ type: 'unknown', target: null, distance: null }];
 }
 
-function getRoutePendingStatus(network, target) {
+function getRoutePendingStatus(network, target, vrf) {
   if (!stagedMode) return null;
-  const marker = `route:${network}:${target || ''}`;
+  // Same key format used by saveRoute/deleteRoute when staging.
+  const marker = `route:${vrf || 'default'}:${network}:${target || ''}`;
   if (pendingRuleMarkers.has(marker)) {
-    const op = pendingOperations.find(o => o.type === 'route' && o.data.network === network);
+    const op = pendingOperations.find(o => o.marker === marker
+      || (o.type === 'route' && o.data.network === network));
     return op?.action === 'delete' ? 'delete' : 'update';
   }
   return null;
@@ -1304,9 +1306,13 @@ async function saveRoute() {
   const commands = buildRouteCommands(routeData);
 
   if (stagedMode) {
-    // Stage the operation
+    // Stage the operation (replacing any previous staged op for this route,
+    // so staging twice never queues duplicates that would fail the batch)
     const marker = `route:${vrf}:${network}:${target || ''}`;
+    const existingIdx = pendingOperations.findIndex(o => o.marker === marker);
+    if (existingIdx >= 0) pendingOperations.splice(existingIdx, 1);
     pendingOperations.push({
+      marker,
       type: 'route',
       action: 'create',
       data: routeData,
@@ -1400,7 +1406,21 @@ async function deleteRoute(network, target, vrf = 'default') {
 
   if (stagedMode) {
     const marker = `route:${vrf}:${network}:${target || ''}`;
+    const existingIdx = pendingOperations.findIndex(o => o.marker === marker);
+    if (existingIdx >= 0 && pendingOperations[existingIdx].action === 'create') {
+      // The route only exists as a staged creation: both ops cancel out.
+      pendingOperations.splice(existingIdx, 1);
+      pendingRuleMarkers.delete(marker);
+      updatePendingIndicator();
+      loadRoutes();
+      showToast('info', 'Reverted', 'Staged route creation cancelled');
+      logActivity('route', 'revert', `Route ${network}${vrfLabel}`, 'reverted',
+        'Delete of staged-new route cancels the pending creation');
+      return;
+    }
+    if (existingIdx >= 0) pendingOperations.splice(existingIdx, 1);
     pendingOperations.push({
+      marker,
       type: 'route',
       action: 'delete',
       data: { network, next_hop: target || undefined, vrf: vrfParam },
@@ -3238,6 +3258,14 @@ function deepEqual(a, b) {
  * Get differential changes between original and modified rule
  * Returns: { sets: [{path, value}], deletes: [path] }
  */
+// VyOS renders valueless flags (disable, exclude...) as {} in JSON, while the
+// modals build them as `true`. Both mean "flag set": normalize before diffing
+// or revert detection never converges for rules disabled on the server.
+function normFlagValue(v) {
+  if (v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 0) return true;
+  return v;
+}
+
 function getRuleDiff(original, modified, basePath = []) {
   const result = { sets: [], deletes: [] };
 
@@ -3259,8 +3287,8 @@ function getRuleDiff(original, modified, basePath = []) {
   const allKeys = new Set([...Object.keys(original), ...Object.keys(modified)]);
 
   for (const key of allKeys) {
-    const origVal = original[key];
-    const modVal = modified[key];
+    const origVal = normFlagValue(original[key]);
+    const modVal = normFlagValue(modified[key]);
     const currentPath = [...basePath, key];
 
     // Field removed
@@ -4519,6 +4547,24 @@ function addPendingOperation(operation) {
     if (originalState !== undefined) {
       originalServerStates.set(marker, originalState);
     }
+  }
+
+  // Deleting a rule that never existed on the server (it was only a staged
+  // creation): both operations cancel out. Without this, the batch would send
+  // a delete for a nonexistent path and the whole apply would fail.
+  if (operation.action === 'delete' && originalServerStates.get(marker) === null) {
+    pendingRuleMarkers.delete(marker);
+    originalServerStates.delete(marker);
+    restoreOriginalInConfig(operation, null); // removes the previewed rule
+    updatePendingIndicator();
+    showToast('info', 'Reverted', 'Staged rule creation cancelled');
+    const cancelTarget = operation.type === 'firewall'
+      ? `Rule ${operation.data.rule_id} in ${operation.data.ruleset}`
+      : `${operation.data.nat_type} NAT rule ${operation.data.rule_id}`;
+    logActivity(operation.type, 'revert', cancelTarget, 'reverted',
+      'Delete of staged-new rule cancels the pending creation');
+    refreshCurrentViewSoft();
+    return;
   }
 
   // For updates, check if new state matches original server state
@@ -6724,6 +6770,9 @@ function handleWriteLockLost() {
       pendingRuleMarkers.clear();
       originalServerStates.clear();
       if (typeof updatePendingIndicator === 'function') updatePendingIndicator();
+      // Staged previews already mutated CONFIG/natData: reload from the
+      // server so the tables stop showing changes that will never apply.
+      if (typeof reloadCurrentView === 'function') reloadCurrentView();
       showToast('warning', 'Lock lost',
         'Pending changes were discarded (someone took the lock or it expired).');
     } else {
