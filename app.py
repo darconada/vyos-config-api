@@ -2152,8 +2152,11 @@ def manage_static_route():
 
 
 # ──────────────────────────────────────────────────────────────
-#  BGP Configuration
+#  BGP Configuration (SOLO LECTURA)
 # ──────────────────────────────────────────────────────────────
+# Decisión (jun 2026): BGP es config por-nodo en un cluster HA (update-source,
+# IPs locales…), así que ni dual-apply ni edición desde esta herramienta tienen
+# sentido: los endpoints de escritura se eliminaron. BGP se edita en el router.
 @app.route('/api/bgp')
 @login_required
 def bgp_config():
@@ -2163,136 +2166,6 @@ def bgp_config():
     if not cfg:
         return jsonify({})
     return jsonify(cfg.get('protocols', {}).get('bgp', {}))
-
-
-@app.route('/api/bgp/neighbor', methods=['POST', 'DELETE'])
-@login_required
-@write_lock_required
-def manage_bgp_neighbor():
-    """Crear o eliminar neighbor BGP."""
-    sess = _get_session()
-    if not sess or not sess.get('active_api'):
-        return jsonify({'error': 'No active connection. Connect to router first.'}), 400
-
-    active_api = sess['active_api']
-    data = request.get_json() or {}
-    neighbor_ip = data.get('neighbor')
-
-    if not neighbor_ip:
-        return jsonify({'error': 'neighbor IP is required'}), 400
-
-    try:
-        if request.method == 'DELETE':
-            active_api.delete_path(['protocols', 'bgp', 'neighbor', neighbor_ip])
-        else:
-            remote_as = data.get('remote_as')
-            if not remote_as:
-                return jsonify({'error': 'remote_as is required'}), 400
-
-            base_path = ['protocols', 'bgp', 'neighbor', neighbor_ip]
-            ops = [{'op': 'set', 'path': base_path + ['remote-as', str(remote_as)]}]
-
-            if data.get('description'):
-                ops.append({'op': 'set', 'path': base_path + ['description', data['description']]})
-            if data.get('update_source'):
-                ops.append({'op': 'set', 'path': base_path + ['update-source', data['update_source']]})
-            if data.get('ebgp_multihop'):
-                ops.append({'op': 'set', 'path': base_path + ['ebgp-multihop', str(data['ebgp_multihop'])]})
-            if data.get('password'):
-                ops.append({'op': 'set', 'path': base_path + ['password', data['password']]})
-
-            # Address family settings
-            if data.get('ipv4_unicast'):
-                af_path = base_path + ['address-family', 'ipv4-unicast']
-                ops.append({'op': 'set', 'path': af_path})
-                if data.get('soft_reconfiguration'):
-                    ops.append({'op': 'set', 'path': af_path + ['soft-reconfiguration', 'inbound']})
-                if data.get('route_map_import'):
-                    ops.append({'op': 'set', 'path': af_path + ['route-map', 'import', data['route_map_import']]})
-                if data.get('route_map_export'):
-                    ops.append({'op': 'set', 'path': af_path + ['route-map', 'export', data['route_map_export']]})
-
-            active_api.configure(ops)
-
-        # Reload config
-        raw = active_api.get_config()
-        sess['raw_config'] = raw
-        sess['config'] = load_config(raw)
-
-        action_name = 'bgp.neighbor.delete' if request.method == 'DELETE' else 'bgp.neighbor.update'
-        _set_audit(action_name, target=neighbor_ip)
-        return jsonify({'status': 'ok', 'message': 'BGP neighbor updated successfully'})
-
-    except VyOSAPIError as e:
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/bgp/network', methods=['POST', 'DELETE'])
-@login_required
-@write_lock_required
-def manage_bgp_network():
-    """Añadir o eliminar network BGP."""
-    sess = _get_session()
-    if not sess or not sess.get('active_api'):
-        return jsonify({'error': 'No active connection. Connect to router first.'}), 400
-
-    active_api = sess['active_api']
-    data = request.get_json() or {}
-    network = data.get('network')
-
-    if not network:
-        return jsonify({'error': 'network is required'}), 400
-
-    try:
-        path = ['protocols', 'bgp', 'address-family', 'ipv4-unicast', 'network', network]
-
-        if request.method == 'DELETE':
-            active_api.delete_path(path)
-        else:
-            active_api.configure([{'op': 'set', 'path': path}])
-
-        # Reload config
-        raw = active_api.get_config()
-        sess['raw_config'] = raw
-        sess['config'] = load_config(raw)
-
-        action_name = 'bgp.network.delete' if request.method == 'DELETE' else 'bgp.network.create'
-        _set_audit(action_name, target=network)
-        return jsonify({'status': 'ok', 'message': 'BGP network updated successfully'})
-
-    except VyOSAPIError as e:
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/bgp/system-as', methods=['POST'])
-@login_required
-@write_lock_required
-def set_bgp_system_as():
-    """Configurar ASN local para BGP."""
-    sess = _get_session()
-    if not sess or not sess.get('active_api'):
-        return jsonify({'error': 'No active connection. Connect to router first.'}), 400
-
-    active_api = sess['active_api']
-    data = request.get_json() or {}
-    system_as = data.get('system_as')
-
-    if not system_as:
-        return jsonify({'error': 'system_as is required'}), 400
-
-    try:
-        active_api.configure([{'op': 'set', 'path': ['protocols', 'bgp', 'system-as', str(system_as)]}])
-
-        # Reload config
-        raw = active_api.get_config()
-        sess['raw_config'] = raw
-        sess['config'] = load_config(raw)
-
-        _set_audit('bgp.system-as.update', target=str(system_as))
-        return jsonify({'status': 'ok', 'message': 'BGP system AS configured successfully'})
-
-    except VyOSAPIError as e:
-        return jsonify({'error': str(e)}), 500
 
 
 if __name__ == '__main__':

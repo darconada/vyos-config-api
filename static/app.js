@@ -1752,20 +1752,24 @@ function renderBGP() {
         </div>
         <h3 class="empty-state-title">BGP Not Configured</h3>
         <p class="empty-state-text">BGP routing protocol is not configured on this device.</p>
-        ${isConnected ? `
-          <button class="btn btn-primary" onclick="openBGPSystemAsModal()" style="margin-top: 1rem;">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-            </svg>
-            Configure BGP
-          </button>
-        ` : ''}
       </div>
     `;
     return;
   }
 
   let html = '';
+
+  // BGP is read-only: cluster nodes legitimately differ in BGP config
+  // (update-source, local addresses), so dual-apply would be wrong by design.
+  html += `
+    <div class="card" style="margin-bottom: 1rem; padding: 0.75rem 1rem; display: flex; align-items: center; gap: 0.5rem;">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+        <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+      </svg>
+      <span class="text-muted">Read-only section: BGP is node-specific (update-source, local addresses) and must be edited on each router directly.</span>
+    </div>
+  `;
 
   // BGP Overview Card
   html += `
@@ -1828,32 +1832,7 @@ function renderBGP() {
     `;
   }
 
-  // Action buttons if connected
-  if (isConnected) {
-    html += `
-      <div class="table-actions" style="margin-bottom: 1rem;">
-        <button class="btn btn-success btn-sm" onclick="openBGPNeighborModal('create')">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-          </svg>
-          Add Neighbor
-        </button>
-        <button class="btn btn-success btn-sm" onclick="openBGPNetworkModal('create')">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
-          </svg>
-          Add Network
-        </button>
-        ${!systemAs ? `
-          <button class="btn btn-primary btn-sm" onclick="openBGPSystemAsModal()">
-            Set Local AS
-          </button>
-        ` : ''}
-      </div>
-    `;
-  }
-
-  // Neighbors Table
+  // Neighbors Table (read-only)
   if (Object.keys(neighbors).length > 0) {
     html += `
       <div class="card" style="margin-bottom: 1.5rem;">
@@ -1868,32 +1847,18 @@ function renderBGP() {
               <th>Description</th>
               <th>Update Source</th>
               <th>eBGP Multihop</th>
-              ${isConnected ? '<th class="actions-col">Actions</th>' : ''}
             </tr></thead>
             <tbody>
     `;
 
     for (const [neighborIP, nbrData] of Object.entries(neighbors)) {
-      const pendingStatus = getBGPPendingStatus('neighbor', neighborIP);
-      const pendingClass = pendingStatus === 'delete' ? 'pending-delete' : (pendingStatus ? 'pending-change' : '');
-      const pendingBadge = pendingStatus ? `<span class="pending-badge">${pendingStatus === 'delete' ? 'DEL' : 'MOD'}</span>` : '';
-
       html += `
-        <tr class="${pendingClass}">
-          <td><code>${escapeHtml(neighborIP)}</code>${pendingBadge}</td>
-          <td><span class="badge">${nbrData['remote-as'] || '-'}</span></td>
+        <tr>
+          <td><code>${escapeHtml(neighborIP)}</code></td>
+          <td><span class="badge">${escapeHtml(String(nbrData['remote-as'] || '-'))}</span></td>
           <td>${escapeHtml(nbrData.description || '-')}</td>
           <td>${nbrData['update-source'] ? `<code>${escapeHtml(nbrData['update-source'])}</code>` : '<span class="text-muted">-</span>'}</td>
-          <td>${nbrData['ebgp-multihop'] || '<span class="text-muted">-</span>'}</td>
-          ${isConnected ? `
-            <td class="actions-col">
-              <button class="btn-icon btn-danger" onclick="deleteBGPNeighbor('${escapeHtml(neighborIP)}')" title="Delete">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-                </svg>
-              </button>
-            </td>
-          ` : ''}
+          <td>${nbrData['ebgp-multihop'] ? escapeHtml(String(nbrData['ebgp-multihop'])) : '<span class="text-muted">-</span>'}</td>
         </tr>
       `;
     }
@@ -1901,7 +1866,7 @@ function renderBGP() {
     html += '</tbody></table></div></div>';
   }
 
-  // Networks Table
+  // Networks Table (read-only)
   if (Object.keys(networks).length > 0) {
     html += `
       <div class="card">
@@ -1912,28 +1877,14 @@ function renderBGP() {
           <table>
             <thead><tr>
               <th>Network</th>
-              ${isConnected ? '<th class="actions-col">Actions</th>' : ''}
             </tr></thead>
             <tbody>
     `;
 
     for (const network of Object.keys(networks).sort()) {
-      const pendingStatus = getBGPPendingStatus('network', network);
-      const pendingClass = pendingStatus === 'delete' ? 'pending-delete' : (pendingStatus ? 'pending-change' : '');
-      const pendingBadge = pendingStatus ? `<span class="pending-badge">${pendingStatus === 'delete' ? 'DEL' : 'MOD'}</span>` : '';
-
       html += `
-        <tr class="${pendingClass}">
-          <td><code>${escapeHtml(network)}</code>${pendingBadge}</td>
-          ${isConnected ? `
-            <td class="actions-col">
-              <button class="btn-icon btn-danger" onclick="deleteBGPNetwork('${escapeHtml(network)}')" title="Delete">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                  <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-                </svg>
-              </button>
-            </td>
-          ` : ''}
+        <tr>
+          <td><code>${escapeHtml(network)}</code></td>
         </tr>
       `;
     }
@@ -1942,423 +1893,6 @@ function renderBGP() {
   }
 
   content.innerHTML = html;
-}
-
-function getBGPPendingStatus(type, id) {
-  if (!stagedMode) return null;
-  const marker = `bgp:${type}:${id}`;
-  if (pendingRuleMarkers.has(marker)) {
-    const op = pendingOperations.find(o => o.type === 'bgp' && o.data.bgpType === type &&
-      (o.data.neighbor === id || o.data.network === id));
-    return op?.action === 'delete' ? 'delete' : 'update';
-  }
-  return null;
-}
-
-// BGP Modals
-async function openBGPSystemAsModal() {
-  if (!await ensureWriteLock('configure the BGP system AS')) return;
-  const existingModal = document.getElementById('bgpSystemAsModal');
-  if (existingModal) existingModal.remove();
-
-  const modal = document.createElement('div');
-  modal.id = 'bgpSystemAsModal';
-  modal.className = 'modal';
-  modal.innerHTML = `
-    <div class="modal-backdrop" onclick="closeModal('bgpSystemAsModal')"></div>
-    <div class="modal-content modal-sm">
-      <div class="modal-header">
-        <h3>Set Local AS</h3>
-        <button class="modal-close" onclick="closeModal('bgpSystemAsModal')">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-          </svg>
-        </button>
-      </div>
-      <div class="modal-body">
-        <div class="form-group">
-          <label>Local AS Number *</label>
-          <input type="number" id="bgpSystemAs" min="1" max="4294967295" placeholder="65000" required>
-        </div>
-      </div>
-      <div class="modal-footer">
-        <button class="btn btn-secondary" onclick="closeModal('bgpSystemAsModal')">Cancel</button>
-        <button class="btn btn-primary" onclick="saveBGPSystemAs()">Save</button>
-      </div>
-    </div>
-  `;
-  document.body.appendChild(modal);
-}
-
-async function saveBGPSystemAs() {
-  const systemAs = document.getElementById('bgpSystemAs').value.trim();
-  if (!systemAs) {
-    showToast('error', 'Validation Error', 'AS number is required');
-    return;
-  }
-
-  closeModal('bgpSystemAsModal');
-  showLoading('Configuring BGP...');
-
-  try {
-    const res = await fetch('/api/bgp/system-as', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ system_as: parseInt(systemAs) })
-    });
-    const j = await res.json();
-    checkWriteLockedResponse(res, j);
-
-    if (!res.ok) throw new Error(j.error || 'Failed to set system AS');
-
-    hasUnsavedChanges = true;
-    updateSaveIndicator();
-    await loadBGP();
-    showToast('success', 'Success', `BGP local AS set to ${systemAs}`);
-    logActivity('bgp', 'update', 'System AS', 'success', `Set BGP local AS to ${systemAs}`, [
-      { cmd: `set protocols bgp system-as ${systemAs}` }
-    ]);
-  } catch (e) {
-    logActivity('bgp', 'update', 'System AS', 'error', e.message);
-    if (!e.isLocked) showToast('error', 'Error', e.message);
-    loadBGP();
-  }
-}
-
-async function openBGPNeighborModal(mode) {
-  if (!await ensureWriteLock(mode === 'edit' ? 'edit a BGP neighbor' : 'add a BGP neighbor')) return;
-  const existingModal = document.getElementById('bgpNeighborModal');
-  if (existingModal) existingModal.remove();
-
-  const modal = document.createElement('div');
-  modal.id = 'bgpNeighborModal';
-  modal.className = 'modal';
-  modal.innerHTML = `
-    <div class="modal-backdrop" onclick="closeModal('bgpNeighborModal')"></div>
-    <div class="modal-content modal-lg">
-      <div class="modal-header">
-        <h3>Add BGP Neighbor</h3>
-        <button class="modal-close" onclick="closeModal('bgpNeighborModal')">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-          </svg>
-        </button>
-      </div>
-      <div class="modal-body">
-        <div class="form-row">
-          <div class="form-group">
-            <label>Neighbor IP *</label>
-            <input type="text" id="bgpNeighborIP" placeholder="10.0.0.1" required>
-          </div>
-          <div class="form-group">
-            <label>Remote AS *</label>
-            <input type="number" id="bgpRemoteAs" min="1" max="4294967295" placeholder="65001" required>
-          </div>
-        </div>
-        <div class="form-group">
-          <label>Description</label>
-          <input type="text" id="bgpNeighborDesc" placeholder="Upstream Provider">
-        </div>
-        <div class="form-row">
-          <div class="form-group">
-            <label>Update Source</label>
-            <input type="text" id="bgpUpdateSource" placeholder="10.0.0.2 or eth0">
-          </div>
-          <div class="form-group">
-            <label>eBGP Multihop</label>
-            <input type="number" id="bgpMultihop" min="1" max="255" placeholder="2">
-          </div>
-        </div>
-        <fieldset class="form-fieldset">
-          <legend>Address Family IPv4</legend>
-          <div class="form-group">
-            <label class="checkbox-label">
-              <input type="checkbox" id="bgpIpv4Unicast" checked>
-              <span>Enable IPv4 Unicast</span>
-            </label>
-          </div>
-          <div class="form-group">
-            <label class="checkbox-label">
-              <input type="checkbox" id="bgpSoftReconfig">
-              <span>Soft Reconfiguration Inbound</span>
-            </label>
-          </div>
-          <div class="form-row">
-            <div class="form-group">
-              <label>Route-map Import</label>
-              <input type="text" id="bgpRouteMapIn" placeholder="IMPORT-MAP">
-            </div>
-            <div class="form-group">
-              <label>Route-map Export</label>
-              <input type="text" id="bgpRouteMapOut" placeholder="EXPORT-MAP">
-            </div>
-          </div>
-        </fieldset>
-      </div>
-      <div class="modal-footer">
-        <button class="btn btn-secondary" onclick="closeModal('bgpNeighborModal')">Cancel</button>
-        <button class="btn btn-primary" onclick="saveBGPNeighbor()">Save</button>
-      </div>
-    </div>
-  `;
-  document.body.appendChild(modal);
-}
-
-async function saveBGPNeighbor() {
-  const neighborIP = document.getElementById('bgpNeighborIP').value.trim();
-  const remoteAs = document.getElementById('bgpRemoteAs').value.trim();
-
-  if (!neighborIP || !remoteAs) {
-    showToast('error', 'Validation Error', 'Neighbor IP and Remote AS are required');
-    return;
-  }
-
-  const neighborData = {
-    neighbor: neighborIP,
-    remote_as: parseInt(remoteAs),
-    description: document.getElementById('bgpNeighborDesc').value.trim() || undefined,
-    update_source: document.getElementById('bgpUpdateSource').value.trim() || undefined,
-    ebgp_multihop: document.getElementById('bgpMultihop').value.trim() ? parseInt(document.getElementById('bgpMultihop').value) : undefined,
-    ipv4_unicast: document.getElementById('bgpIpv4Unicast').checked,
-    soft_reconfiguration: document.getElementById('bgpSoftReconfig').checked,
-    route_map_import: document.getElementById('bgpRouteMapIn').value.trim() || undefined,
-    route_map_export: document.getElementById('bgpRouteMapOut').value.trim() || undefined
-  };
-
-  if (stagedMode) {
-    const marker = `bgp:neighbor:${neighborIP}`;
-    pendingOperations.push({
-      type: 'bgp',
-      action: 'create',
-      data: { bgpType: 'neighbor', ...neighborData },
-      display: `BGP neighbor ${neighborIP} AS ${remoteAs}`
-    });
-    pendingRuleMarkers.add(marker);
-    updatePendingIndicator();
-    closeModal('bgpNeighborModal');
-    loadBGP();
-    showToast('info', 'Staged', `BGP neighbor ${neighborIP} queued for creation`);
-    logActivity('bgp', 'staged', `Neighbor ${neighborIP}`, 'staged', `Neighbor staged for creation`);
-    return;
-  }
-
-  closeModal('bgpNeighborModal');
-  showLoading('Adding BGP neighbor...');
-
-  try {
-    const res = await fetch('/api/bgp/neighbor', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(neighborData)
-    });
-    const j = await res.json();
-    checkWriteLockedResponse(res, j);
-
-    if (!res.ok) throw new Error(j.error || 'Failed to add neighbor');
-
-    hasUnsavedChanges = true;
-    updateSaveIndicator();
-    await loadBGP();
-    showToast('success', 'Success', `BGP neighbor ${neighborIP} added`);
-    logActivity('bgp', 'create', `Neighbor ${neighborIP}`, 'success', `Added BGP neighbor ${neighborIP} AS ${remoteAs}`, [
-      { cmd: `set protocols bgp neighbor ${neighborIP} remote-as ${remoteAs}` }
-    ]);
-  } catch (e) {
-    logActivity('bgp', 'create', `Neighbor ${neighborIP}`, 'error', e.message);
-    if (!e.isLocked) showToast('error', 'Error', e.message);
-    loadBGP();
-  }
-}
-
-async function deleteBGPNeighbor(neighborIP) {
-  if (!await ensureWriteLock(`delete BGP neighbor ${neighborIP}`)) return;
-  const confirmed = await openConfirmModal(
-    'Delete BGP Neighbor?',
-    `Are you sure you want to delete neighbor ${neighborIP}?`
-  );
-
-  if (!confirmed) return;
-
-  if (stagedMode) {
-    const marker = `bgp:neighbor:${neighborIP}`;
-    pendingOperations.push({
-      type: 'bgp',
-      action: 'delete',
-      data: { bgpType: 'neighbor', neighbor: neighborIP },
-      display: `Delete BGP neighbor ${neighborIP}`
-    });
-    pendingRuleMarkers.add(marker);
-    updatePendingIndicator();
-    loadBGP();
-    showToast('info', 'Staged', `Neighbor deletion queued`);
-    logActivity('bgp', 'staged', `Neighbor ${neighborIP}`, 'staged', `Neighbor staged for deletion`);
-    return;
-  }
-
-  showLoading('Deleting BGP neighbor...');
-
-  try {
-    const res = await fetch('/api/bgp/neighbor', {
-      method: 'DELETE',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ neighbor: neighborIP })
-    });
-    const j = await res.json();
-    checkWriteLockedResponse(res, j);
-
-    if (!res.ok) throw new Error(j.error || 'Failed to delete neighbor');
-
-    hasUnsavedChanges = true;
-    updateSaveIndicator();
-    await loadBGP();
-    showToast('success', 'Success', `BGP neighbor ${neighborIP} deleted`);
-    logActivity('bgp', 'delete', `Neighbor ${neighborIP}`, 'success', `Deleted BGP neighbor ${neighborIP}`, [
-      { cmd: `delete protocols bgp neighbor ${neighborIP}` }
-    ]);
-  } catch (e) {
-    logActivity('bgp', 'delete', `Neighbor ${neighborIP}`, 'error', e.message);
-    if (!e.isLocked) showToast('error', 'Error', e.message);
-    loadBGP();
-  }
-}
-
-async function openBGPNetworkModal(mode) {
-  if (!await ensureWriteLock('add a BGP network')) return;
-  const existingModal = document.getElementById('bgpNetworkModal');
-  if (existingModal) existingModal.remove();
-
-  const modal = document.createElement('div');
-  modal.id = 'bgpNetworkModal';
-  modal.className = 'modal';
-  modal.innerHTML = `
-    <div class="modal-backdrop" onclick="closeModal('bgpNetworkModal')"></div>
-    <div class="modal-content modal-sm">
-      <div class="modal-header">
-        <h3>Add BGP Network</h3>
-        <button class="modal-close" onclick="closeModal('bgpNetworkModal')">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
-          </svg>
-        </button>
-      </div>
-      <div class="modal-body">
-        <div class="form-group">
-          <label>Network (CIDR) *</label>
-          <input type="text" id="bgpNetworkCIDR" placeholder="192.168.0.0/24" required>
-          <small class="text-muted">Network to advertise via BGP</small>
-        </div>
-      </div>
-      <div class="modal-footer">
-        <button class="btn btn-secondary" onclick="closeModal('bgpNetworkModal')">Cancel</button>
-        <button class="btn btn-primary" onclick="saveBGPNetwork()">Save</button>
-      </div>
-    </div>
-  `;
-  document.body.appendChild(modal);
-}
-
-async function saveBGPNetwork() {
-  const network = document.getElementById('bgpNetworkCIDR').value.trim();
-  if (!network) {
-    showToast('error', 'Validation Error', 'Network is required');
-    return;
-  }
-
-  if (stagedMode) {
-    const marker = `bgp:network:${network}`;
-    pendingOperations.push({
-      type: 'bgp',
-      action: 'create',
-      data: { bgpType: 'network', network },
-      display: `BGP network ${network}`
-    });
-    pendingRuleMarkers.add(marker);
-    updatePendingIndicator();
-    closeModal('bgpNetworkModal');
-    loadBGP();
-    showToast('info', 'Staged', `BGP network ${network} queued`);
-    logActivity('bgp', 'staged', `Network ${network}`, 'staged', `Network staged for advertisement`);
-    return;
-  }
-
-  closeModal('bgpNetworkModal');
-  showLoading('Adding BGP network...');
-
-  try {
-    const res = await fetch('/api/bgp/network', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ network })
-    });
-    const j = await res.json();
-    checkWriteLockedResponse(res, j);
-
-    if (!res.ok) throw new Error(j.error || 'Failed to add network');
-
-    hasUnsavedChanges = true;
-    updateSaveIndicator();
-    await loadBGP();
-    showToast('success', 'Success', `BGP network ${network} added`);
-    logActivity('bgp', 'create', `Network ${network}`, 'success', `Added BGP network ${network}`, [
-      { cmd: `set protocols bgp address-family ipv4-unicast network ${network}` }
-    ]);
-  } catch (e) {
-    logActivity('bgp', 'create', `Network ${network}`, 'error', e.message);
-    if (!e.isLocked) showToast('error', 'Error', e.message);
-    loadBGP();
-  }
-}
-
-async function deleteBGPNetwork(network) {
-  if (!await ensureWriteLock(`delete BGP network ${network}`)) return;
-  const confirmed = await openConfirmModal(
-    'Delete BGP Network?',
-    `Are you sure you want to stop advertising ${network}?`
-  );
-
-  if (!confirmed) return;
-
-  if (stagedMode) {
-    const marker = `bgp:network:${network}`;
-    pendingOperations.push({
-      type: 'bgp',
-      action: 'delete',
-      data: { bgpType: 'network', network },
-      display: `Delete BGP network ${network}`
-    });
-    pendingRuleMarkers.add(marker);
-    updatePendingIndicator();
-    loadBGP();
-    showToast('info', 'Staged', `Network deletion queued`);
-    logActivity('bgp', 'staged', `Network ${network}`, 'staged', `Network staged for deletion`);
-    return;
-  }
-
-  showLoading('Deleting BGP network...');
-
-  try {
-    const res = await fetch('/api/bgp/network', {
-      method: 'DELETE',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ network })
-    });
-    const j = await res.json();
-    checkWriteLockedResponse(res, j);
-
-    if (!res.ok) throw new Error(j.error || 'Failed to delete network');
-
-    hasUnsavedChanges = true;
-    updateSaveIndicator();
-    await loadBGP();
-    showToast('success', 'Success', `BGP network ${network} removed`);
-    logActivity('bgp', 'delete', `Network ${network}`, 'success', `Removed BGP network ${network}`, [
-      { cmd: `delete protocols bgp address-family ipv4-unicast network ${network}` }
-    ]);
-  } catch (e) {
-    logActivity('bgp', 'delete', `Network ${network}`, 'error', e.message);
-    if (!e.isLocked) showToast('error', 'Error', e.message);
-    loadBGP();
-  }
 }
 
 // =========================================
