@@ -1,6 +1,37 @@
-# Drag & drop de reglas de firewall (estilo Checkpoint) — diseño
+# Drag & drop de reglas de firewall (estilo Checkpoint)
 
-> Estado: **anotado, no implementado** (junio 2026). Documento de diseño para cuando se decida atacarlo.
+> Estado: **IMPLEMENTADO** (junio 2026). Decisiones tomadas con el usuario:
+> cascada mínima cuando no hay hueco, punto medio del hueco como ID destino,
+> soportado también en modo staged, y botones de "insert above/below".
+>
+> ## Cómo quedó
+> - **Frontend**: el badge del ID es el drag handle. `computeMovePlan` calcula
+>   el plan (hueco → punto medio; sin hueco → cascada mínima hasta el primer
+>   hueco; si la regla movida estorba a la cascada → swap vía ID temporal).
+>   SIEMPRE hay modal de confirmación con las reglas desplazadas, aviso de
+>   grupos cuyo nombre contiene el ID antiguo (convención de algunos routers)
+>   y los comandos exactos. Con filtros activos el drag se bloquea (las filas
+>   ocultas harían ambigua la posición). Tope: 50 pasos por plan.
+> - **Backend**: `POST /api/firewall/rules/move` y acción `move` en
+>   `build_vyos_operations` → `_build_moves_ops`, que RE-VALIDA cada paso del
+>   plan contra una simulación secuencial (no contra el estado inicial:
+>   un `set` sobre un ID ocupado lo mergearía VyOS EN SILENCIO). Cada paso
+>   recrea la regla desde el árbol crudo (`_build_renumber_ops`), todo en UNA
+>   transacción atómica vía `apply_ops_dual` (dual-apply, lock, audit
+>   `firewall.move`, rollback real).
+> - **Staged**: cada drop encola una operación `move` con preview local
+>   (subárboles recolocados en CONFIG, badges MOD en los IDs nuevos);
+>   `batch-configure` simula el batch SECUENCIALMENTE, así los moves
+>   encadenados se validan contra el estado que deja el anterior.
+> - **Insert above/below**: botones por fila que precalculan el ID del hueco
+>   y abren el modal de crear; si no hay hueco no se mueve nada implícitamente.
+> - **Validación**: fuzz de 254 escenarios aleatorios cruzando el plan del
+>   cliente contra la validación del servidor: 0 fallos, sin pérdidas ni
+>   duplicados, orden final siempre igual a la intención del drop.
+
+---
+
+## Diseño original (referencia)
 
 ## Restricción de fondo
 

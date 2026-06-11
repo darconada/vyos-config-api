@@ -1892,6 +1892,49 @@ def renumber_nat_rule():
 
 
 # ──────────────────────────────────────────────────────────────
+#  Move / reorder (drag & drop)
+# ──────────────────────────────────────────────────────────────
+@app.route('/api/firewall/rules/move', methods=['POST'])
+@login_required
+@write_lock_required
+def move_firewall_rules():
+    """
+    Aplica un plan de movimiento de reglas (drag & drop) en una transacción.
+    Body: {ruleset, moves: [{from, to}, ...] (ordenado), apply_to_peer?}
+    El plan lo calcula el frontend, pero aquí se re-valida paso a paso contra
+    el config cacheado (ver _build_moves_ops).
+    """
+    sess = _get_session()
+    if not sess or not sess.get('active_api'):
+        return jsonify({'error': 'No active connection. Connect to router first.'}), 400
+
+    data = request.get_json() or {}
+    ruleset = data.get('ruleset')
+    moves = data.get('moves')
+    to_peer = data.get('apply_to_peer')
+
+    try:
+        ops = build_vyos_operations({'type': 'firewall', 'action': 'move',
+                                     'data': {'ruleset': ruleset, 'moves': moves}},
+                                    raw_config=sess.get('raw_config'))
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+    # Etiqueta para el audit: el frontend manda moved_rule/moved_to (la regla
+    # arrastrada); con cascada o swap el último paso del plan no es descriptivo.
+    moved_rule = data.get('moved_rule') or (moves[-1].get('from') if moves else '?')
+    moved_to = data.get('moved_to') or (moves[-1].get('to') if moves else '?')
+    target = f'{ruleset}: {moved_rule} -> {moved_to}'
+    if len(moves) > 1:
+        target += f' (+{len(moves) - 1} shifted)'
+    _set_audit('firewall.move', target=target,
+               commands=[{'cmd': ' '.join([op.get('op', '')] + list(op.get('path', [])))} for op in ops])
+    result = apply_ops_dual(sess, ops, to_peer_requested=to_peer)
+    g.audit_nodes = result.get('applied_to')
+    return jsonify({'status': 'ok', 'message': 'Rules moved successfully', **result})
+
+
+# ──────────────────────────────────────────────────────────────
 #  Default-action del ruleset
 # ──────────────────────────────────────────────────────────────
 @app.route('/api/firewall/ruleset/default-action', methods=['POST'])
@@ -2024,12 +2067,21 @@ def batch_configure():
     if not operations:
         return jsonify({'error': 'No operations provided'}), 400
 
+    # Simulación SECUENCIAL del batch: cada operación se construye contra el
+    # estado que dejan las anteriores (no contra el estado inicial). Esencial
+    # para renumbers/moves staged encadenados: el move N depende de los ids
+    # que dejó el move N-1. Best-effort: si una op no se puede simular, las
+    # siguientes validan contra el último estado conocido y VyOS (transacción
+    # atómica) sigue siendo el validador final.
+    raw0 = sess.get('raw_config')
+    sim = copy.deepcopy(raw0) if raw0 is not None else None
     vyos_ops = []
     try:
         for op in operations:
-            # raw_config permite resolver renumbers staged contra el árbol
-            # crudo en el momento del Apply All (no al encolar).
-            vyos_ops.extend(build_vyos_operations(op, raw_config=sess.get('raw_config')))
+            built = build_vyos_operations(op, raw_config=sim if sim is not None else raw0)
+            vyos_ops.extend(built)
+            if sim is not None and built:
+                apply_ops_in_memory(sim, built)
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
 
@@ -2094,6 +2146,54 @@ def _build_renumber_ops(raw_config, old_path, new_path, diff=None):
     return ops
 
 
+_MAX_MOVE_STEPS = 50  # backstop: una cascada mayor huele a plan erróneo
+
+
+def _build_moves_ops(raw_config, ruleset, moves):
+    """
+    Construye las ops de un plan de movimiento (drag & drop): lista ORDENADA
+    de pasos {from, to} dentro de un mismo ruleset, cada uno un renumber
+    (recrear desde el árbol crudo + borrar el id viejo), todo destinado a UNA
+    única transacción /configure.
+
+    CRÍTICO: cada paso se valida contra una SIMULACIÓN que evoluciona, no
+    contra el estado inicial. En una cascada, el destino del paso N queda
+    libre gracias al paso N-1; validar contra el estado inicial rechazaría
+    planes válidos, y NO validar dejaría pasar un `set` sobre una regla
+    ocupada, que VyOS mergea EN SILENCIO (no da error) corrompiendo la regla.
+
+    Lanza ValueError ante cualquier paso inválido.
+    """
+    if raw_config is None:
+        raise ValueError('No cached config available to resolve rule subtrees')
+    if not ruleset:
+        raise ValueError('move requires ruleset')
+    if not moves or not isinstance(moves, list):
+        raise ValueError('move requires a non-empty moves list')
+    if len(moves) > _MAX_MOVE_STEPS:
+        raise ValueError(f'Move plan too large ({len(moves)} steps, max {_MAX_MOVE_STEPS})')
+
+    sim = copy.deepcopy(raw_config)
+    all_ops = []
+    for step in moves:
+        src = step.get('from')
+        dst = step.get('to')
+        if src in (None, '') or dst in (None, ''):
+            raise ValueError('each move step requires from and to')
+        src, dst = str(src), str(dst)
+        if not src.isdigit() or not dst.isdigit() or not (1 <= int(dst) <= 999999):
+            raise ValueError(f'Invalid rule id in move step: {src} -> {dst}')
+        old_path = ['firewall', 'ipv4', 'name', ruleset, 'rule', src]
+        new_path = ['firewall', 'ipv4', 'name', ruleset, 'rule', dst]
+        step_ops = _build_renumber_ops(sim, old_path, new_path)
+        # Avanzar la simulación: el siguiente paso debe validarse contra el
+        # estado que dejará este.
+        if not apply_ops_in_memory(sim, step_ops):
+            raise ValueError(f'Cannot simulate move step {src} -> {dst}')
+        all_ops.extend(step_ops)
+    return all_ops
+
+
 def build_vyos_operations(operation, raw_config=None):
     """
     Convierte una operación del frontend a operaciones VyOS (lista de dicts con 'op' y 'path').
@@ -2110,6 +2210,11 @@ def build_vyos_operations(operation, raw_config=None):
 
     if op_type == 'firewall':
         ruleset = data.get('ruleset')
+        if action == 'move':
+            # Drag & drop: plan de renumbers encadenados, resuelto contra el
+            # árbol crudo (en batch, contra la simulación secuencial del batch).
+            ops.extend(_build_moves_ops(raw_config, ruleset, data.get('moves')))
+            return ops
         # Validar SIEMPRE: un item de batch malformado generaba paths con el
         # literal 'None' (p. ej. "rule None") que llegaban al router.
         if not ruleset or data.get('rule_id') in (None, ''):

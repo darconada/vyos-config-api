@@ -2095,6 +2095,321 @@ function renderHookCards(hooks) {
   return html;
 }
 
+// ── Drag & drop de reglas (reordenar = renumerar) ──
+// VyOS no tiene "mover": cada drop se traduce a un plan de renumbers
+// (recrear desde el arbol crudo + borrar el id viejo) aplicado en UNA
+// transaccion atomica. El plan se calcula aqui y el backend lo RE-VALIDA
+// paso a paso contra una simulacion (_build_moves_ops).
+
+// Calcula el plan para soltar fromId entre prevId y nextId (null = extremo).
+// Devuelve { noop } | { error } | { moves: [{from,to}...], movedTo, shifted }.
+function computeMovePlan(allIds, fromId, prevId, nextId) {
+  const ids = allIds.map(Number).sort((a, b) => a - b);
+  const from = Number(fromId);
+  if (!ids.includes(from)) return { error: 'Rule not found in this ruleset' };
+  const prev = prevId === null ? null : Number(prevId);
+  const next = nextId === null ? null : Number(nextId);
+
+  // Soltar en la posicion actual -> no-op
+  const idx = ids.indexOf(from);
+  const curPrev = idx > 0 ? ids[idx - 1] : null;
+  const curNext = idx < ids.length - 1 ? ids[idx + 1] : null;
+  if (prev === curPrev && next === curNext) return { noop: true };
+  if (prev === from || next === from) return { noop: true };
+
+  const low = prev === null ? 0 : prev;
+
+  // Detras de la ultima regla
+  if (next === null) {
+    const to = low + 10;
+    if (to > 999999) return { error: 'No free rule id available after the last rule' };
+    return { moves: [{ from: String(from), to: String(to) }], movedTo: to, shifted: [] };
+  }
+
+  // Hay hueco: punto medio (conserva huecos a ambos lados)
+  if (next - low > 1) {
+    const to = Math.floor((low + next) / 2);
+    return { moves: [{ from: String(from), to: String(to) }], movedTo: to, shifted: [] };
+  }
+
+  // Sin hueco: cascada minima desde `next` hasta el primer id libre.
+  const target = next;
+  const idSet = new Set(ids);
+  const run = [];
+  let cursor = target;
+  while (idSet.has(cursor)) { run.push(cursor); cursor++; }
+  const firstFree = cursor;
+  if (firstFree > 999999) return { error: 'No free rule id available for the shift' };
+
+  const moves = [];
+  let shiftedIds;
+  if (run.includes(from)) {
+    // La regla movida ocupa un id que la cascada necesita: primero sale a un
+    // id temporal libre, se desplaza el tramo intermedio, y entra al hueco.
+    moves.push({ from: String(from), to: String(firstFree) });
+    shiftedIds = run.filter(id => id >= target && id < from);
+    for (let i = shiftedIds.length - 1; i >= 0; i--) {
+      moves.push({ from: String(shiftedIds[i]), to: String(shiftedIds[i] + 1) });
+    }
+    moves.push({ from: String(firstFree), to: String(target) });
+  } else {
+    shiftedIds = run.slice();
+    for (let i = shiftedIds.length - 1; i >= 0; i--) {
+      moves.push({ from: String(shiftedIds[i]), to: String(shiftedIds[i] + 1) });
+    }
+    moves.push({ from: String(from), to: String(target) });
+  }
+  if (moves.length > 50) {
+    return { error: `This move would renumber ${moves.length - 1} other rules (max 50). Renumber manually instead.` };
+  }
+  return { moves, movedTo: target, shifted: shiftedIds.map(id => ({ from: id, to: id + 1 })) };
+}
+
+let dragRuleId = null;
+
+function clearDropIndicators() {
+  content.querySelectorAll('.drop-above, .drop-below').forEach(el =>
+    el.classList.remove('drop-above', 'drop-below'));
+}
+
+function setupRuleDrag() {
+  if (!isConnected) return;
+  const tbody = content.querySelector('table tbody');
+  if (!tbody) return;
+  tbody.querySelectorAll('tr[id^="row-"]').forEach(tr => {
+    const ruleId = tr.id.slice(4);
+    const handle = tr.querySelector('.drag-handle');
+    if (handle) {
+      handle.addEventListener('dragstart', (e) => {
+        const hasFilters = Object.keys(filters).length > 0 || ipFilters.source || ipFilters.destination;
+        if (hasFilters) {
+          e.preventDefault();
+          showToast('warning', 'Filters active',
+            'Clear the filters before reordering: hidden rules make the drop position ambiguous.');
+          return;
+        }
+        dragRuleId = ruleId;
+        tr.classList.add('dragging');
+        e.dataTransfer.effectAllowed = 'move';
+        try { e.dataTransfer.setData('text/plain', ruleId); } catch (err) { /* IE */ }
+      });
+      handle.addEventListener('dragend', () => {
+        tr.classList.remove('dragging');
+        clearDropIndicators();
+        dragRuleId = null;
+      });
+    }
+    tr.addEventListener('dragover', (e) => {
+      if (dragRuleId === null) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      const rect = tr.getBoundingClientRect();
+      const below = (e.clientY - rect.top) > rect.height / 2;
+      clearDropIndicators();
+      tr.classList.add(below ? 'drop-below' : 'drop-above');
+    });
+    tr.addEventListener('drop', (e) => {
+      if (dragRuleId === null) return;
+      e.preventDefault();
+      const from = dragRuleId;
+      dragRuleId = null;
+      clearDropIndicators();
+      const rect = tr.getBoundingClientRect();
+      const below = (e.clientY - rect.top) > rect.height / 2;
+      handleRuleDrop(from, ruleId, below);
+    });
+  });
+}
+
+async function handleRuleDrop(fromId, overId, below) {
+  if (String(fromId) === String(overId)) return;
+  const ids = Object.keys(currentRulesetData).map(Number).sort((a, b) => a - b);
+  const over = Number(overId);
+  const oidx = ids.indexOf(over);
+  if (oidx < 0) return;
+  const prev = below ? over : (oidx > 0 ? ids[oidx - 1] : null);
+  const next = below ? (oidx < ids.length - 1 ? ids[oidx + 1] : null) : over;
+  const plan = computeMovePlan(ids, fromId, prev, next);
+  if (plan.noop) return;
+  if (plan.error) { showToast('warning', 'Cannot move', plan.error); return; }
+  if (!await ensureWriteLock(`move rule ${fromId}`)) return;
+  openMoveConfirmModal(currentRulesetName, fromId, plan);
+}
+
+// Comandos del plan: simula los pasos sobre los subarboles de CONFIG para
+// que cada paso lea la regla donde REALMENTE estara en ese momento (en un
+// swap, el ultimo paso lee la regla desde su id temporal).
+function buildMoveCommands(ruleset, moves) {
+  const basePrefix = `firewall ipv4 name ${ruleset} rule`;
+  const pool = {};
+  for (const [id, r] of Object.entries(CONFIG?.firewall?.name?.[ruleset]?.rule || {})) pool[id] = r;
+  const commands = [];
+  for (const m of moves) {
+    const subtree = pool[m.from];
+    if (subtree === undefined) continue;
+    commands.push(...buildSubtreeCommands(`${basePrefix} ${m.to}`, subtree));
+    commands.push({ op: 'delete', cmd: `delete ${basePrefix} ${m.from}` });
+    delete pool[m.from];
+    pool[m.to] = subtree;
+  }
+  return commands;
+}
+
+// Convencion de algunos routers: nombres de grupo alineados con el id de la
+// regla. Renumerar NO renombra grupos -> avisar de los afectados.
+function groupNamesTiedToRuleId(rule, ruleId) {
+  const names = [];
+  for (const side of ['source', 'destination']) {
+    const g = rule?.[side]?.group || {};
+    for (const name of Object.values(g)) {
+      if (typeof name === 'string' && name.includes(String(ruleId))) names.push(name);
+    }
+  }
+  return names;
+}
+
+function openMoveConfirmModal(ruleset, fromId, plan) {
+  document.getElementById('moveConfirmModal')?.remove();
+  const commands = buildMoveCommands(ruleset, plan.moves);
+
+  let shiftedHtml = '';
+  if (plan.shifted.length) {
+    shiftedHtml = `
+      <div class="form-group">
+        <label>Additional rules renumbered (no free id at the drop position):</label>
+        <ul class="group-details-list">
+          ${plan.shifted.map(s => `<li>Rule ${s.from} &rarr; ${s.to}</li>`).join('')}
+        </ul>
+      </div>`;
+  }
+
+  const groupWarnings = [];
+  for (const m of plan.moves) {
+    const rule = currentRulesetData[m.from];
+    if (!rule) continue;
+    for (const name of groupNamesTiedToRuleId(rule, m.from)) {
+      groupWarnings.push(`Rule ${m.from} &rarr; ${m.to}: group <code>${escapeHtml(name)}</code>`);
+    }
+  }
+  const groupWarnHtml = groupWarnings.length ? `
+    <div class="form-group">
+      <label style="color: var(--warning-color, #d97706);">Group names tied to old rule ids (NOT renamed automatically):</label>
+      <ul class="group-details-list">${groupWarnings.map(w => `<li>${w}</li>`).join('')}</ul>
+    </div>` : '';
+
+  const modal = document.createElement('div');
+  modal.id = 'moveConfirmModal';
+  modal.className = 'modal';
+  modal.innerHTML = `
+    <div class="modal-backdrop" onclick="closeModal('moveConfirmModal')"></div>
+    <div class="modal-content modal-md">
+      <div class="modal-header">
+        <h3>Move rule ${escapeHtml(fromId)} &rarr; ${escapeHtml(String(plan.movedTo))}?</h3>
+        <button class="modal-close" onclick="closeModal('moveConfirmModal')">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <p>VyOS rule order is the rule id: moving = renumbering. The rule is recreated
+        with ALL its fields (including ones not shown in this UI) and the old id is
+        deleted, atomically in one commit.</p>
+        ${shiftedHtml}
+        ${groupWarnHtml}
+        <div class="form-group">
+          <label>Commands (${commands.length}):</label>
+          <div class="command-preview-box" style="max-height: 220px; overflow-y: auto; font-family: monospace; font-size: 0.78rem; white-space: pre-wrap; background: var(--bg-secondary); border-radius: var(--radius-sm); padding: 0.5rem;">${commands.map(c => `<span class="${c.op === 'delete' ? 'cmd-delete' : 'cmd-set'}">${escapeHtml(c.cmd)}</span>`).join('\n')}</div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('moveConfirmModal')">Cancel</button>
+        <button class="btn btn-primary" id="moveConfirmBtn">${stagedMode ? 'Queue move' : 'Move rule'}</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  document.getElementById('moveConfirmBtn').addEventListener('click', () =>
+    executeMovePlan(ruleset, fromId, plan, commands));
+}
+
+// Preview local de un move staged: recolocar los subarboles en CONFIG.
+function applyMoveToLocalConfig(ruleset, moves) {
+  const rules = CONFIG?.firewall?.name?.[ruleset]?.rule;
+  if (!rules) return;
+  for (const m of moves) {
+    const subtree = rules[m.from];
+    if (subtree === undefined) continue;
+    delete rules[m.from];
+    rules[m.to] = subtree;
+  }
+  if (currentRulesetName === ruleset) currentRulesetData = rules;
+}
+
+async function executeMovePlan(ruleset, fromId, plan, commands) {
+  closeModal('moveConfirmModal');
+  const target = `Rule ${fromId} -> ${plan.movedTo} in ${ruleset}`
+    + (plan.shifted.length ? ` (+${plan.shifted.length} shifted)` : '');
+
+  if (stagedMode) {
+    pendingOperations.push({
+      type: 'firewall',
+      action: 'move',
+      data: { ruleset, moves: plan.moves,
+              moved_rule: String(fromId), moved_to: String(plan.movedTo) },
+      display: `Move firewall rule: ${target}`,
+      commands
+    });
+    for (const m of plan.moves) pendingRuleMarkers.add(`firewall:${ruleset}:${m.to}`);
+    applyMoveToLocalConfig(ruleset, plan.moves);
+    updatePendingIndicator();
+    showToast('info', 'Staged', `Move queued: rule ${fromId} -> ${plan.movedTo}`);
+    logActivity('firewall', 'staged', target, 'staged', `Staged: move`, commands);
+    renderRuleset();
+    return;
+  }
+
+  try {
+    showLoading('Moving rule...');
+    const data = await clusterApplyFetch('/api/firewall/rules/move', 'POST',
+      { ruleset, moves: plan.moves,
+        moved_rule: String(fromId), moved_to: String(plan.movedTo) });
+    showToast('success', 'Rule Moved', target);
+    logActivity('firewall', 'move', target, 'success',
+      `Moved firewall rule${clusterNodesSuffix(data)}`, commands);
+    hasUnsavedChanges = true;
+    updateSaveIndicator();
+    await reloadConfig();
+    viewRuleset(ruleset);
+  } catch (e) {
+    if (!e.isDivergence && !e.isLocked) showToast('error', 'Error', e.message);
+    logActivity('firewall', 'move', target, 'error', `Failed to move rule: ${e.message}`, commands);
+    viewRuleset(ruleset);
+  }
+}
+
+// Insertar una regla nueva encima/debajo de otra: precalcula el id del hueco
+// y abre el modal de crear. Si no hay hueco no movemos nada implicitamente.
+function insertRuleNear(refId, below) {
+  const ids = Object.keys(currentRulesetData).map(Number).sort((a, b) => a - b);
+  const ref = Number(refId);
+  const idx = ids.indexOf(ref);
+  if (idx < 0) return;
+  const low = below ? ref : (idx > 0 ? ids[idx - 1] : 0);
+  const high = below ? (idx < ids.length - 1 ? ids[idx + 1] : null) : ref;
+  let newId;
+  if (high === null) {
+    newId = low + 10;
+  } else if (high - low > 1) {
+    newId = Math.floor((low + high) / 2);
+  } else {
+    showToast('warning', 'No free ID',
+      `No free rule id between ${low} and ${high}. Drag rules apart first or renumber.`);
+    return;
+  }
+  openFirewallRuleModal('create', currentRulesetName, null, newId);
+}
+
 // ── Default-action del ruleset ──
 async function openDefaultActionModal() {
   if (!await ensureWriteLock('change the ruleset default action')) return;
@@ -2411,7 +2726,7 @@ function renderRuleset() {
         : '';
 
       html += `<tr id="row-${id}" class="${rowClass}">
-        <td><span class="badge">${escapeHtml(row.rule_id)}</span>${disabledBadge}${extrasBadge}${pendingBadge}</td>
+        <td><span class="badge drag-handle" draggable="${isConnected ? 'true' : 'false'}" title="Drag to reorder">${escapeHtml(row.rule_id)}</span>${disabledBadge}${extrasBadge}${pendingBadge}</td>
         <td><div class="cell-wrap wide">${cellHTML(r.source, 'address', 'network')}</div></td>
         <td class="font-mono text-sm"><div class="cell-wrap">${cellHTML(r.source, 'port')}</div></td>
         <td><div class="cell-wrap wide">${cellHTML(r.destination, 'address', 'network')}</div></td>
@@ -2420,6 +2735,16 @@ function renderRuleset() {
         <td><span class="action-badge ${actionClass}">${escapeHtml(row.action)}</span></td>
         <td class="text-muted"><div class="cell-wrap wide">${escapeHtml(row.description)}</div></td>
         ${isConnected ? `<td class="actions-col">
+          <button class="btn-icon" onclick="insertRuleNear(${jsArg(id)}, false)" title="Insert rule above">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="12" y1="19" x2="12" y2="9"/><polyline points="7 12 12 7 17 12"/><line x1="5" y1="3" x2="19" y2="3"/>
+            </svg>
+          </button>
+          <button class="btn-icon" onclick="insertRuleNear(${jsArg(id)}, true)" title="Insert rule below">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="12" y1="5" x2="12" y2="15"/><polyline points="7 12 12 17 17 12"/><line x1="5" y1="21" x2="19" y2="21"/>
+            </svg>
+          </button>
           <button class="btn-icon" onclick="openFirewallRuleModal('edit', ${jsArg(currentRulesetName)}, ${jsArg(id)})" title="Edit">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
@@ -2452,6 +2777,8 @@ function renderRuleset() {
     renderRuleset();
   };
   document.getElementById('searchBtn').onclick = openSearchModal;
+
+  setupRuleDrag();
 }
 
 function clearAllFilters() {
@@ -3741,7 +4068,7 @@ function toggleJumpTarget() {
   }
 }
 
-async function openFirewallRuleModal(mode = 'create', rulesetName = null, ruleId = null) {
+async function openFirewallRuleModal(mode = 'create', rulesetName = null, ruleId = null, presetId = null) {
   if (!await ensureWriteLock(mode === 'edit' ? 'edit a firewall rule' : 'create a firewall rule')) return;
   if (!isConnected) {
     showToast('warning', 'Not Connected', 'Connect to the router first');
@@ -3758,7 +4085,7 @@ async function openFirewallRuleModal(mode = 'create', rulesetName = null, ruleId
     document.getElementById('firewallRuleTitle').textContent = `Edit Rule ${ruleId}`;
   } else {
     document.getElementById('firewallRuleTitle').textContent = 'New Firewall Rule';
-    document.getElementById('fwRuleId').value = '';
+    document.getElementById('fwRuleId').value = presetId !== null ? String(presetId) : '';
   }
   document.getElementById('fwJumpTargetGroup').classList.add('hidden');
   originalFirewallRule = null;
@@ -5038,7 +5365,16 @@ function getPendingStatus(type, ...args) {
 
   // Find the operation to determine if it's a create/update or delete
   const op = pendingOperations.find(o => buildRuleMarker(o) === marker);
-  return op ? op.action : null;
+  if (op) return op.action;
+  // Un move staged afecta a varios ids con UNA operacion: badge en los NUEVOS ids.
+  if (type === 'firewall') {
+    const [ruleset, ruleId] = args;
+    const mv = pendingOperations.find(o => o.type === 'firewall' && o.action === 'move'
+      && o.data.ruleset === ruleset
+      && o.data.moves.some(m => String(m.to) === String(ruleId)));
+    if (mv) return 'update';
+  }
+  return null;
 }
 
 // Apply operation to local CONFIG (in-memory preview)
@@ -5240,6 +5576,10 @@ function buildCommandsForOperation(op) {
   if (op.type === 'firewall') {
     if (op.action === 'delete') {
       return buildDeleteCommand('firewall', op.data.ruleset, op.data.rule_id);
+    } else if (op.action === 'move') {
+      // Calculados al encolar: CONFIG ya tiene el preview aplicado y los
+      // subarboles no estan donde el plan los lee.
+      return op.commands || [];
     } else if (op.action === 'renumber') {
       const subtree = CONFIG?.firewall?.name?.[op.data.ruleset]?.rule?.[op.data.rule_id] || {};
       const newBase = `firewall ipv4 name ${op.data.new_ruleset || op.data.ruleset} rule ${op.data.new_rule_id}`;

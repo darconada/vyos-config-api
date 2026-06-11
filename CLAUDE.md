@@ -399,10 +399,15 @@ New endpoint: `POST /api/cluster/set-peer` (`{peer_name}`) — declares the clus
 
 ## Known improvements / future work
 
-### Deferred feature designs (see docs/)
-- `docs/drag-and-drop-reorder.md` — drag & drop rule reordering (Checkpoint-style):
-  translation to delete+set transactions, gap/cascade strategies, what to build.
-  Can build directly on `_build_renumber_ops`.
+### Drag & drop rule reordering (Jun 2026 — implemented)
+- See `docs/drag-and-drop-reorder.md`. Drag the rule-id badge to reorder within a
+  ruleset: gap → midpoint id; no gap → minimal cascade (or temp-id swap); always a
+  confirmation modal with shifted rules, group-name warnings and exact commands.
+  Backend `POST /api/firewall/rules/move` re-validates the client plan step by step
+  against a sequential simulation (a set onto an occupied id would MERGE silently in
+  VyOS). Staged mode queues composite move ops; batch-configure simulates the batch
+  sequentially so chained moves validate against the prior move's outcome.
+  Insert above/below buttons precompute the gap id for new rules.
 - `docs/firewall-field-gaps.md` — VyOS firewall matchers not yet in the modal
   (state, log, interfaces, negation, 1.4 hooks, IPv6...), prioritized. New modal
   fields MUST be added to `FW_FORM_FIELDS`/`NAT_FORM_FIELDS` in app.js.

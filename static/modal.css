@@ -2000,3 +2000,20 @@ tr.rule-disabled td.actions-col {
 .checkbox-row .checkbox-label {
   margin: 0;
 }
+
+/* Drag & drop de reglas */
+.drag-handle {
+  cursor: grab;
+}
+.drag-handle:active {
+  cursor: grabbing;
+}
+tr.dragging {
+  opacity: 0.45;
+}
+tr.drop-above td {
+  border-top: 2px solid var(--primary-color, #3b82f6);
+}
+tr.drop-below td {
+  border-bottom: 2px solid var(--primary-color, #3b82f6);
+}
