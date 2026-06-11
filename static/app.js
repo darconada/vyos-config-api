@@ -84,6 +84,7 @@ let CONFIG = null;
 let currentSection = null;
 let currentRulesetName = null;
 let currentRulesetData = {};
+let currentRulesetDefaultAction = null;
 let groupCache = {};
 let showResolved = false;
 let filters = {};
@@ -547,9 +548,13 @@ function renderNatTable(title, natType, rules, cols) {
       const disabledClass = isDisabled ? 'rule-disabled' : '';
       const disabledBadge = isDisabled ? `<span class="disabled-badge" title="Rule is disabled">OFF</span>` : '';
       const rowClass = [pendingClass, disabledClass].filter(Boolean).join(' ');
+      const extras = getUnmodeledFields(NAT_FORM_FIELDS, r);
+      const extrasBadge = extras.length
+        ? `<span class="extra-fields-badge" title="${escapeHtml('Fields not editable in this UI: ' + extras.join(', '))}">+${extras.length}</span>`
+        : '';
 
       html += `<tr class="${rowClass}">
-        <td><span class="badge">${escapeHtml(id)}</span>${disabledBadge}${pendingBadge}</td>
+        <td><span class="badge">${escapeHtml(id)}</span>${disabledBadge}${extrasBadge}${pendingBadge}</td>
         ${cols.map(c => `<td><div class="cell-wrap wide">${escapeHtml(get(r, c.key))}</div></td>`).join('')}
         ${isConnected ? `<td class="actions-col">
           <button class="btn-icon" onclick="openNatRuleModal('edit', ${jsArg(natType)}, ${jsArg(id)})" title="Edit">
@@ -1971,10 +1976,15 @@ async function loadFirewall() {
   content.innerHTML = showSkeletonTable(6, 4);
 
   try {
-    const res = await fetch('/api/firewall/rulesets');
+    const [res, hooksRes] = await Promise.all([
+      fetch('/api/firewall/rulesets'),
+      fetch('/api/firewall/hooks')
+    ]);
     const sets = await res.json();
+    let hooks = {};
+    try { if (hooksRes.ok) hooks = await hooksRes.json(); } catch (e) { /* opcional */ }
 
-    if (sets.length === 0) {
+    if (sets.length === 0 && Object.keys(hooks).length === 0) {
       content.innerHTML = `
         <div class="empty-state">
           <div class="empty-state-icon">
@@ -2012,9 +2022,161 @@ async function loadFirewall() {
             `).join('')}
           </div>
         </div>
-      </div>`;
+      </div>` + renderHookCards(hooks);
   } catch (e) {
     showToast('error', 'Error', 'Failed to load firewall rulesets');
+  }
+}
+
+// Cadenas de hook ipv4 (forward/input/output filter): solo lectura. Son el
+// esqueleto de despliegue (interface-match + jump-target a las cadenas con
+// nombre); se editan fuera de esta herramienta.
+function renderHookCards(hooks) {
+  const entries = Object.entries(hooks || {});
+  if (!entries.length) return '';
+  let html = '';
+  for (const [hook, flt] of entries) {
+    const rules = flt.rule || {};
+    const ids = Object.keys(rules).sort((a, b) => parseInt(a) - parseInt(b));
+    html += `
+      <div class="card" style="margin-top: 1.5rem;">
+        <div class="card-header">
+          <div class="card-title">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/>
+              <polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/>
+            </svg>
+            Hook: ${escapeHtml(hook)} filter
+            <span class="badge badge-outline">default: ${escapeHtml(flt['default-action'] || '-')}</span>
+            <span class="badge">${ids.length} rules</span>
+            <span class="text-muted" style="font-size: 0.78rem; font-weight: normal;">read-only (deployment skeleton)</span>
+          </div>
+        </div>
+        <div class="table-container">
+          <table>
+            <thead><tr>
+              <th style="width:70px">ID</th><th>In iface</th><th>Out iface</th>
+              <th>Source</th><th>Destination</th><th style="width:100px">Action</th>
+              <th>Target</th><th>Description</th>
+            </tr></thead>
+            <tbody>
+              ${ids.map(id => {
+                const r = rules[id];
+                const inIf = r['inbound-interface']?.name || r['inbound-interface']?.group || '';
+                const outIf = r['outbound-interface']?.name || r['outbound-interface']?.group || '';
+                const tgt = r['jump-target'] || '';
+                const isDisabled = r.disable !== undefined;
+                return `<tr class="${isDisabled ? 'rule-disabled' : ''}">
+                  <td><span class="badge">${escapeHtml(id)}</span>${isDisabled ? '<span class="disabled-badge" title="Rule is disabled">OFF</span>' : ''}</td>
+                  <td>${inIf ? `<code>${escapeHtml(inIf)}</code>` : '<span class="text-muted">-</span>'}</td>
+                  <td>${outIf ? `<code>${escapeHtml(outIf)}</code>` : '<span class="text-muted">-</span>'}</td>
+                  <td>${cellHTML(r.source, 'address', 'network')}</td>
+                  <td>${cellHTML(r.destination, 'address', 'network')}</td>
+                  <td><span class="action-badge ${escapeHtml((r.action || '').toLowerCase())}">${escapeHtml(r.action || '-')}</span></td>
+                  <td>${tgt ? `<a href="#" onclick="viewRuleset(${jsArg(tgt)});return false;">${escapeHtml(tgt)}</a>` : '<span class="text-muted">-</span>'}</td>
+                  <td class="text-muted">${escapeHtml(r.description || '-')}</td>
+                </tr>`;
+              }).join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>`;
+  }
+  return html;
+}
+
+// ── Default-action del ruleset ──
+async function openDefaultActionModal() {
+  if (!await ensureWriteLock('change the ruleset default action')) return;
+  document.getElementById('defaultActionModal')?.remove();
+  const options = ['accept', 'drop', 'reject', 'return'];
+  const modal = document.createElement('div');
+  modal.id = 'defaultActionModal';
+  modal.className = 'modal';
+  modal.innerHTML = `
+    <div class="modal-backdrop" onclick="closeModal('defaultActionModal')"></div>
+    <div class="modal-content modal-sm">
+      <div class="modal-header">
+        <h3>Default action: ${escapeHtml(currentRulesetName)}</h3>
+        <button class="modal-close" onclick="closeModal('defaultActionModal')">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>Default action *</label>
+          <select id="rsDefaultActionSelect">
+            ${options.map(o => `<option value="${o}" ${o === currentRulesetDefaultAction ? 'selected' : ''}>${o}</option>`).join('')}
+          </select>
+          <small class="text-muted">Applied to traffic not matched by any rule in this ruleset.</small>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('defaultActionModal')">Cancel</button>
+        <button class="btn btn-primary" onclick="saveRulesetDefaultAction()">Save</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+}
+
+async function saveRulesetDefaultAction() {
+  const value = document.getElementById('rsDefaultActionSelect').value;
+  const ruleset = currentRulesetName;
+  closeModal('defaultActionModal');
+  if (value === currentRulesetDefaultAction) {
+    showToast('info', 'No Changes', 'Default action unchanged');
+    return;
+  }
+  const commands = [{ op: 'set', cmd: `set firewall ipv4 name ${ruleset} default-action '${value}'` }];
+
+  if (stagedMode) {
+    const marker = `ruleset:${ruleset}:default-action`;
+    const idx = pendingOperations.findIndex(o => o.marker === marker);
+    if (idx >= 0) pendingOperations.splice(idx, 1);
+    pendingOperations.push({
+      marker,
+      type: 'ruleset',
+      action: 'default-action',
+      data: { ruleset, value },
+      display: `Default action of ${ruleset} -> ${value}`
+    });
+    pendingRuleMarkers.add(marker);
+    if (CONFIG?.firewall?.name?.[ruleset]) CONFIG.firewall.name[ruleset]['default-action'] = value;
+    currentRulesetDefaultAction = value;
+    updatePendingIndicator();
+    showToast('info', 'Staged', `Default action of ${ruleset} queued`);
+    logActivity('firewall', 'staged', `${ruleset} default-action`, 'staged',
+      `Staged: default-action ${value}`, commands);
+    renderRuleset();
+    return;
+  }
+
+  const doApply = async () => {
+    try {
+      showLoading('Applying default action...');
+      const data = await clusterApplyFetch('/api/firewall/ruleset/default-action', 'POST',
+        { ruleset, value });
+      showToast('success', 'Default Action Updated', `${ruleset}: ${value}`);
+      logActivity('firewall', 'update', `${ruleset} default-action`, 'success',
+        `Default action set to ${value}${clusterNodesSuffix(data)}`, commands);
+      hasUnsavedChanges = true;
+      updateSaveIndicator();
+      await reloadConfig();
+      viewRuleset(ruleset);
+    } catch (e) {
+      if (!e.isDivergence && !e.isLocked) showToast('error', 'Error', e.message);
+      logActivity('firewall', 'update', `${ruleset} default-action`, 'error', e.message, commands);
+      viewRuleset(ruleset);
+    }
+  };
+
+  if (verboseMode) {
+    showCommandPreview(commands, doApply);
+  } else {
+    await doApply();
   }
 }
 
@@ -2048,6 +2210,7 @@ async function viewRuleset(rs) {
 
     currentRulesetName = rs;
     currentRulesetData = js.rule || {};
+    currentRulesetDefaultAction = js['default-action'] || null;
 
     // Preload groups
     const refs = new Set();
@@ -2117,6 +2280,14 @@ function renderRuleset() {
           </svg>
           ${escapeHtml(currentRulesetName)}
           <span class="badge">${ruleCount} rules</span>
+          ${currentRulesetDefaultAction ? `<span class="badge badge-outline">default: ${escapeHtml(currentRulesetDefaultAction)}</span>` : ''}
+          ${isConnected && currentRulesetDefaultAction ? `
+            <button class="btn-icon" onclick="openDefaultActionModal()" title="Edit default action">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+              </svg>
+            </button>` : ''}
         </div>
         <div class="flex gap-2">
           ${isConnected ? `<button class="btn btn-success btn-sm" onclick="openFirewallRuleModal('create', ${jsArg(currentRulesetName)})">
@@ -2220,9 +2391,13 @@ function renderRuleset() {
       const disabledClass = isDisabled ? 'rule-disabled' : '';
       const disabledBadge = isDisabled ? `<span class="disabled-badge" title="Rule is disabled">OFF</span>` : '';
       const rowClass = [pendingClass, disabledClass].filter(Boolean).join(' ');
+      const extras = getUnmodeledFields(FW_FORM_FIELDS, r);
+      const extrasBadge = extras.length
+        ? `<span class="extra-fields-badge" title="${escapeHtml('Fields not editable in this UI: ' + extras.join(', '))}">+${extras.length}</span>`
+        : '';
 
       html += `<tr id="row-${id}" class="${rowClass}">
-        <td><span class="badge">${escapeHtml(row.rule_id)}</span>${disabledBadge}${pendingBadge}</td>
+        <td><span class="badge">${escapeHtml(row.rule_id)}</span>${disabledBadge}${extrasBadge}${pendingBadge}</td>
         <td><div class="cell-wrap wide">${cellHTML(r.source, 'address', 'network')}</div></td>
         <td class="font-mono text-sm"><div class="cell-wrap">${cellHTML(r.source, 'port')}</div></td>
         <td><div class="cell-wrap wide">${cellHTML(r.destination, 'address', 'network')}</div></td>
@@ -3272,7 +3447,7 @@ function normFlagValue(v) {
 // emitir DELETES de estos paths: borrar lo que el form no muestra destruiria
 // config puesta por CLI (state, log, tcp flags...).
 const FW_FORM_FIELDS = {
-  'action': true, 'jump-target': true, 'protocol': true, 'description': true, 'disable': true,
+  'action': true, 'jump-target': true, 'protocol': true, 'description': true, 'disable': true, 'log': true,
   'source': { 'address': true, 'port': true, 'group': true },
   'destination': { 'address': true, 'port': true, 'group': true }
 };
@@ -3302,6 +3477,22 @@ function getFormRuleDiff(type, original, modified) {
   const fields = type === 'nat' ? NAT_FORM_FIELDS : FW_FORM_FIELDS;
   diff.deletes = diff.deletes.filter(p => isFormManagedPath(fields, p));
   return diff;
+}
+
+// Lista los campos de una regla que el formulario NO modela (tcp flags,
+// limit, packet-length... puestos por CLI). Se muestran como chip en la tabla
+// para no editar a ciegas; el renumber ya los preserva server-side.
+function getUnmodeledFields(fields, obj, prefix = '') {
+  const extras = [];
+  for (const [k, v] of Object.entries(obj || {})) {
+    const spec = fields[k];
+    if (spec === undefined) { extras.push(prefix + k); continue; }
+    if (spec === true) continue;
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      extras.push(...getUnmodeledFields(spec, v, prefix + k + '.'));
+    }
+  }
+  return extras;
 }
 
 function getRuleDiff(original, modified, basePath = []) {
@@ -3561,6 +3752,7 @@ async function openFirewallRuleModal(mode = 'create', rulesetName = null, ruleId
     document.getElementById('fwRuleProtocol').value = rule.protocol || '';
     document.getElementById('fwRuleDescription').value = rule.description || '';
     document.getElementById('fwRuleDisable').checked = rule.disable !== undefined;
+    document.getElementById('fwRuleLog').checked = rule.log !== undefined;
     document.getElementById('fwRuleSrcAddress').value = rule.source?.address || '';
     document.getElementById('fwRuleSrcPort').value = rule.source?.port || '';
     document.getElementById('fwRuleDstAddress').value = rule.destination?.address || '';
@@ -3611,6 +3803,9 @@ async function saveFirewallRule() {
 
   if (document.getElementById('fwRuleDisable').checked) {
     ruleData.disable = true;
+  }
+  if (document.getElementById('fwRuleLog').checked) {
+    ruleData.log = true;
   }
 
   // Source
@@ -4977,6 +5172,8 @@ function buildCommandsForOperation(op) {
     } else {
       return buildNatCommands(op.data.nat_type, op.data.rule_id, op.data.rule);
     }
+  } else if (op.type === 'ruleset' && op.action === 'default-action') {
+    return [{ op: 'set', cmd: `set firewall ipv4 name ${op.data.ruleset} default-action '${op.data.value}'` }];
   }
   return [];
 }
@@ -5021,6 +5218,9 @@ function buildFirewallCommands(ruleset, ruleId, ruleData) {
   }
   if (ruleData.disable) {
     commands.push({ op: 'set', cmd: `set ${basePath} disable` });
+  }
+  if (ruleData.log) {
+    commands.push({ op: 'set', cmd: `set ${basePath} log` });
   }
 
   // Source

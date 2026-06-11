@@ -1,7 +1,11 @@
 # Campos de reglas de firewall VyOS no soportados por la UI — plan
 
-> Estado: **anotado, no implementado** (junio 2026). Gap analysis del modal de
-> reglas frente a lo que soporta VyOS 1.4 (sagitta) / 1.5.
+> Estado: **fase 1 IMPLEMENTADA** (junio 2026): `log` editable en el modal,
+> chip de "extra fields" en las tablas (firewall y NAT), `default-action` del
+> ruleset editable, y hooks forward/input/output visibles en solo-lectura.
+> El resto queda descartado o aplazado según el uso real medido abajo.
+> Acciones por regla: la flota solo usa return/jump/drop/accept, todas ya en
+> el modal (synproxy/offload sin uso).
 
 ## Lo que el modal soporta hoy
 

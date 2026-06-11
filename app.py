@@ -1148,8 +1148,8 @@ def _is_group_entry_path(path):
 
 # Flags booleanos VyOS que no llevan valor: el último segmento del path
 # es el flag en sí, no un valor. Cubrimos los que generan los helpers de este
-# codebase; otros (log…) caerán al fallback de fetch — es seguro.
-_VYOS_BOOLEAN_FLAGS = {'exclude', 'disable'}
+# codebase; otros caerán al fallback de fetch — es seguro.
+_VYOS_BOOLEAN_FLAGS = {'exclude', 'disable', 'log'}
 
 
 def _set_op(raw, path):
@@ -1837,6 +1837,60 @@ def renumber_nat_rule():
 
 
 # ──────────────────────────────────────────────────────────────
+#  Default-action del ruleset
+# ──────────────────────────────────────────────────────────────
+@app.route('/api/firewall/ruleset/default-action', methods=['POST'])
+@login_required
+@write_lock_required
+def set_ruleset_default_action():
+    """Cambia el default-action de un ruleset. Body: {ruleset, value, apply_to_peer?}"""
+    sess = _get_session()
+    if not sess or not sess.get('active_api'):
+        return jsonify({'error': 'No active connection. Connect to router first.'}), 400
+
+    data = request.get_json() or {}
+    ruleset = data.get('ruleset')
+    value = data.get('value')
+    to_peer = data.get('apply_to_peer')
+
+    try:
+        ops = build_vyos_operations({'type': 'ruleset', 'action': 'default-action',
+                                     'data': {'ruleset': ruleset, 'value': value}})
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+    _set_audit('firewall.default-action', target=f'{ruleset} -> {value}',
+               commands=[{'cmd': ' '.join([op.get('op', '')] + list(op.get('path', [])))} for op in ops])
+    result = apply_ops_dual(sess, ops, to_peer_requested=to_peer)
+    g.audit_nodes = result.get('applied_to')
+    return jsonify({'status': 'ok', 'message': 'Default action updated', **result})
+
+
+# ──────────────────────────────────────────────────────────────
+#  Hooks 1.4 (forward/input/output filter) — solo lectura
+# ──────────────────────────────────────────────────────────────
+@app.route('/api/firewall/hooks')
+@login_required
+def firewall_hooks():
+    """
+    Devuelve las cadenas de hook ipv4 (forward/input/output filter), solo
+    lectura: son el esqueleto de despliegue (interface-match + jump-target a
+    las cadenas con nombre) y no se editan desde esta herramienta.
+    """
+    sess = _get_session()
+    raw = sess.get('raw_config') if sess else None
+    if not raw:
+        return jsonify({})
+    ipv4 = raw.get('firewall', {}).get('ipv4', {})
+    out = {}
+    for hook in ('forward', 'input', 'output'):
+        flt = ipv4.get(hook, {}).get('filter')
+        if flt:
+            out[hook] = flt
+    return jsonify(out)
+
+
+# ──────────────────────────────────────────────────────────────
 #  API de escritura (Firewall Groups)
 # ──────────────────────────────────────────────────────────────
 @app.route('/api/firewall/group', methods=['POST', 'PUT', 'DELETE'])
@@ -2030,6 +2084,8 @@ def build_vyos_operations(operation, raw_config=None):
                 ops.append({'op': 'set', 'path': base_path + ['description', rule['description']]})
             if rule.get('disable'):
                 ops.append({'op': 'set', 'path': base_path + ['disable']})
+            if rule.get('log'):
+                ops.append({'op': 'set', 'path': base_path + ['log']})
 
             # Source
             src = rule.get('source', {})
@@ -2106,6 +2162,17 @@ def build_vyos_operations(operation, raw_config=None):
                 ops.append({'op': 'set', 'path': base_path + ['inbound-interface', 'name', rule['inbound-interface']['name']]})
             if rule.get('outbound-interface', {}).get('name'):
                 ops.append({'op': 'set', 'path': base_path + ['outbound-interface', 'name', rule['outbound-interface']['name']]})
+
+    elif op_type == 'ruleset':
+        ruleset = data.get('ruleset')
+        if action == 'default-action':
+            value = data.get('value')
+            if not ruleset:
+                raise ValueError('ruleset is required')
+            if value not in ('accept', 'drop', 'reject', 'return'):
+                raise ValueError(f'Invalid default-action: {value}')
+            ops.append({'op': 'set',
+                        'path': ['firewall', 'ipv4', 'name', ruleset, 'default-action', value]})
 
     elif op_type == 'group':
         group_type = data.get('group_type')  # 'address', 'network', 'port'
