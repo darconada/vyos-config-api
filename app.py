@@ -904,6 +904,14 @@ def disconnect_peer():
 # ──────────────────────────────────────────────────────────────
 def _deep_equal(a, b):
     """Igualdad estructural ignorando orden de claves en dicts."""
+    # VyOS renderiza un nodo multivalor con un único valor como string y con
+    # varios como lista: ['x'] y 'x' son la MISMA config. Sin esta
+    # normalización, un cache patcheado en memoria podía diferir de un fetch
+    # fresco y disparar falsos 409 "cluster no sincronizado".
+    if isinstance(a, list) and len(a) == 1 and not isinstance(b, list):
+        a = a[0]
+    if isinstance(b, list) and len(b) == 1 and not isinstance(a, list):
+        b = b[0]
     if type(a) != type(b):
         # dict vs dict / list vs list — permitimos {} == None implícito abajo
         if (a in (None, {}) and b in (None, {})):
@@ -1408,15 +1416,38 @@ def _apply_ops_dual_locked(sess, ops, to_peer_requested, require_sync):
     active_api = sess['active_api']
     do_peer = _want_peer(sess, to_peer_requested)
 
-    # Pre-flight sync check (solo si se va a aplicar al peer)
+    # Pre-flight sync check (solo si se va a aplicar al peer).
+    # Refrescamos AMBOS nodos en paralelo: antes solo se refetcheaba el peer y
+    # se comparaba contra el cache (posiblemente viejo) del primary, con lo que
+    # un cambio out-of-band en el primary pasaba el gate o lo bloqueaba en
+    # falso. En paralelo, el coste de pared es max(t_primary, t_peer), igual
+    # que el fetch único de antes.
     if do_peer and require_sync:
         peer_api = sess['peer_api']
-        try:
-            raw_peer = peer_api.get_config()
-            sess['raw_peer_config'] = raw_peer
-            sess['peer_config'] = load_config(raw_peer)
-        except VyOSAPIError as e:
-            raise DualApplyError(502, {'error': f'Peer inaccesible: {str(e)}'})
+        primary_fetch_err = None
+        peer_fetch_err = None
+        raw_primary = None
+        raw_peer = None
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2,
+                                                   thread_name_prefix='pre-flight') as ex:
+            f_primary = ex.submit(active_api.get_config)
+            f_peer = ex.submit(peer_api.get_config)
+            try:
+                raw_primary = f_primary.result()
+            except Exception as e:
+                primary_fetch_err = str(e)
+            try:
+                raw_peer = f_peer.result()
+            except Exception as e:
+                peer_fetch_err = str(e)
+        if primary_fetch_err:
+            raise DualApplyError(502, {'error': f'Primary inaccesible en pre-flight: {primary_fetch_err}'})
+        if peer_fetch_err:
+            raise DualApplyError(502, {'error': f'Peer inaccesible: {peer_fetch_err}'})
+        sess['raw_config'] = raw_primary
+        sess['config'] = load_config(raw_primary)
+        sess['raw_peer_config'] = raw_peer
+        sess['peer_config'] = load_config(raw_peer)
         diffs = compute_sync_diffs(sess['config'], sess['peer_config'])
         if diffs:
             cluster_info = sess.get('cluster_info') or {}
