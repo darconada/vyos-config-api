@@ -4,12 +4,47 @@
 console.log('VyOS Config Viewer JS loaded (API REST version)');
 
 // =========================================
-// AUTH: redirect to /login on 401 from any fetch
+// TAB IDENTITY: per-tab connection state on the backend
 // =========================================
-(function installAuthInterceptor() {
+// sessionStorage is per-tab (unlike cookies), so each browser tab gets its
+// own backend session and can connect to a different router. Note: duplicating
+// a tab copies sessionStorage, so a duplicated tab shares the connection.
+const TAB_ID = (() => {
+  let id = null;
+  try {
+    id = sessionStorage.getItem('vyosTabId');
+    if (!id) {
+      id = (window.crypto && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
+      sessionStorage.setItem('vyosTabId', id);
+    }
+  } catch (e) {
+    id = `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
+  }
+  return id;
+})();
+
+// =========================================
+// AUTH: redirect to /login on 401 from any fetch
+// + inject X-Tab-Id on same-origin requests
+// =========================================
+(function installFetchInterceptor() {
   const origFetch = window.fetch.bind(window);
-  window.fetch = async function (...args) {
-    const res = await origFetch(...args);
+  window.fetch = async function (input, init) {
+    try {
+      const url = typeof input === 'string' ? input : (input && input.url) || '';
+      const sameOrigin = url.startsWith('/') || url.startsWith(location.origin);
+      if (sameOrigin) {
+        init = init || {};
+        const headers = new Headers(init.headers || (typeof input !== 'string' && input.headers) || undefined);
+        headers.set('X-Tab-Id', TAB_ID);
+        init.headers = headers;
+      }
+    } catch (e) {
+      // Never break a request because of the tab header.
+    }
+    const res = await origFetch(input, init);
     if (res.status === 401) {
       window.location.href = '/login';
       // Swallow the response in practice; caller will see the redirect happen.

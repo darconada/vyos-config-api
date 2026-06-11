@@ -57,15 +57,40 @@ _USER_SESSIONS_MUTEX = threading.Lock()
 USER_SESSION_TTL = 1800  # 30 min sin actividad → la sesión se descarta
 
 
-def _get_session(create=False):
-    """Devuelve la sesión del usuario actual; crea vacía si create=True."""
+def _session_key():
+    """
+    Clave de la sesión de conexión: usuario + pestaña del navegador.
+
+    El frontend manda un X-Tab-Id único por pestaña (sessionStorage), de modo
+    que cada pestaña mantiene su PROPIA conexión a un router y un usuario puede
+    trabajar contra dos equipos a la vez. Sin cabecera (curl, clientes viejos)
+    se degrada a la clave por-usuario de antes.
+    """
     user = _current_user()
     if not user:
         return None
+    tab = (request.headers.get('X-Tab-Id') or '').strip()
+    if tab:
+        tab = re.sub(r'[^A-Za-z0-9_-]', '', tab)[:64]
+    return f'{user}::{tab}' if tab else user
+
+
+def _user_session_items(user):
+    """Pares (key, sess) de TODAS las pestañas del usuario. Llamar con el mutex cogido."""
+    prefix = user + '::'
+    return [(k, s) for k, s in USER_SESSIONS.items()
+            if k == user or k.startswith(prefix)]
+
+
+def _get_session(create=False):
+    """Devuelve la sesión (por usuario+pestaña) actual; crea vacía si create=True."""
+    key = _session_key()
+    if not key:
+        return None
     with _USER_SESSIONS_MUTEX:
-        sess = USER_SESSIONS.get(user)
+        sess = USER_SESSIONS.get(key)
         if sess is None and create:
-            sess = USER_SESSIONS[user] = {'_lock': threading.RLock()}
+            sess = USER_SESSIONS[key] = {'_lock': threading.RLock()}
         if sess is not None:
             sess['last_seen'] = time.time()
         return sess
@@ -523,9 +548,11 @@ def logout():
         for cid in released_clusters:
             audit_log.emit(user=user, action='lock.release', target=cid,
                            cluster_id=cid, details='auto-released on logout')
-        # Soltar la sesión persistente del usuario (libera la conexión al router).
+        # Soltar las sesiones persistentes del usuario, una por pestaña
+        # (libera las conexiones a routers).
         with _USER_SESSIONS_MUTEX:
-            USER_SESSIONS.pop(user, None)
+            for k, _ in _user_session_items(user):
+                USER_SESSIONS.pop(k, None)
     session.clear()
     return redirect(url_for('login_form'))
 
@@ -734,14 +761,25 @@ def fetch_config():
             sess['config'] = cfg
         new_cluster_id = _cluster_id_for(sess)
         if prev_cluster_id and prev_cluster_id != new_cluster_id and user:
-            with _WRITE_LOCK_MUTEX:
-                state = WRITE_LOCKS.get(prev_cluster_id)
-                if state and state.get('user') == user:
-                    WRITE_LOCKS.pop(prev_cluster_id, None)
-                    audit_log.emit(user=user, action='lock.release',
-                                   target=prev_cluster_id,
-                                   cluster_id=prev_cluster_id,
-                                   details='auto-released on cluster switch')
+            # Con sesiones por pestaña, solo auto-liberamos el lock del cluster
+            # anterior si NINGUNA otra pestaña del usuario lo sigue usando.
+            still_used = False
+            with _USER_SESSIONS_MUTEX:
+                for k, other in _user_session_items(user):
+                    if other is sess:
+                        continue
+                    if _cluster_id_for(other) == prev_cluster_id:
+                        still_used = True
+                        break
+            if not still_used:
+                with _WRITE_LOCK_MUTEX:
+                    state = WRITE_LOCKS.get(prev_cluster_id)
+                    if state and state.get('user') == user:
+                        WRITE_LOCKS.pop(prev_cluster_id, None)
+                        audit_log.emit(user=user, action='lock.release',
+                                       target=prev_cluster_id,
+                                       cluster_id=prev_cluster_id,
+                                       details='auto-released on cluster switch')
 
         response = {'status': 'ok', 'data': cfg}
         if cluster:
