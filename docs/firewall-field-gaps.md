@@ -9,6 +9,35 @@ action (accept/drop/reject/return/continue/jump/queue, con jump-target),
 protocol (8 valores fijos), description, disable, y source/destination con:
 address único, port, y UN grupo de cada tipo (address/network/port-group).
 
+## Uso REAL medido en la flota (jun 2026)
+
+Escaneo de atributos por regla vía API (`/retrieve` de `firewall`) sobre
+`es-por-ins-ifw01-02` (340 reglas), `vyos-cb-lgr-dr-07` (45) y el stateless
+`vyos-cb-lgr-dr-01` (15):
+
+| Campo | ifw01-02 | dr-07 | dr-01 (stateless) |
+|---|---|---|---|
+| action / description / protocol / source / destination | masivo | masivo | sí |
+| destination.port / address, grupos | masivo | sí | sí |
+| jump-target | 10 | 5 | 4 |
+| inbound/outbound-interface.name | 10 | 5 | 4 (casi todo en reglas de los hooks) |
+| **state por regla** | **0** | **0** | **0** |
+| **log por regla** | **0** | **0** | **0** |
+| tcp.flags | 0 | 0 | 5 |
+| packet-length | 0 | 0 | 2 |
+| limit rate/burst | 0 | 0 | 1 |
+| icmp / time / recent / dscp / mark / fragment / ipsec | 0 | 0 | 0 |
+| firewall ipv6 | no | no | no |
+
+Conclusiones:
+- El estado se lleva en `global-options state-policy` (los dos stateful lo
+  tienen); **state por regla queda DESCARTADO del modal**.
+- Los tres routers tienen reglas en los hooks `ipv4 forward/input filter`
+  (el pegamento interface → jump-target a las cadenas con nombre), invisibles
+  hoy para la UI.
+- Los matchers exóticos (tcp flags, packet-length, limit) existen solo en los
+  stateless y en cantidades de una mano.
+
 ## Gaps, por prioridad
 
 ### Alta (uso diario en cualquier firewall serio)
