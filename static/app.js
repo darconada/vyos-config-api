@@ -3486,13 +3486,23 @@ function getUnmodeledFields(fields, obj, prefix = '') {
   const extras = [];
   for (const [k, v] of Object.entries(obj || {})) {
     const spec = fields[k];
-    if (spec === undefined) { extras.push(prefix + k); continue; }
+    if (spec === undefined) { extras.push(...listLeafPaths(v, prefix + k)); continue; }
     if (spec === true) continue;
     if (v && typeof v === 'object' && !Array.isArray(v)) {
       extras.push(...getUnmodeledFields(spec, v, prefix + k + '.'));
     }
   }
   return extras;
+}
+
+// Aplana un subarbol desconocido a sus hojas: tcp:{flags:{syn:{}}} -> 'tcp.flags.syn'
+function listLeafPaths(obj, prefix) {
+  if (obj === null || obj === undefined || typeof obj !== 'object' || Array.isArray(obj)) return [prefix];
+  const keys = Object.keys(obj);
+  if (!keys.length) return [prefix];
+  const out = [];
+  for (const k of keys) out.push(...listLeafPaths(obj[k], prefix + '.' + k));
+  return out;
 }
 
 function getRuleDiff(original, modified, basePath = []) {
