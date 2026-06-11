@@ -41,6 +41,9 @@ class VyOSAPI:
         self.verify_ssl = verify_ssl
         self.timeout = timeout
         self.configure_timeout = configure_timeout
+        # Sesión HTTP reutilizable: keep-alive evita un handshake TCP+TLS
+        # completo por cada petición contra el router.
+        self._session = requests.Session()
 
     def _request(self, endpoint, data, use_configure_timeout=False):
         """
@@ -67,7 +70,7 @@ class VyOSAPI:
         timeout = self.configure_timeout if use_configure_timeout else self.timeout
 
         try:
-            resp = requests.post(
+            resp = self._session.post(
                 url,
                 data=payload,
                 verify=self.verify_ssl,

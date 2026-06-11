@@ -82,6 +82,10 @@ const toastContainer = document.getElementById('toastContainer');
 // =========================================
 let CONFIG = null;
 let currentSection = null;
+// Token de carga: cada load* lo incrementa y descarta su propia respuesta si
+// otra carga arranco despues (evita renderizar la seccion equivocada cuando
+// el usuario cambia rapido de vista y la respuesta lenta llega la ultima).
+let contentLoadSeq = 0;
 let currentRulesetName = null;
 let currentRulesetData = {};
 let currentRulesetDefaultAction = null;
@@ -410,11 +414,14 @@ async function loadSection(sec) {
 // NAT
 // =========================================
 async function loadNat() {
+  const loadToken = ++contentLoadSeq;
   content.innerHTML = showSkeletonTable(8, 5);
 
   try {
     const res = await fetch('/api/NAT');
-    natData = await res.json();
+    const data = await res.json();
+    if (loadToken !== contentLoadSeq) return;
+    natData = data;
     renderNat(natData);
   } catch (e) {
     showToast('error', 'Error', 'Failed to load NAT rules');
@@ -1973,6 +1980,7 @@ function renderBGP() {
 // FIREWALL
 // =========================================
 async function loadFirewall() {
+  const loadToken = ++contentLoadSeq;
   content.innerHTML = showSkeletonTable(6, 4);
 
   try {
@@ -1983,6 +1991,7 @@ async function loadFirewall() {
     const sets = await res.json();
     let hooks = {};
     try { if (hooksRes.ok) hooks = await hooksRes.json(); } catch (e) { /* opcional */ }
+    if (loadToken !== contentLoadSeq) return;
 
     if (sets.length === 0 && Object.keys(hooks).length === 0) {
       content.innerHTML = `
@@ -2025,6 +2034,7 @@ async function loadFirewall() {
       </div>` + renderHookCards(hooks);
   } catch (e) {
     showToast('error', 'Error', 'Failed to load firewall rulesets');
+    content.innerHTML = '<div class="empty-state"><p class="text-muted">Failed to load firewall rulesets</p></div>';
   }
 }
 
@@ -2198,6 +2208,7 @@ async function mapWithLimit(items, limit, fn) {
 }
 
 async function viewRuleset(rs) {
+  const loadToken = ++contentLoadSeq;
   content.innerHTML = showSkeletonTable(10, 8);
   updateBreadcrumb([
     { label: 'Firewall', action: () => loadSection('Firewall') },
@@ -2207,6 +2218,7 @@ async function viewRuleset(rs) {
   try {
     const res = await fetch(`/api/firewall/ruleset/${encodeURIComponent(rs)}`);
     const js = await res.json();
+    if (loadToken !== contentLoadSeq) return;
 
     currentRulesetName = rs;
     currentRulesetData = js.rule || {};
@@ -2244,6 +2256,7 @@ async function viewRuleset(rs) {
       if (type === 'network') groupCache[key] = obj.network;
       if (type === 'port') groupCache[key] = obj.port;
     });
+    if (loadToken !== contentLoadSeq) return;
 
     filters = {};
     ipFilters = { source: null, destination: null };
@@ -2252,6 +2265,7 @@ async function viewRuleset(rs) {
     renderRuleset();
   } catch (e) {
     showToast('error', 'Error', 'Failed to load ruleset');
+    content.innerHTML = '<div class="empty-state"><p class="text-muted">Failed to load ruleset</p></div>';
   }
 }
 
@@ -5151,8 +5165,20 @@ async function executeAllPending() {
   } catch (e) {
     if (!e.isDivergence && !e.isLocked) showToast('error', 'Error', e.message);
     logActivity('config', 'update', `Batch: ${count} operations`, 'error', `Failed to apply batch changes: ${e.message}`, allCommands);
-    // Keep pending operations on error for retry
+    // Keep pending operations on error for retry. The reload refetches server
+    // state, so re-apply the staged previews on top: otherwise the rows show
+    // server values while still carrying MOD/DEL badges.
     await reloadCurrentView();
+    for (const op of pendingOperations) {
+      if (op.type === 'ruleset' && op.action === 'default-action') {
+        if (CONFIG?.firewall?.name?.[op.data.ruleset]) {
+          CONFIG.firewall.name[op.data.ruleset]['default-action'] = op.data.value;
+        }
+      } else {
+        applyOperationToLocalConfig(op);
+      }
+    }
+    refreshCurrentViewSoft();
   }
 }
 
@@ -6041,6 +6067,14 @@ async function executeGroupSave(groupData, mode, commands) {
       if (CONFIG) CONFIG.firewall.group = groupsData;
     }
 
+    // Invalidar tambien la cache por-ruleset: el traffic search y la vista
+    // "Show Values" leen de groupCache y seguian usando las entradas viejas.
+    const cacheKey = `${groupData.group_type}-${groupData.group_name}`;
+    if (cacheKey in groupCache) {
+      const fresh = groupsData?.[`${groupData.group_type}-group`]?.[groupData.group_name];
+      groupCache[cacheKey] = fresh?.[groupData.group_type];
+    }
+
     showToast('success', 'Success', `Group ${mode === 'create' ? 'created' : 'updated'} successfully`);
     hasUnsavedChanges = true;
     updateSaveIndicator();
@@ -6125,8 +6159,12 @@ async function executeGroupDelete(groupType, groupName, commands) {
     const groupRes = await fetch('/api/firewall/groups');
     if (groupRes.ok) {
       groupsData = await groupRes.json();
-      if (CONFIG) CONFIG.firewall.group = groupsData;
+      if (CONFIG) {
+        CONFIG.firewall = CONFIG.firewall || {};
+        CONFIG.firewall.group = groupsData;
+      }
     }
+    delete groupCache[`${groupType}-${groupName}`];
 
     showToast('success', 'Deleted', `Group "${groupName}" deleted`);
     hasUnsavedChanges = true;
@@ -6413,8 +6451,10 @@ reloadCurrentView = async function() {
 // KEYBOARD SHORTCUTS
 // =========================================
 document.addEventListener('keydown', (e) => {
-  // Don't trigger shortcuts when typing in inputs
-  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
+  // Don't trigger shortcuts when typing in inputs (selects use letter keys
+  // for option jumping, and contenteditable is text input too)
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA'
+      || e.target.tagName === 'SELECT' || e.target.isContentEditable) {
     if (e.key === 'Escape') {
       e.target.blur();
     }

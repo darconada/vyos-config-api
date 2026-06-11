@@ -34,6 +34,42 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
 )
 
+
+def _assert_single_worker():
+    """
+    El write-lock por cluster y las sesiones viven en memoria del PROCESO:
+    con gunicorn --workers > 1 habría N "single writers" por cluster y los
+    usuarios rebotarían entre workers sin error visible. Mejor negarse a
+    arrancar que corromper config en silencio.
+    """
+    try:
+        with open('/proc/self/cmdline', 'rb') as f:
+            argv = f.read().decode('utf-8', 'replace').split('\x00')
+    except OSError:
+        return
+    if not any('gunicorn' in a for a in argv):
+        return  # flask dev server u otro runner: un solo proceso
+    workers = None
+    for i, a in enumerate(argv):
+        if a in ('-w', '--workers') and i + 1 < len(argv):
+            workers = argv[i + 1]
+        elif a.startswith('--workers='):
+            workers = a.split('=', 1)[1]
+        elif a.startswith('-w') and len(a) > 2 and a[2:].isdigit():
+            workers = a[2:]
+    if workers is not None:
+        try:
+            if int(workers) > 1:
+                raise SystemExit(
+                    'vyos-config-viewer-api requiere gunicorn con --workers 1 '
+                    '(usa --threads para concurrencia): el write-lock por cluster '
+                    'y las sesiones son estado en memoria del proceso.')
+        except ValueError:
+            pass
+
+
+_assert_single_worker()
+
 # ──────────────────────────────────────────────────────────────
 #  Sesiones por usuario
 # ──────────────────────────────────────────────────────────────
@@ -2074,6 +2110,10 @@ def build_vyos_operations(operation, raw_config=None):
 
     if op_type == 'firewall':
         ruleset = data.get('ruleset')
+        # Validar SIEMPRE: un item de batch malformado generaba paths con el
+        # literal 'None' (p. ej. "rule None") que llegaban al router.
+        if not ruleset or data.get('rule_id') in (None, ''):
+            raise ValueError('firewall operation requires ruleset and rule_id')
         rule_id = str(data.get('rule_id'))
         base_path = ['firewall', 'ipv4', 'name', ruleset, 'rule', rule_id]
 
@@ -2081,6 +2121,8 @@ def build_vyos_operations(operation, raw_config=None):
             ops.append({'op': 'delete', 'path': base_path})
         elif action == 'renumber':
             new_ruleset = data.get('new_ruleset') or ruleset
+            if data.get('new_rule_id') in (None, ''):
+                raise ValueError('renumber requires new_rule_id')
             new_rule_id = str(data.get('new_rule_id'))
             ops.extend(_build_renumber_ops(
                 raw_config,
@@ -2147,12 +2189,18 @@ def build_vyos_operations(operation, raw_config=None):
 
     elif op_type == 'nat':
         nat_type = data.get('nat_type')
+        if nat_type not in ('source', 'destination'):
+            raise ValueError(f'Invalid nat_type: {nat_type}')
+        if data.get('rule_id') in (None, ''):
+            raise ValueError('nat operation requires rule_id')
         rule_id = str(data.get('rule_id'))
         base_path = ['nat', nat_type, 'rule', rule_id]
 
         if action == 'delete':
             ops.append({'op': 'delete', 'path': base_path})
         elif action == 'renumber':
+            if data.get('new_rule_id') in (None, ''):
+                raise ValueError('renumber requires new_rule_id')
             new_rule_id = str(data.get('new_rule_id'))
             ops.extend(_build_renumber_ops(
                 raw_config,
@@ -2215,7 +2263,11 @@ def build_vyos_operations(operation, raw_config=None):
     elif op_type == 'group':
         group_type = data.get('group_type')  # 'address', 'network', 'port'
         group_name = data.get('group_name')
-        entry_key = {'address': 'address', 'network': 'network', 'port': 'port'}[group_type]
+        if group_type not in ('address', 'network', 'port'):
+            raise ValueError(f'Invalid group_type: {group_type}')
+        if not group_name:
+            raise ValueError('group operation requires group_name')
+        entry_key = group_type
         base_path = ['firewall', 'group', f'{group_type}-group', group_name]
 
         if action == 'delete':
