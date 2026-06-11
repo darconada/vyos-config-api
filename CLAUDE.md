@@ -366,7 +366,47 @@ All manual paths set `peer_name_manual:true`. `_cluster_id_for` then derives the
 
 New endpoint: `POST /api/cluster/set-peer` (`{peer_name}`) — declares the cluster peer on an already-open connection.
 
+**Hardening round (Jun 2026):**
+- **Dual-apply rollback is now real**: inverse ops are computed against the pre-apply
+  cached state (`build_rollback_ops` + `_inverse_ops_for` + `_subtree_to_set_ops` in
+  app.py). Value replacements restore the old value; deletes are re-created via the
+  subtree serializer. If no safe inverse exists, rollback reports `unavailable` instead
+  of doing something destructive. Write endpoints call `_set_audit` BEFORE
+  `apply_ops_dual`, so failed/partial applies reach `logs/audit.jsonl` with status=error.
+- **Per-session thread safety**: each USER_SESSIONS entry carries a `threading.RLock`
+  (`_session_lock`); `apply_ops_dual` runs fully under it. Cache patches are
+  copy-on-write (`_patch_cache_cow`): patch a deepcopy, swap the reference; readers
+  never see a half-mutated tree.
+- **False 409 fix**: `_deep_equal` treats `['x']` == `'x'` (VyOS single-value render);
+  `_delete_op` collapses 1-element lists and handles string-leaf value deletion.
+- **Symmetric pre-flight**: dual-apply pre-flight refetches primary AND peer in
+  parallel (wall time unchanged vs the old peer-only fetch).
+- **BGP is read-only** (decision): cluster nodes legitimately differ in BGP config
+  (update-source, local IPs), so dual-apply would be wrong by design. Write endpoints
+  removed; UI shows a read-only notice. BGP is edited on the router directly.
+- **Per-tab sessions**: frontend sends `X-Tab-Id` (sessionStorage UUID) on same-origin
+  fetches; backend keys USER_SESSIONS by `user::tab_id`. Each browser tab can connect
+  to a different router. No header → legacy per-user key. Duplicated tabs share the
+  original tab's connection (sessionStorage is copied on duplicate).
+- **XSS hardening**: `showToast` escapes title/message; `jsArg()` helper for dynamic
+  args inside inline `onclick` (escapeHtml(JSON.stringify())); breadcrumb is DOM-based
+  with function actions; config-derived cells escaped; encodeURIComponent on fetch
+  URLs built from router data.
+- **Staged mode fixes**: delete of a staged-new rule/route cancels both ops (no more
+  poisoned batches); lock loss reloads the current view (previews were stale); route
+  pending markers unified to `route:vrf:network:target` and deduped; valueless flags
+  (`{}` vs `true`) normalized in diffs (`normFlagValue`) so revert detection converges.
+
 ## Known improvements / future work
+
+### Deferred feature designs (see docs/)
+- `docs/drag-and-drop-reorder.md` — drag & drop rule reordering (Checkpoint-style):
+  translation to delete+set transactions, gap/cascade strategies, what to build.
+- `docs/renumber-subtree-serializer.md` — wire `_subtree_to_set_ops` into the rule ID
+  change flow so renumber rebuilds from the raw config tree instead of the modal form
+  (currently loses CLI-only fields like `state`).
+- `docs/firewall-field-gaps.md` — VyOS firewall matchers not yet in the modal
+  (state, log, interfaces, negation, 1.4 hooks, IPv6...), prioritized.
 
 ### HA cluster sync-check — further reductions (deferred)
 
